@@ -28,7 +28,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, MemUConfig
     from nanobot.cron.service import CronService
 
 
@@ -65,6 +65,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        memu_config: MemUConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -100,6 +101,12 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
         )
 
+        # memU bridge (lazy init)
+        self._memu_bridge = None
+        if memu_config and memu_config.enabled:
+            from nanobot.agent.memu_service import MemUBridge
+            self._memu_bridge = MemUBridge(memu_config)
+
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
@@ -129,6 +136,9 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        if self._memu_bridge:
+            from nanobot.agent.tools.memu_retrieve import MemURetrieveTool
+            self.tools.register(MemURetrieveTool(self._memu_bridge))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -260,6 +270,9 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        if self._memu_bridge:
+            await self._memu_bridge.initialize()
+            self._memu_bridge.start_background_task()
         logger.info("Agent loop started")
 
         while self._running:
@@ -314,7 +327,9 @@ class AgentLoop:
                 ))
 
     async def close_mcp(self) -> None:
-        """Close MCP connections."""
+        """Close MCP connections and memU bridge."""
+        if self._memu_bridge:
+            await self._memu_bridge.close()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -487,6 +502,10 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
+        # Feed new messages to memU for extraction
+        if self._memu_bridge:
+            self._memu_bridge.feed_messages(messages[skip:])
+
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
         return await MemoryStore(self.workspace).consolidate(
@@ -504,6 +523,8 @@ class AgentLoop:
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
+        if self._memu_bridge and not self._memu_bridge._available:
+            await self._memu_bridge.initialize()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""

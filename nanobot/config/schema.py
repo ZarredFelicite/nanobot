@@ -302,6 +302,17 @@ class ExecToolConfig(Base):
     path_append: str = ""
 
 
+class MemUConfig(Base):
+    """memU proactive memory service configuration."""
+
+    enabled: bool = False
+    db_path: str = "~/.nanobot/workspace/memory/memu.db"
+    batch_message_threshold: int = 5
+    batch_time_threshold_s: int = 120
+    max_retrieval_results: int = 10
+    extraction_model: str | None = None
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -318,6 +329,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    memu: MemUConfig = Field(default_factory=MemUConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
