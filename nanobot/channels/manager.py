@@ -42,7 +42,7 @@ class ChannelManager:
                     self.config.channels.telegram,
                     self.bus,
                     groq_api_key=self.config.providers.groq.api_key,
-                    default_session=self.config.agents.default_session,
+                    default_session=self.config.agents.defaults.session,
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:
@@ -156,7 +156,7 @@ class ChannelManager:
             self.channels["cli"] = CLISocketServer(
                 self.config.channels.cli_socket,
                 self.bus,
-                default_session=self.config.agents.default_session,
+                default_session=self.config.agents.defaults.session,
             )
             logger.info("CLI socket channel enabled")
 

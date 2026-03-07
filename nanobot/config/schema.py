@@ -236,12 +236,12 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     memory_window: int = 100
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    session: str = ""  # Shared session key for CLI + owner channels (e.g. "user:zarred")
 
 
 class AgentsConfig(Base):
     """Agent configuration."""
 
-    default_session: str = ""  # Shared session key for CLI + owner channels (e.g. "user:zarred")
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
 
 
