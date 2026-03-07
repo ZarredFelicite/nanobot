@@ -8,6 +8,7 @@ to nanobot as its backend.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import json
 import time
 import uuid
@@ -59,6 +60,24 @@ class OpenCodeChannel(BaseChannel):
     def _next_id(self, prefix: str = "msg") -> str:
         self._id_counter += 1
         return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+    @staticmethod
+    def _epoch_ms(ts: float) -> int:
+        return int(ts * 1000)
+
+    @staticmethod
+    def _default_title_for_session(session: Session) -> str:
+        return f"session-{session.created_at.strftime('%Y%m%d-%H%M%S')}"
+
+    def _new_session_id(self) -> str:
+        return f"session-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')[:22]}"
+
+    def _session_exists(self, key: str) -> bool:
+        if not self.session_manager:
+            return False
+        if key in self.session_manager._cache:
+            return True
+        return any(s.get("key") == key for s in self.session_manager.list_sessions())
 
     def _parse_model(self) -> tuple[str, str]:
         """Return (provider_name, short_model_id) from agent config.
@@ -199,8 +218,20 @@ class OpenCodeChannel(BaseChannel):
                         "reasoning": False,
                         "attachment": False,
                         "toolcall": True,
-                        "input": {"text": True, "audio": False, "image": True, "video": False, "pdf": False},
-                        "output": {"text": True, "audio": False, "image": False, "video": False, "pdf": False},
+                        "input": {
+                            "text": True,
+                            "audio": False,
+                            "image": True,
+                            "video": False,
+                            "pdf": False,
+                        },
+                        "output": {
+                            "text": True,
+                            "audio": False,
+                            "image": False,
+                            "video": False,
+                            "pdf": False,
+                        },
                     },
                     "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
                     "limit": {"context": 200000, "output": 8192},
@@ -211,63 +242,97 @@ class OpenCodeChannel(BaseChannel):
             },
         }
 
-        return web.json_response({
-            "providers": [provider_data],
-            "default": {"default": f"{provider_name}/{model_id}"},
-        })
+        return web.json_response(
+            {
+                "providers": [provider_data],
+                "default": {"default": f"{provider_name}/{model_id}"},
+            }
+        )
 
     async def _handle_provider(self, request: web.Request) -> web.Response:
         provider_name, model_id = self._parse_model()
 
-        return web.json_response([{
-            "id": provider_name,
-            "name": provider_name.title(),
-            "source": "env",
-            "env": [],
-            "options": {},
-            "models": {
-                model_id: {
-                    "id": model_id,
-                    "providerID": provider_name,
-                    "name": model_id,
-                    "api": {"id": "anthropic", "url": "", "npm": ""},
-                    "capabilities": {
-                        "temperature": True, "reasoning": False, "attachment": False, "toolcall": True,
-                        "input": {"text": True, "audio": False, "image": True, "video": False, "pdf": False},
-                        "output": {"text": True, "audio": False, "image": False, "video": False, "pdf": False},
-                    },
-                    "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
-                    "limit": {"context": 200000, "output": 8192},
-                    "status": "active",
+        return web.json_response(
+            [
+                {
+                    "id": provider_name,
+                    "name": provider_name.title(),
+                    "source": "env",
+                    "env": [],
                     "options": {},
-                    "headers": {},
-                },
-            },
-        }])
+                    "models": {
+                        model_id: {
+                            "id": model_id,
+                            "providerID": provider_name,
+                            "name": model_id,
+                            "api": {"id": "anthropic", "url": "", "npm": ""},
+                            "capabilities": {
+                                "temperature": True,
+                                "reasoning": False,
+                                "attachment": False,
+                                "toolcall": True,
+                                "input": {
+                                    "text": True,
+                                    "audio": False,
+                                    "image": True,
+                                    "video": False,
+                                    "pdf": False,
+                                },
+                                "output": {
+                                    "text": True,
+                                    "audio": False,
+                                    "image": False,
+                                    "video": False,
+                                    "pdf": False,
+                                },
+                            },
+                            "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
+                            "limit": {"context": 200000, "output": 8192},
+                            "status": "active",
+                            "options": {},
+                            "headers": {},
+                        },
+                    },
+                }
+            ]
+        )
 
     async def _handle_agent(self, request: web.Request) -> web.Response:
-        return web.json_response([{
-            "name": "default",
-            "description": "nanobot agent",
-            "mode": "primary",
-            "builtIn": True,
-            "permission": {"edit": True, "bash": True},
-            "tools": {},
-            "options": {},
-        }])
+        return web.json_response(
+            [
+                {
+                    "name": "default",
+                    "description": "nanobot agent",
+                    "mode": "primary",
+                    "builtIn": True,
+                    "permission": {"edit": True, "bash": True},
+                    "tools": {},
+                    "options": {},
+                }
+            ]
+        )
 
     async def _handle_config(self, request: web.Request) -> web.Response:
-        return web.json_response({
-            "theme": "catppuccin-mocha",
-            "keybinds": {},
-            "tui": {},
-            "model": {},
-            "provider": {},
-            "mcp": {},
-            "agent": {},
-            "permission": {},
-            "tools": {},
-        })
+        provider_name, model_id = self._parse_model()
+        return web.json_response(
+            {
+                "theme": "catppuccin-mocha",
+                "keybinds": {},
+                "tui": {},
+                "model": f"{provider_name}/{model_id}",
+                "provider": {
+                    provider_name: {
+                        "models": {
+                            model_id: {},
+                        },
+                    },
+                },
+                "mcp": {},
+                "agent": {},
+                "permission": {},
+                "tools": {},
+            }
+        )
 
     # ------------------------------------------------------------------
     # SSE endpoint
@@ -289,11 +354,7 @@ class OpenCodeChannel(BaseChannel):
 
         try:
             while not resp.task.done():
-                # Heartbeat
-                try:
-                    await resp.write(b":\n\n")
-                except (ConnectionResetError, ConnectionAbortedError):
-                    break
+                await self._sse_write(resp, "server.heartbeat", {})
                 await asyncio.sleep(10)
         except asyncio.CancelledError:
             pass
@@ -308,9 +369,9 @@ class OpenCodeChannel(BaseChannel):
         return await self._handle_sse(request)
 
     async def _sse_write(self, resp: web.StreamResponse, event_type: str, properties: dict) -> None:
-        data = json.dumps({"type": event_type, "properties": properties})
+        payload = json.dumps({"type": event_type, "properties": properties})
         try:
-            await resp.write(f"data: {data}\n\n".encode())
+            await resp.write(f"data: {payload}\n\n".encode())
         except (ConnectionResetError, ConnectionAbortedError, RuntimeError):
             if resp in self._sse_clients:
                 self._sse_clients.remove(resp)
@@ -327,9 +388,31 @@ class OpenCodeChannel(BaseChannel):
         if not self.session_manager:
             return web.json_response({"error": "no session manager"}, status=500)
 
-        session_id = uuid.uuid4().hex[:12]
-        key = f"opencode:{session_id}"
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        requested_id = body.get("id")
+        is_empty_body = not body
+
+        if requested_id == "main":
+            session_id = "main"
+        elif is_empty_body and not self._session_exists("main"):
+            session_id = "main"
+        else:
+            session_id = self._new_session_id()
+        key = session_id
         session = self.session_manager.get_or_create(key)
+
+        requested_title = body.get("title")
+        if isinstance(requested_title, str) and requested_title.strip():
+            session.metadata["title"] = requested_title.strip()
+        elif "title" not in session.metadata:
+            session.metadata["title"] = self._default_title_for_session(session)
+
         self.session_manager.save(session)
 
         info = self._session_to_info(session, session_id)
@@ -414,7 +497,7 @@ class OpenCodeChannel(BaseChannel):
 
         if not session:
             # Auto-create session
-            key = f"opencode:{session_id}"
+            key = session_id
             session = self.session_manager.get_or_create(key)
             self.session_manager.save(session)
 
@@ -438,18 +521,22 @@ class OpenCodeChannel(BaseChannel):
         if not user_text:
             return web.json_response({"error": "empty message"}, status=400)
 
-        now = time.time()
+        now_s = time.time()
+        now_ms = self._epoch_ms(now_s)
         provider_name, model_id = self._parse_model()
 
-        # User message
-        user_msg_id = self._next_id("msg")
-        user_part_id = self._next_id("part")
+        # Use deterministic IDs aligned with persisted session index mapping.
+        # This avoids TUI reordering/duplication when it reconciles live SSE events
+        # with /session/{id}/message history.
+        base_index = len(session.messages)
+        user_msg_id = f"msg_{session_id}_{base_index}"
+        user_part_id = f"part_{session_id}_{base_index}"
 
         user_msg = {
             "id": user_msg_id,
             "sessionID": session_id,
             "role": "user",
-            "time": {"created": now},
+            "time": {"created": now_ms},
             "agent": "default",
             "model": {"providerID": provider_name, "modelID": model_id},
         }
@@ -459,35 +546,39 @@ class OpenCodeChannel(BaseChannel):
             "messageID": user_msg_id,
             "type": "text",
             "text": user_text,
-            "time": {"created": now},
+            "time": {"created": now_ms},
         }
 
         await self._broadcast_sse("message.updated", {"info": user_msg})
         await self._broadcast_sse("message.part.updated", {"part": user_part})
 
-        # Assistant message placeholder
-        asst_msg_id = self._next_id("msg")
-        asst_part_id = self._next_id("part")
+        # Assistant placeholder ID follows the expected next raw message index.
+        asst_msg_id = f"msg_{session_id}_{base_index + 1}"
+        asst_part_id = f"part_{session_id}_{base_index + 1}"
 
         asst_msg = {
             "id": asst_msg_id,
             "sessionID": session_id,
             "role": "assistant",
-            "time": {"created": now},
+            "time": {"created": now_ms + 1},
             "parentID": user_msg_id,
             "modelID": model_id,
             "providerID": provider_name,
             "mode": "default",
+            "agent": "default",
             "path": {"cwd": str(self.agent_loop.workspace), "root": str(self.agent_loop.workspace)},
             "cost": 0,
             "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
         }
 
         await self._broadcast_sse("message.updated", {"info": asst_msg})
-        await self._broadcast_sse("session.status", {
-            "sessionID": session_id,
-            "status": {"type": "busy"},
-        })
+        await self._broadcast_sse(
+            "session.status",
+            {
+                "sessionID": session_id,
+                "status": {"type": "busy"},
+            },
+        )
 
         # Process via agent
         accumulated_text = []
@@ -496,17 +587,20 @@ class OpenCodeChannel(BaseChannel):
             if tool_hint:
                 return
             accumulated_text.append(content)
-            await self._broadcast_sse("message.part.updated", {
-                "part": {
-                    "id": asst_part_id,
-                    "sessionID": session_id,
-                    "messageID": asst_msg_id,
-                    "type": "text",
-                    "text": "\n".join(accumulated_text),
-                    "time": {"created": now},
+            await self._broadcast_sse(
+                "message.part.updated",
+                {
+                    "part": {
+                        "id": asst_part_id,
+                        "sessionID": session_id,
+                        "messageID": asst_msg_id,
+                        "type": "text",
+                        "text": "\n".join(accumulated_text),
+                        "time": {"created": now_ms + 1},
+                    },
+                    "delta": content,
                 },
-                "delta": content,
-            })
+            )
 
         try:
             response = await self.agent_loop.process_direct(
@@ -530,24 +624,37 @@ class OpenCodeChannel(BaseChannel):
             "messageID": asst_msg_id,
             "type": "text",
             "text": final_text,
-            "time": {"created": now},
+            "time": {"created": now_ms + 1},
         }
         await self._broadcast_sse("message.part.updated", {"part": asst_part_final})
 
-        asst_msg["time"]["completed"] = time.time()
+        asst_msg["time"]["completed"] = self._epoch_ms(time.time())
         await self._broadcast_sse("message.updated", {"info": asst_msg})
 
         # Session idle
-        await self._broadcast_sse("session.status", {
-            "sessionID": session_id,
-            "status": {"type": "idle"},
-        })
+        await self._broadcast_sse(
+            "session.status",
+            {
+                "sessionID": session_id,
+                "status": {"type": "idle"},
+            },
+        )
 
         # Update session info
         session_info = self._session_to_info(session, session_id)
         await self._broadcast_sse("session.updated", {"info": session_info})
 
-        return web.json_response({"ok": True})
+        # Re-emit user turn once at completion to reduce first-turn race misses
+        # when a brand-new session is created and prompted immediately.
+        await self._broadcast_sse("message.updated", {"info": user_msg})
+        await self._broadcast_sse("message.part.updated", {"part": user_part})
+
+        return web.json_response(
+            {
+                "info": asst_msg,
+                "parts": [asst_part_final],
+            }
+        )
 
     async def _handle_prompt_async(self, request: web.Request) -> web.Response:
         # Fire-and-forget version of message send
@@ -591,13 +698,15 @@ class OpenCodeChannel(BaseChannel):
     async def _handle_path(self, request: web.Request) -> web.Response:
         workspace = str(self.agent_loop.workspace) if self.agent_loop else "~/.nanobot"
         home = str(Path.home())
-        return web.json_response({
-            "home": home,
-            "state": f"{home}/.nanobot",
-            "config": f"{home}/.nanobot",
-            "worktree": workspace,
-            "directory": workspace,
-        })
+        return web.json_response(
+            {
+                "home": home,
+                "state": f"{home}/.nanobot",
+                "config": f"{home}/.nanobot",
+                "worktree": workspace,
+                "directory": workspace,
+            }
+        )
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"healthy": True, "version": "0.1.4"})
@@ -611,46 +720,47 @@ class OpenCodeChannel(BaseChannel):
         if not self.session_manager:
             return None, ""
 
-        # Try direct key
-        key = f"opencode:{session_id}"
+        # Try direct key and prefixed key.
+        direct_key = session_id
+        prefixed_key = f"opencode:{session_id}"
         sessions = self.session_manager.list_sessions()
 
         # Check cache first
-        session = self.session_manager._cache.get(key)
+        session = self.session_manager._cache.get(direct_key)
         if session:
-            return session, key
+            return session, direct_key
+        session = self.session_manager._cache.get(prefixed_key)
+        if session:
+            return session, prefixed_key
 
         # Search all sessions for matching ID
         for s in sessions:
             s_key = s.get("key", "")
-            if s_key == key:
-                return self.session_manager.get_or_create(key), key
+            if s_key == direct_key:
+                return self.session_manager.get_or_create(direct_key), direct_key
+            if s_key == prefixed_key:
+                return self.session_manager.get_or_create(prefixed_key), prefixed_key
             # Also match by suffix
             if ":" in s_key and s_key.split(":", 1)[1] == session_id:
                 return self.session_manager.get_or_create(s_key), s_key
 
-        return None, key
+        if session_id == "main":
+            return None, "main"
+        return None, prefixed_key
 
     def _session_to_info(self, session: Session, session_id: str) -> dict[str, Any]:
         """Convert a nanobot Session to OpenCode Session.Info format."""
         title = session.metadata.get("title", "")
-        if not title and session.messages:
-            # Use first user message as title
-            for m in session.messages:
-                if m.get("role") == "user":
-                    content = m.get("content", "")
-                    if isinstance(content, str):
-                        title = content[:80]
-                    break
-
-        created_ts = session.created_at.timestamp()
-        updated_ts = session.updated_at.timestamp()
+        if not isinstance(title, str) or not title.strip():
+            title = self._default_title_for_session(session)
+        created_ts = self._epoch_ms(session.created_at.timestamp())
+        updated_ts = self._epoch_ms(session.updated_at.timestamp())
 
         return {
             "id": session_id,
             "projectID": "nanobot",
             "directory": str(self.agent_loop.workspace) if self.agent_loop else "~/.nanobot",
-            "title": title or "New Session",
+            "title": title,
             "version": "1",
             "time": {
                 "created": created_ts,
@@ -659,11 +769,12 @@ class OpenCodeChannel(BaseChannel):
         }
 
     def _messages_to_opencode(self, session: Session, session_id: str) -> list[dict[str, Any]]:
-        """Convert nanobot message list to OpenCode message format."""
+        """Convert nanobot message list to OpenCode MessageV2.WithParts format."""
         result = []
         provider_name, model_id = self._parse_model()
 
         prev_user_id = None
+        prev_user_created_ms: int | None = None
 
         for i, m in enumerate(session.messages):
             role = m.get("role", "")
@@ -671,55 +782,84 @@ class OpenCodeChannel(BaseChannel):
             ts = m.get("timestamp", "")
             try:
                 from datetime import datetime
-                created = datetime.fromisoformat(ts).timestamp() if ts else time.time()
-            except (ValueError, TypeError):
-                created = time.time()
 
-            msg_id = self._next_id("msg")
+                created = (
+                    self._epoch_ms(datetime.fromisoformat(ts).timestamp())
+                    if ts
+                    else self._epoch_ms(time.time())
+                )
+            except (ValueError, TypeError):
+                created = self._epoch_ms(time.time())
+
+            msg_id = f"msg_{session_id}_{i}"
+            part_id = f"part_{session_id}_{i}"
 
             if role == "user":
                 text = content if isinstance(content, str) else str(content)
                 msg = {
-                    "id": msg_id,
-                    "sessionID": session_id,
-                    "role": "user",
-                    "time": {"created": created},
-                    "agent": "default",
-                    "model": {"providerID": provider_name, "modelID": model_id},
-                    "parts": [{
-                        "id": self._next_id("part"),
+                    "info": {
+                        "id": msg_id,
                         "sessionID": session_id,
-                        "messageID": msg_id,
-                        "type": "text",
-                        "text": text,
-                    }],
+                        "role": "user",
+                        "time": {"created": created},
+                        "agent": "default",
+                        "model": {"providerID": provider_name, "modelID": model_id},
+                    },
+                    "parts": [
+                        {
+                            "id": part_id,
+                            "sessionID": session_id,
+                            "messageID": msg_id,
+                            "type": "text",
+                            "text": text,
+                            "time": {"start": created, "end": created},
+                        }
+                    ],
                 }
                 result.append(msg)
                 prev_user_id = msg_id
+                prev_user_created_ms = created
 
             elif role == "assistant":
                 text = content if isinstance(content, str) else str(content)
                 if not text:
                     continue
+                created_assistant = created
+                if prev_user_created_ms is not None and created_assistant <= prev_user_created_ms:
+                    created_assistant = prev_user_created_ms + 1
                 msg = {
-                    "id": msg_id,
-                    "sessionID": session_id,
-                    "role": "assistant",
-                    "time": {"created": created, "completed": created},
-                    "parentID": prev_user_id or "",
-                    "modelID": model_id,
-                    "providerID": provider_name,
-                    "mode": "default",
-                    "path": {"cwd": str(self.agent_loop.workspace) if self.agent_loop else "", "root": ""},
-                    "cost": 0,
-                    "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
-                    "parts": [{
-                        "id": self._next_id("part"),
+                    "info": {
+                        "id": msg_id,
                         "sessionID": session_id,
-                        "messageID": msg_id,
-                        "type": "text",
-                        "text": text,
-                    }],
+                        "role": "assistant",
+                        "time": {"created": created_assistant, "completed": created_assistant},
+                        "parentID": prev_user_id or "",
+                        "modelID": model_id,
+                        "providerID": provider_name,
+                        "mode": "default",
+                        "agent": "default",
+                        "path": {
+                            "cwd": str(self.agent_loop.workspace) if self.agent_loop else "",
+                            "root": "",
+                        },
+                        "cost": 0,
+                        "tokens": {
+                            "input": 0,
+                            "output": 0,
+                            "reasoning": 0,
+                            "cache": {"read": 0, "write": 0},
+                        },
+                    },
+                    "parts": [
+                        {
+                            "id": part_id,
+                            "sessionID": session_id,
+                            "messageID": msg_id,
+                            "type": "text",
+                            "text": text,
+                            "time": {"start": created_assistant, "end": created_assistant},
+                        }
+                    ],
                 }
                 result.append(msg)
 

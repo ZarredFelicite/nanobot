@@ -107,6 +107,8 @@ async def test_config(client):
     assert resp.status == 200
     data = await resp.json()
     assert isinstance(data, dict)
+    assert isinstance(data["model"], str)
+    assert "/" in data["model"]
 
 
 # ------------------------------------------------------------------
@@ -174,9 +176,12 @@ async def test_send_message(client, mock_agent_loop):
     session = await create_resp.json()
     sid = session["id"]
 
-    resp = await client.post(f"/session/{sid}/message", json={
-        "parts": [{"type": "text", "text": "Hello!"}],
-    })
+    resp = await client.post(
+        f"/session/{sid}/message",
+        json={
+            "parts": [{"type": "text", "text": "Hello!"}],
+        },
+    )
     assert resp.status == 200
     mock_agent_loop.process_direct.assert_awaited_once()
 
@@ -186,9 +191,12 @@ async def test_send_empty_message(client):
     session = await create_resp.json()
     sid = session["id"]
 
-    resp = await client.post(f"/session/{sid}/message", json={
-        "parts": [{"type": "text", "text": ""}],
-    })
+    resp = await client.post(
+        f"/session/{sid}/message",
+        json={
+            "parts": [{"type": "text", "text": ""}],
+        },
+    )
     assert resp.status == 400
 
 
