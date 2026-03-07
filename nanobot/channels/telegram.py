@@ -149,18 +149,32 @@ class TelegramChannel(BaseChannel):
         chat_id = self._session_chat_ids.get(session)
         if not chat_id:
             return
-        text = f"[{msg.channel}] {msg.content}"
+        text = f"[{msg.channel}:user] {msg.content}"
         # Fire-and-forget send (we're in a sync callback)
-        asyncio.ensure_future(self._send_text(int(chat_id), text))
+        asyncio.ensure_future(self._send_silent(int(chat_id), text))
 
-    async def _send_text(self, chat_id: int, text: str) -> None:
-        """Send a plain text message to a chat."""
+    async def _send_silent(self, chat_id: int, text: str) -> None:
+        """Send a silent text message (no notification) to a chat."""
         if not self._app:
             return
         try:
-            await self._app.bot.send_message(chat_id=chat_id, text=text)
+            await self._app.bot.send_message(
+                chat_id=chat_id, text=text, disable_notification=True,
+            )
         except Exception as e:
             logger.debug("Failed to mirror to Telegram {}: {}", chat_id, e)
+
+    async def mirror(self, msg: OutboundMessage) -> None:
+        """Mirror agent responses from other channels silently."""
+        if not msg.session_key or not msg.content:
+            return
+        if msg.metadata.get("_progress"):
+            return
+        chat_id = self._session_chat_ids.get(msg.session_key)
+        if not chat_id:
+            return
+        text = f"[{msg.channel}:agent] {msg.content}"
+        await self._send_silent(int(chat_id), text)
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""

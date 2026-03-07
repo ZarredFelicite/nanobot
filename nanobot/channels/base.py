@@ -139,7 +139,7 @@ class BaseChannel(ABC):
         mirrored = OutboundMessage(
             channel=self.name,
             chat_id=chat_id,
-            content=f"[{source}] {msg.content}",
+            content=f"[{source}:agent] {msg.content}",
         )
         await self.send(mirrored)
 
