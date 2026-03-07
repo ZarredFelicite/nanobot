@@ -519,6 +519,15 @@ def _run_as_client_interactive(
         turn_done.set()
         turn_response: list[str] = []
 
+        def _tty_write(text: str) -> None:
+            """Write directly to the terminal, bypassing prompt_toolkit's stdout proxy."""
+            try:
+                fd = sys.stdout.fileno()
+                os.write(fd, text.encode())
+            except Exception:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+
         async def _read_responses():
             while True:
                 try:
@@ -531,20 +540,14 @@ def _run_as_client_interactive(
                     source = data.get("from")  # set on mirrored messages
 
                     if msg_type == "inbound" and source:
-                        # User message from another channel
-                        print(f"\n\033[36m[{source}]\033[0m {content}\n", flush=True)
+                        _tty_write(f"\n\033[36m[{source}]\033[0m {content}\n\n")
                     elif msg_type == "progress":
                         prefix = f"[{source}] " if source else ""
-                        print(f"  \033[2m{prefix}↳ {content}\033[0m", flush=True)
+                        _tty_write(f"  \033[2m{prefix}↳ {content}\033[0m\n")
                     elif msg_type == "response":
                         if source:
-                            # Agent response mirrored from another channel
-                            print(f"\n\033[35m← {source}\033[0m", flush=True)
-                            if render_markdown:
-                                console.print(Markdown(content))
-                            else:
-                                print(content, flush=True)
-                            print(flush=True)
+                            _tty_write(f"\n\033[35m← {source}\033[0m\n")
+                            _tty_write(f"{content}\n\n")
                         elif not turn_done.is_set():
                             turn_response.append(content)
                             turn_done.set()
