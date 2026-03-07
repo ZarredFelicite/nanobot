@@ -10,7 +10,7 @@ from telegram import BotCommand, ReplyParameters, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import TelegramConfig
@@ -129,15 +129,47 @@ class TelegramChannel(BaseChannel):
         self.default_session = default_session
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
+
+        # Seed session→chat_id for the owner so mirroring works before first Telegram message
+        if self.default_session and self.config.allow_from:
+            owner = self.config.allow_from[0]
+            if owner != "*":
+                # For Telegram DMs, chat_id == user_id (strip username from "id|username")
+                owner_id = owner.split("|")[0]
+                self._session_chat_ids[self.default_session] = owner_id
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
+
+    def _on_inbound(self, msg: InboundMessage) -> None:
+        """Echo inbound messages from other channels to the Telegram owner."""
+        if msg.channel == self.name or not self._app:
+            return
+        session = msg.session_key
+        chat_id = self._session_chat_ids.get(session)
+        if not chat_id:
+            return
+        text = f"[{msg.channel}] {msg.content}"
+        # Fire-and-forget send (we're in a sync callback)
+        asyncio.ensure_future(self._send_text(int(chat_id), text))
+
+    async def _send_text(self, chat_id: int, text: str) -> None:
+        """Send a plain text message to a chat."""
+        if not self._app:
+            return
+        try:
+            await self._app.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            logger.debug("Failed to mirror to Telegram {}: {}", chat_id, e)
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
         if not self.config.token:
             logger.error("Telegram bot token not configured")
             return
+
+        # Register inbound listener for cross-channel echo
+        self.bus.add_inbound_listener(self._on_inbound)
 
         self._running = True
 
