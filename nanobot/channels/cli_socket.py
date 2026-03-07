@@ -36,8 +36,28 @@ class CLISocketServer(BaseChannel):
         self._client_sessions: dict[str, str] = {}  # chat_id -> session_key
         self._client_counter = 0
 
+    def _on_inbound(self, msg: InboundMessage) -> None:
+        """Echo inbound messages from other channels to CLI clients on the same session."""
+        if msg.channel == "cli":
+            return
+        session = msg.session_key
+        for chat_id, client_session in self._client_sessions.items():
+            if client_session != session:
+                continue
+            writer = self._clients.get(chat_id)
+            if writer:
+                self._write_json(writer, {
+                    "type": "inbound",
+                    "content": msg.content,
+                    "from": msg.channel,
+                    "sender": msg.sender_id,
+                })
+
     async def start(self) -> None:
         """Start listening on the Unix socket."""
+        # Register inbound listener for cross-channel echo
+        self.bus.add_inbound_listener(self._on_inbound)
+
         # Remove stale socket file
         if self._socket_path.exists():
             try:

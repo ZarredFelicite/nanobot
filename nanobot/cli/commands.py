@@ -473,12 +473,14 @@ def _run_as_client_single(
                 break
             data = json.loads(line.decode().strip())
             source = data.get("from")
-            if data.get("type") == "progress":
+            if data.get("type") == "inbound" and source:
+                print(f"\n\033[36m[{source}]\033[0m {data.get('content', '')}\n", flush=True)
+            elif data.get("type") == "progress":
                 prefix = f"[{source}] " if source else ""
-                console.print(f"  [dim]{prefix}↳ {data.get('content', '')}[/dim]")
+                print(f"  \033[2m{prefix}↳ {data.get('content', '')}\033[0m", flush=True)
             elif data.get("type") == "response":
                 if source:
-                    console.print(f"\n[magenta]← {source}[/magenta]: {data.get('content', '')}\n")
+                    print(f"\n\033[35m← {source}\033[0m: {data.get('content', '')}\n", flush=True)
                 else:
                     response_text = data.get("content", "")
                     break
@@ -528,17 +530,21 @@ def _run_as_client_interactive(
                     content = data.get("content", "")
                     source = data.get("from")  # set on mirrored messages
 
-                    if msg_type == "progress":
+                    if msg_type == "inbound" and source:
+                        # User message from another channel
+                        print(f"\n\033[36m[{source}]\033[0m {content}\n", flush=True)
+                    elif msg_type == "progress":
                         prefix = f"[{source}] " if source else ""
-                        console.print(f"  [dim]{prefix}↳ {content}[/dim]")
+                        print(f"  \033[2m{prefix}↳ {content}\033[0m", flush=True)
                     elif msg_type == "response":
                         if source:
-                            # Mirrored from another channel — always show
-                            console.print()
-                            console.print(f"[magenta]← {source}[/magenta]")
-                            body = Markdown(content) if render_markdown else Text(content)
-                            console.print(body)
-                            console.print()
+                            # Agent response mirrored from another channel
+                            print(f"\n\033[35m← {source}\033[0m", flush=True)
+                            if render_markdown:
+                                console.print(Markdown(content))
+                            else:
+                                print(content, flush=True)
+                            print(flush=True)
                         elif not turn_done.is_set():
                             turn_response.append(content)
                             turn_done.set()

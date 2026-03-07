@@ -1,6 +1,8 @@
 """Async message queue for decoupled channel-agent communication."""
 
 import asyncio
+from collections.abc import Callable
+from typing import Any
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 
@@ -16,10 +18,20 @@ class MessageBus:
     def __init__(self):
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+        self._inbound_listeners: list[Callable[[InboundMessage], Any]] = []
+
+    def add_inbound_listener(self, listener: Callable[[InboundMessage], Any]) -> None:
+        """Register a listener that is notified on every inbound message."""
+        self._inbound_listeners.append(listener)
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
         await self.inbound.put(msg)
+        for listener in self._inbound_listeners:
+            try:
+                listener(msg)
+            except Exception:
+                pass
 
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""

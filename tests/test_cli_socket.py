@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.cli_socket import CLISocketServer
 from nanobot.config.schema import CLISocketConfig
@@ -369,6 +369,62 @@ async def test_mirror_progress_from_other_channel(server, socket_path):
         data = json.loads(line.decode().strip())
         assert data["type"] == "progress"
         assert data["from"] == "telegram"
+
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_inbound_echo_from_other_channel(server, socket_path, bus):
+    """Inbound messages from other channels are echoed to CLI clients on the same session."""
+    await server.start()
+    try:
+        reader, writer, welcome = await _connect(socket_path)
+
+        # Simulate a Telegram inbound message on the shared session
+        telegram_msg = InboundMessage(
+            channel="telegram",
+            sender_id="12345|zarred",
+            chat_id="12345",
+            content="how's it going?",
+            session_key_override="user:test",
+        )
+        await bus.publish_inbound(telegram_msg)
+
+        # CLI client should receive the inbound echo
+        line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        data = json.loads(line.decode().strip())
+        assert data["type"] == "inbound"
+        assert data["content"] == "how's it going?"
+        assert data["from"] == "telegram"
+
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_inbound_echo_skips_cli_messages(server, socket_path, bus):
+    """CLI's own inbound messages are not echoed back."""
+    await server.start()
+    try:
+        reader, writer, welcome = await _connect(socket_path)
+
+        cli_msg = InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id=welcome["chatId"],
+            content="hello",
+            session_key_override="user:test",
+        )
+        await bus.publish_inbound(cli_msg)
+
+        # Should not receive an echo of our own message
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(reader.readline(), timeout=0.3)
 
         writer.close()
         await writer.wait_closed()
