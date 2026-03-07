@@ -1,0 +1,266 @@
+"""Tests for OpenCode HTTP+SSE channel."""
+
+import asyncio
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
+
+from nanobot.bus.queue import MessageBus
+from nanobot.channels.opencode import OpenCodeChannel
+from nanobot.config.schema import AgentDefaults, OpenCodeConfig
+from nanobot.session.manager import Session, SessionManager
+
+
+@pytest.fixture
+def bus():
+    return MessageBus()
+
+
+@pytest.fixture
+def session_manager(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "sessions").mkdir()
+    return SessionManager(workspace)
+
+
+@pytest.fixture
+def agent_config():
+    return AgentDefaults(
+        model="anthropic/claude-sonnet-4-20250514",
+        provider="anthropic",
+    )
+
+
+@pytest.fixture
+def mock_agent_loop(tmp_path):
+    loop = MagicMock()
+    loop.workspace = tmp_path / "workspace"
+    loop.process_direct = AsyncMock(return_value="Hello from nanobot!")
+    return loop
+
+
+@pytest.fixture
+def channel(bus, session_manager, mock_agent_loop, agent_config):
+    config = OpenCodeConfig(enabled=True, port=0)  # port 0 = not used in tests
+    return OpenCodeChannel(
+        config=config,
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=agent_config,
+    )
+
+
+@pytest.fixture
+def app(channel):
+    application = web.Application()
+    channel._register_routes(application)
+    return application
+
+
+@pytest.fixture
+async def client(app, aiohttp_client):
+    return await aiohttp_client(app)
+
+
+# ------------------------------------------------------------------
+# Bootstrap endpoints
+# ------------------------------------------------------------------
+
+
+async def test_config_providers(client):
+    resp = await client.get("/config/providers")
+    assert resp.status == 200
+    data = await resp.json()
+    assert "providers" in data
+    assert "default" in data
+    assert len(data["providers"]) >= 1
+    provider = data["providers"][0]
+    assert "id" in provider
+    assert "models" in provider
+
+
+async def test_provider(client):
+    resp = await client.get("/provider")
+    assert resp.status == 200
+    data = await resp.json()
+    assert isinstance(data, list)
+    assert len(data) >= 1
+    assert "models" in data[0]
+
+
+async def test_agent(client):
+    resp = await client.get("/agent")
+    assert resp.status == 200
+    data = await resp.json()
+    assert isinstance(data, list)
+    assert data[0]["name"] == "default"
+
+
+async def test_config(client):
+    resp = await client.get("/config")
+    assert resp.status == 200
+    data = await resp.json()
+    assert isinstance(data, dict)
+
+
+# ------------------------------------------------------------------
+# Session endpoints
+# ------------------------------------------------------------------
+
+
+async def test_create_session(client):
+    resp = await client.post("/session")
+    assert resp.status == 200
+    data = await resp.json()
+    assert "id" in data
+    assert "title" in data
+    assert "time" in data
+
+
+async def test_list_sessions(client):
+    # Create a session first
+    await client.post("/session")
+    resp = await client.get("/session")
+    assert resp.status == 200
+    data = await resp.json()
+    assert isinstance(data, list)
+
+
+async def test_get_session(client):
+    create_resp = await client.post("/session")
+    session = await create_resp.json()
+    sid = session["id"]
+
+    resp = await client.get(f"/session/{sid}")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["id"] == sid
+
+
+async def test_delete_session(client):
+    create_resp = await client.post("/session")
+    session = await create_resp.json()
+    sid = session["id"]
+
+    resp = await client.delete(f"/session/{sid}")
+    assert resp.status == 200
+
+
+async def test_session_messages_empty(client):
+    create_resp = await client.post("/session")
+    session = await create_resp.json()
+    sid = session["id"]
+
+    resp = await client.get(f"/session/{sid}/message")
+    assert resp.status == 200
+    data = await resp.json()
+    assert isinstance(data, list)
+    assert len(data) == 0
+
+
+# ------------------------------------------------------------------
+# Message send
+# ------------------------------------------------------------------
+
+
+async def test_send_message(client, mock_agent_loop):
+    create_resp = await client.post("/session")
+    session = await create_resp.json()
+    sid = session["id"]
+
+    resp = await client.post(f"/session/{sid}/message", json={
+        "parts": [{"type": "text", "text": "Hello!"}],
+    })
+    assert resp.status == 200
+    mock_agent_loop.process_direct.assert_awaited_once()
+
+
+async def test_send_empty_message(client):
+    create_resp = await client.post("/session")
+    session = await create_resp.json()
+    sid = session["id"]
+
+    resp = await client.post(f"/session/{sid}/message", json={
+        "parts": [{"type": "text", "text": ""}],
+    })
+    assert resp.status == 400
+
+
+# ------------------------------------------------------------------
+# SSE endpoint
+# ------------------------------------------------------------------
+
+
+async def test_sse_connected(client):
+    resp = await client.get("/event")
+    assert resp.status == 200
+    assert resp.content_type == "text/event-stream"
+
+    # Read the first SSE frame
+    line = b""
+    async for chunk in resp.content.iter_any():
+        line += chunk
+        if b"\n\n" in line:
+            break
+
+    text = line.decode()
+    assert "server.connected" in text
+
+
+# ------------------------------------------------------------------
+# Stub endpoints
+# ------------------------------------------------------------------
+
+
+async def test_stub_command(client):
+    resp = await client.get("/command")
+    assert resp.status == 200
+    assert await resp.json() == []
+
+
+async def test_stub_lsp(client):
+    resp = await client.get("/lsp")
+    assert resp.status == 200
+    assert await resp.json() == {}
+
+
+async def test_stub_vcs(client):
+    resp = await client.get("/vcs")
+    assert resp.status == 200
+    data = await resp.json()
+    assert "branch" in data
+
+
+async def test_health(client):
+    resp = await client.get("/global/health")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["healthy"] is True
+
+
+async def test_path(client):
+    resp = await client.get("/path")
+    assert resp.status == 200
+    data = await resp.json()
+    assert "home" in data
+    assert "directory" in data
+
+
+async def test_session_status(client):
+    resp = await client.get("/session/status")
+    assert resp.status == 200
+
+
+async def test_abort(client):
+    create_resp = await client.post("/session")
+    session = await create_resp.json()
+    sid = session["id"]
+
+    resp = await client.post(f"/session/{sid}/abort")
+    assert resp.status == 200

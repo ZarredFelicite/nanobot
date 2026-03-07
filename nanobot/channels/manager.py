@@ -23,9 +23,11 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(self, config: Config, bus: MessageBus, session_manager=None, agent_loop=None):
         self.config = config
         self.bus = bus
+        self.session_manager = session_manager
+        self.agent_loop = agent_loop
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -159,6 +161,21 @@ class ChannelManager:
                 default_session=self.config.agents.defaults.session,
             )
             logger.info("CLI socket channel enabled")
+
+        # OpenCode TUI HTTP+SSE channel
+        if self.config.channels.opencode.enabled:
+            try:
+                from nanobot.channels.opencode import OpenCodeChannel
+                self.channels["opencode"] = OpenCodeChannel(
+                    config=self.config.channels.opencode,
+                    bus=self.bus,
+                    session_manager=self.session_manager,
+                    agent_loop=self.agent_loop,
+                    agent_config=self.config.agents.defaults,
+                )
+                logger.info("OpenCode channel enabled on port {}", self.config.channels.opencode.port)
+            except ImportError as e:
+                logger.warning("OpenCode channel not available: {}", e)
 
         self._validate_allow_from()
 
