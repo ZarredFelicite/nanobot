@@ -121,10 +121,12 @@ class TelegramChannel(BaseChannel):
         config: TelegramConfig,
         bus: MessageBus,
         groq_api_key: str = "",
+        default_session: str = "",
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
+        self.default_session = default_session
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
@@ -433,6 +435,13 @@ class TelegramChannel(BaseChannel):
         # Start typing indicator before processing
         self._start_typing(str_chat_id)
 
+        # Use default_session for the owner (first allow_from entry)
+        session_key = None
+        if self.default_session and self.config.allow_from:
+            owner_id = self.config.allow_from[0]
+            if owner_id == "*" or owner_id in sender_id.split("|"):
+                session_key = self.default_session
+
         # Forward to the message bus
         await self._handle_message(
             sender_id=sender_id,
@@ -445,7 +454,8 @@ class TelegramChannel(BaseChannel):
                 "username": user.username,
                 "first_name": user.first_name,
                 "is_group": message.chat.type != "private"
-            }
+            },
+            session_key=session_key,
         )
 
     async def _flush_media_group(self, key: str) -> None:

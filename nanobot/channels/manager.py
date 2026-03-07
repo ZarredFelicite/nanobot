@@ -42,6 +42,7 @@ class ChannelManager:
                     self.config.channels.telegram,
                     self.bus,
                     groq_api_key=self.config.providers.groq.api_key,
+                    default_session=self.config.agents.default_session,
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:
@@ -148,6 +149,16 @@ class ChannelManager:
                 logger.info("Matrix channel enabled")
             except ImportError as e:
                 logger.warning("Matrix channel not available: {}", e)
+
+        # CLI socket channel (gateway client mode)
+        if self.config.channels.cli_socket.enabled:
+            from nanobot.channels.cli_socket import CLISocketServer
+            self.channels["cli"] = CLISocketServer(
+                self.config.channels.cli_socket,
+                self.bus,
+                default_session=self.config.agents.default_session,
+            )
+            logger.info("CLI socket channel enabled")
 
         self._validate_allow_from()
 

@@ -200,11 +200,19 @@ class MatrixConfig(Base):
     group_allow_from: list[str] = Field(default_factory=list)
     allow_room_mentions: bool = False
 
+class CLISocketConfig(Base):
+    """CLI Unix socket configuration for gateway client mode."""
+
+    enabled: bool = True
+    socket_path: str = "~/.nanobot/cli.sock"
+
+
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
     send_progress: bool = True    # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    cli_socket: CLISocketConfig = Field(default_factory=CLISocketConfig)
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -233,6 +241,7 @@ class AgentDefaults(Base):
 class AgentsConfig(Base):
     """Agent configuration."""
 
+    default_session: str = ""  # Shared session key for CLI + owner channels (e.g. "user:zarred")
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
 
 

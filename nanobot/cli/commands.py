@@ -1,6 +1,7 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
 import os
 import select
 import signal
@@ -423,6 +424,167 @@ def gateway(
 
 
 # ============================================================================
+# Gateway Client Helpers
+# ============================================================================
+
+
+def _test_gateway_connection(socket_path: Path) -> bool:
+    """Test if a running gateway is reachable on the Unix socket."""
+    import socket
+
+    if not socket_path.exists():
+        return False
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(str(socket_path))
+        return True
+    except (ConnectionRefusedError, FileNotFoundError, OSError):
+        return False
+    finally:
+        sock.close()
+
+
+def _run_as_client_single(
+    socket_path: Path, message: str, session: str | None, render_markdown: bool,
+) -> None:
+    """Send a single message to the gateway and print the response."""
+
+    async def _run():
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+        # Read welcome
+        welcome_line = await reader.readline()
+        welcome = json.loads(welcome_line.decode().strip())
+        chat_id = welcome.get("chatId", "")
+
+        # Send message
+        payload: dict = {"type": "message", "content": message}
+        if session:
+            payload["session"] = session
+        writer.write(json.dumps(payload).encode() + b"\n")
+        await writer.drain()
+
+        # Read responses until we get a non-progress response
+        response_text = ""
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            data = json.loads(line.decode().strip())
+            if data.get("type") == "progress":
+                console.print(f"  [dim]{data.get('content', '')}[/dim]")
+            elif data.get("type") == "response":
+                response_text = data.get("content", "")
+                break
+
+        writer.close()
+        await writer.wait_closed()
+
+        _print_agent_response(response_text, render_markdown=render_markdown)
+
+    asyncio.run(_run())
+
+
+def _run_as_client_interactive(
+    socket_path: Path, session: str | None, render_markdown: bool,
+) -> None:
+    """Run an interactive session connected to the gateway."""
+    _init_prompt_session()
+    console.print(f"{__logo__} Connected to gateway (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+
+    def _exit_on_sigint(signum, frame):
+        _restore_terminal()
+        console.print("\nGoodbye!")
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _exit_on_sigint)
+
+    async def _run():
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+        # Read welcome
+        welcome_line = await reader.readline()
+        welcome = json.loads(welcome_line.decode().strip())
+        chat_id = welcome.get("chatId", "")
+
+        turn_done = asyncio.Event()
+        turn_done.set()
+        turn_response: list[str] = []
+
+        async def _read_responses():
+            while True:
+                try:
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    data = json.loads(line.decode().strip())
+                    msg_type = data.get("type", "")
+                    content = data.get("content", "")
+
+                    if msg_type == "progress":
+                        console.print(f"  [dim]{content}[/dim]")
+                    elif msg_type == "response":
+                        if not turn_done.is_set():
+                            turn_response.append(content)
+                            turn_done.set()
+                        elif content:
+                            _print_agent_response(content, render_markdown=render_markdown)
+                except (json.JSONDecodeError, asyncio.CancelledError):
+                    break
+
+        read_task = asyncio.create_task(_read_responses())
+
+        try:
+            while True:
+                try:
+                    _flush_pending_tty_input()
+                    user_input = await _read_interactive_input_async()
+                    command = user_input.strip()
+                    if not command:
+                        continue
+
+                    if _is_exit_command(command):
+                        _restore_terminal()
+                        console.print("\nGoodbye!")
+                        break
+
+                    turn_done.clear()
+                    turn_response.clear()
+
+                    payload: dict = {"type": "message", "content": user_input}
+                    if session:
+                        payload["session"] = session
+                    writer.write(json.dumps(payload).encode() + b"\n")
+                    await writer.drain()
+
+                    # Wait for response with a spinner
+                    with console.status("[dim]nanobot is thinking...[/dim]", spinner="dots"):
+                        await turn_done.wait()
+
+                    if turn_response:
+                        _print_agent_response(turn_response[0], render_markdown=render_markdown)
+
+                except KeyboardInterrupt:
+                    _restore_terminal()
+                    console.print("\nGoodbye!")
+                    break
+                except EOFError:
+                    _restore_terminal()
+                    console.print("\nGoodbye!")
+                    break
+        finally:
+            read_task.cancel()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    asyncio.run(_run())
+
+
+# ============================================================================
 # Agent Commands
 # ============================================================================
 
@@ -444,6 +606,31 @@ def agent(
 
     config = load_config()
     sync_workspace_templates(config.workspace_path)
+
+    # --- Gateway client mode: connect to running gateway if available ---
+    socket_path = Path(config.channels.cli_socket.socket_path).expanduser()
+    if config.channels.cli_socket.enabled and socket_path.exists():
+        # Determine session override for gateway mode
+        # If user kept the default session_id, use the gateway's default_session (omit field)
+        # If user explicitly passed -s, forward it
+        explicit_session = session_id if session_id != "cli:direct" else None
+
+        if _test_gateway_connection(socket_path):
+            try:
+                if message:
+                    console.print(f"[dim]Connected to gateway via {socket_path}[/dim]")
+                    _run_as_client_single(socket_path, message, explicit_session, markdown)
+                else:
+                    _run_as_client_interactive(socket_path, explicit_session, markdown)
+                return
+            except ConnectionRefusedError:
+                console.print("[yellow]Gateway not responding, falling back to standalone mode[/yellow]")
+            except Exception as e:
+                console.print(f"[yellow]Gateway connection failed ({e}), falling back to standalone[/yellow]")
+        else:
+            console.print("[yellow]Gateway socket exists but not reachable, falling back to standalone[/yellow]")
+
+    # --- Standalone mode (existing behavior) ---
 
     bus = MessageBus()
     provider = _make_provider(config)
@@ -494,12 +681,32 @@ def agent(
         console.print(f"  [dim]↳ {content}[/dim]")
 
     if message:
-        # Single message mode — direct call, no bus needed
+        # Single message mode — direct call, but with channel support for outbound messages
         async def run_once():
-            with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
-            await agent_loop.close_mcp()
+            from nanobot.channels.manager import ChannelManager
+
+            # Create channel manager to handle outbound messages (e.g., to Telegram)
+            channels = ChannelManager(config, bus)
+
+            # Start channels briefly to handle outbound messages
+            channel_task = None
+            if channels.enabled_channels:
+                channel_task = asyncio.create_task(channels.start_all())
+
+            try:
+                with _thinking_ctx():
+                    response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
+
+                # Give channels time to send any outbound messages
+                await asyncio.sleep(0.5)
+
+                _print_agent_response(response, render_markdown=markdown)
+            finally:
+                if channel_task:
+                    channel_task.cancel()
+                    await asyncio.gather(channel_task, return_exceptions=True)
+                    await channels.stop_all()
+                await agent_loop.close_mcp()
 
         asyncio.run(run_once())
     else:
