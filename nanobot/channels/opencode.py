@@ -60,6 +60,26 @@ class OpenCodeChannel(BaseChannel):
         self._id_counter += 1
         return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
+    def _parse_model(self) -> tuple[str, str]:
+        """Return (provider_name, short_model_id) from agent config.
+
+        Nanobot stores models as "provider/model-name" (e.g. "anthropic/claude-opus-4-5").
+        OpenCode expects the provider ID and model ID to be separate, with the models
+        dict keyed by the short model ID (without provider prefix).
+        """
+        full_model = self.agent_config.model if self.agent_config else "default"
+        provider = self.agent_config.provider if self.agent_config else "nanobot"
+
+        if "/" in full_model:
+            prefix, short = full_model.split("/", 1)
+            if provider == "auto":
+                provider = prefix
+            return provider, short
+
+        if provider == "auto":
+            provider = "nanobot"
+        return provider, full_model
+
     # ------------------------------------------------------------------
     # BaseChannel interface
     # ------------------------------------------------------------------
@@ -160,10 +180,7 @@ class OpenCodeChannel(BaseChannel):
     # ------------------------------------------------------------------
 
     async def _handle_config_providers(self, request: web.Request) -> web.Response:
-        model_id = self.agent_config.model if self.agent_config else "default"
-        provider_name = self.agent_config.provider if self.agent_config else "nanobot"
-        if provider_name == "auto":
-            provider_name = model_id.split("/")[0] if "/" in model_id else "nanobot"
+        provider_name, model_id = self._parse_model()
 
         provider_data = {
             "id": provider_name,
@@ -200,10 +217,7 @@ class OpenCodeChannel(BaseChannel):
         })
 
     async def _handle_provider(self, request: web.Request) -> web.Response:
-        model_id = self.agent_config.model if self.agent_config else "default"
-        provider_name = self.agent_config.provider if self.agent_config else "nanobot"
-        if provider_name == "auto":
-            provider_name = model_id.split("/")[0] if "/" in model_id else "nanobot"
+        provider_name, model_id = self._parse_model()
 
         return web.json_response([{
             "id": provider_name,
@@ -425,10 +439,7 @@ class OpenCodeChannel(BaseChannel):
             return web.json_response({"error": "empty message"}, status=400)
 
         now = time.time()
-        model_id = self.agent_config.model if self.agent_config else "default"
-        provider_name = self.agent_config.provider if self.agent_config else "nanobot"
-        if provider_name == "auto":
-            provider_name = model_id.split("/")[0] if "/" in model_id else "nanobot"
+        provider_name, model_id = self._parse_model()
 
         # User message
         user_msg_id = self._next_id("msg")
@@ -650,10 +661,7 @@ class OpenCodeChannel(BaseChannel):
     def _messages_to_opencode(self, session: Session, session_id: str) -> list[dict[str, Any]]:
         """Convert nanobot message list to OpenCode message format."""
         result = []
-        model_id = self.agent_config.model if self.agent_config else "default"
-        provider_name = self.agent_config.provider if self.agent_config else "nanobot"
-        if provider_name == "auto":
-            provider_name = model_id.split("/")[0] if "/" in model_id else "nanobot"
+        provider_name, model_id = self._parse_model()
 
         prev_user_id = None
 
