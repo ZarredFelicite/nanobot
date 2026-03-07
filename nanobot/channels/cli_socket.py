@@ -33,6 +33,7 @@ class CLISocketServer(BaseChannel):
         self._socket_path = Path(config.socket_path).expanduser()
         self._server: asyncio.AbstractServer | None = None
         self._clients: dict[str, asyncio.StreamWriter] = {}
+        self._client_sessions: dict[str, str] = {}  # chat_id -> session_key
         self._client_counter = 0
 
     async def start(self) -> None:
@@ -61,6 +62,10 @@ class CLISocketServer(BaseChannel):
         chat_id = f"cli_{self._client_counter}"
         self._client_counter += 1
         self._clients[chat_id] = writer
+
+        # Track session for this client (default until overridden by first message)
+        if self.default_session:
+            self._client_sessions[chat_id] = self.default_session
 
         logger.info("CLI client connected: {}", chat_id)
 
@@ -93,6 +98,10 @@ class CLISocketServer(BaseChannel):
                 # Determine session key
                 session_override = data.get("session") or self.default_session or None
 
+                # Track the session this client is using
+                if session_override:
+                    self._client_sessions[chat_id] = session_override
+
                 msg = InboundMessage(
                     channel="cli",
                     sender_id="user",
@@ -106,6 +115,7 @@ class CLISocketServer(BaseChannel):
             pass
         finally:
             self._clients.pop(chat_id, None)
+            self._client_sessions.pop(chat_id, None)
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -127,6 +137,27 @@ class CLISocketServer(BaseChannel):
         }
         self._write_json(writer, payload)
 
+    def mirror(self, msg: OutboundMessage) -> None:
+        """Mirror a message from another channel to CLI clients sharing the same session."""
+        if not msg.session_key:
+            return
+
+        is_progress = msg.metadata.get("_progress", False)
+        source = msg.channel
+
+        for chat_id, session in self._client_sessions.items():
+            if session != msg.session_key:
+                continue
+            writer = self._clients.get(chat_id)
+            if not writer:
+                continue
+            payload = {
+                "type": "progress" if is_progress else "response",
+                "content": msg.content or "",
+                "from": source,
+            }
+            self._write_json(writer, payload)
+
     async def stop(self) -> None:
         """Stop the server and clean up."""
         self._running = False
@@ -139,6 +170,7 @@ class CLISocketServer(BaseChannel):
             except Exception:
                 pass
         self._clients.clear()
+        self._client_sessions.clear()
 
         # Close server
         if self._server:

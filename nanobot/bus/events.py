@@ -34,5 +34,6 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    session_key: str | None = None  # Set by agent loop for cross-channel mirroring
 
 

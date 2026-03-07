@@ -288,3 +288,89 @@ async def test_empty_content_ignored(server, socket_path, bus):
         await writer.wait_closed()
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_mirror_sends_to_matching_session(server, socket_path):
+    """Mirror delivers messages from other channels to CLI clients on the same session."""
+    await server.start()
+    try:
+        reader, writer, welcome = await _connect(socket_path)
+        chat_id = welcome["chatId"]
+
+        # Send a message so the client's session is tracked
+        msg = {"type": "message", "content": "hi"}
+        writer.write(json.dumps(msg).encode() + b"\n")
+        await writer.drain()
+        await asyncio.sleep(0.05)
+
+        # Mirror a Telegram response on the same session
+        out_msg = OutboundMessage(
+            channel="telegram", chat_id="12345",
+            content="Hello from Telegram!",
+            session_key="user:test",
+        )
+        server.mirror(out_msg)
+
+        line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        data = json.loads(line.decode().strip())
+        assert data["type"] == "response"
+        assert data["content"] == "Hello from Telegram!"
+        assert data["from"] == "telegram"
+
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_mirror_skips_different_session(server, socket_path):
+    """Mirror does not deliver messages for a different session."""
+    await server.start()
+    try:
+        reader, writer, welcome = await _connect(socket_path)
+
+        # Client is on default session "user:test"
+        # Mirror a message on a different session
+        out_msg = OutboundMessage(
+            channel="telegram", chat_id="12345",
+            content="You should not see this",
+            session_key="other:session",
+        )
+        server.mirror(out_msg)
+
+        # Should time out — nothing delivered
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(reader.readline(), timeout=0.3)
+
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_mirror_progress_from_other_channel(server, socket_path):
+    """Mirrored progress messages include source channel."""
+    await server.start()
+    try:
+        reader, writer, welcome = await _connect(socket_path)
+
+        out_msg = OutboundMessage(
+            channel="telegram", chat_id="12345",
+            content="Thinking...",
+            metadata={"_progress": True},
+            session_key="user:test",
+        )
+        server.mirror(out_msg)
+
+        line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        data = json.loads(line.decode().strip())
+        assert data["type"] == "progress"
+        assert data["from"] == "telegram"
+
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await server.stop()

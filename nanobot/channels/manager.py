@@ -241,6 +241,12 @@ class ChannelManager:
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
 
+                # Mirror to CLI socket clients sharing the same session
+                if msg.channel != "cli" and msg.session_key:
+                    cli_ch = self.channels.get("cli")
+                    if cli_ch and hasattr(cli_ch, "mirror"):
+                        cli_ch.mirror(msg)
+
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:

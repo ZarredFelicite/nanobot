@@ -465,18 +465,23 @@ def _run_as_client_single(
         writer.write(json.dumps(payload).encode() + b"\n")
         await writer.drain()
 
-        # Read responses until we get a non-progress response
+        # Read responses until we get a non-progress, non-mirrored response
         response_text = ""
         while True:
             line = await reader.readline()
             if not line:
                 break
             data = json.loads(line.decode().strip())
+            source = data.get("from")
             if data.get("type") == "progress":
-                console.print(f"  [dim]{data.get('content', '')}[/dim]")
+                prefix = f"[{source}] " if source else ""
+                console.print(f"  [dim]{prefix}↳ {data.get('content', '')}[/dim]")
             elif data.get("type") == "response":
-                response_text = data.get("content", "")
-                break
+                if source:
+                    console.print(f"\n[magenta]← {source}[/magenta]: {data.get('content', '')}\n")
+                else:
+                    response_text = data.get("content", "")
+                    break
 
         writer.close()
         await writer.wait_closed()
@@ -521,11 +526,20 @@ def _run_as_client_interactive(
                     data = json.loads(line.decode().strip())
                     msg_type = data.get("type", "")
                     content = data.get("content", "")
+                    source = data.get("from")  # set on mirrored messages
 
                     if msg_type == "progress":
-                        console.print(f"  [dim]{content}[/dim]")
+                        prefix = f"[{source}] " if source else ""
+                        console.print(f"  [dim]{prefix}↳ {content}[/dim]")
                     elif msg_type == "response":
-                        if not turn_done.is_set():
+                        if source:
+                            # Mirrored from another channel — always show
+                            console.print()
+                            console.print(f"[magenta]← {source}[/magenta]")
+                            body = Markdown(content) if render_markdown else Text(content)
+                            console.print(body)
+                            console.print()
+                        elif not turn_done.is_set():
                             turn_response.append(content)
                             turn_done.set()
                         elif content:
