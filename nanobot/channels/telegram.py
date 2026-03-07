@@ -141,6 +141,14 @@ class TelegramChannel(BaseChannel):
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
 
+    # -- Mirror log: a single message that gets edited (no notifications) --
+    # Key: session_key -> (chat_id, message_id, lines[])
+    _mirror_logs: dict[str, tuple[int, int, list[str]]]
+
+    _MIRROR_HEADER = "📋 CLI Activity"
+    _MIRROR_MAX_LINES = 30  # Trim oldest lines when exceeded
+    _MIRROR_MAX_LEN = 4000  # Telegram message length limit
+
     def _on_inbound(self, msg: InboundMessage) -> None:
         """Echo inbound messages from other channels to the Telegram owner."""
         if msg.channel == self.name or not self._app:
@@ -149,23 +157,11 @@ class TelegramChannel(BaseChannel):
         chat_id = self._session_chat_ids.get(session)
         if not chat_id:
             return
-        text = f"[{msg.channel}:user] {msg.content}"
-        # Fire-and-forget send (we're in a sync callback)
-        asyncio.ensure_future(self._send_silent(int(chat_id), text))
-
-    async def _send_silent(self, chat_id: int, text: str) -> None:
-        """Send a silent text message (no notification) to a chat."""
-        if not self._app:
-            return
-        try:
-            await self._app.bot.send_message(
-                chat_id=chat_id, text=text, disable_notification=True,
-            )
-        except Exception as e:
-            logger.debug("Failed to mirror to Telegram {}: {}", chat_id, e)
+        line = f"[{msg.channel}:user] {msg.content}"
+        asyncio.ensure_future(self._append_mirror_log(session, int(chat_id), line))
 
     async def mirror(self, msg: OutboundMessage) -> None:
-        """Mirror agent responses from other channels silently."""
+        """Mirror agent responses from other channels via edited log message."""
         if not msg.session_key or not msg.content:
             return
         if msg.metadata.get("_progress"):
@@ -173,8 +169,59 @@ class TelegramChannel(BaseChannel):
         chat_id = self._session_chat_ids.get(msg.session_key)
         if not chat_id:
             return
-        text = f"[{msg.channel}:agent] {msg.content}"
-        await self._send_silent(int(chat_id), text)
+        # Truncate long agent responses for the mirror log
+        content = msg.content
+        if len(content) > 300:
+            content = content[:300] + "…"
+        line = f"[{msg.channel}:agent] {content}"
+        await self._append_mirror_log(msg.session_key, int(chat_id), line)
+
+    async def _append_mirror_log(self, session: str, chat_id: int, line: str) -> None:
+        """Append a line to the mirror log message, creating or editing as needed."""
+        if not self._app:
+            return
+
+        if not hasattr(self, "_mirror_logs"):
+            self._mirror_logs = {}
+
+        entry = self._mirror_logs.get(session)
+
+        if entry:
+            _, msg_id, lines = entry
+            lines.append(line)
+            # Trim oldest lines if too many
+            if len(lines) > self._MIRROR_MAX_LINES:
+                lines[:] = lines[-self._MIRROR_MAX_LINES:]
+            text = self._build_mirror_text(lines)
+            # If text is too long, trim from the top
+            while len(text) > self._MIRROR_MAX_LEN and len(lines) > 1:
+                lines.pop(0)
+                text = self._build_mirror_text(lines)
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id, text=text,
+                )
+                self._mirror_logs[session] = (chat_id, msg_id, lines)
+                return
+            except Exception as e:
+                # Message may have been deleted or is too old — create a new one
+                logger.debug("Mirror log edit failed, creating new: {}", e)
+
+        # Create new mirror log message
+        lines = [line]
+        text = self._build_mirror_text(lines)
+        try:
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id, text=text, disable_notification=True,
+            )
+            self._mirror_logs[session] = (chat_id, sent.message_id, lines)
+        except Exception as e:
+            logger.debug("Failed to create mirror log in Telegram {}: {}", chat_id, e)
+
+    def _build_mirror_text(self, lines: list[str]) -> str:
+        """Build the full mirror log message text."""
+        body = "\n".join(lines)
+        return f"{self._MIRROR_HEADER}\n\n{body}"
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
