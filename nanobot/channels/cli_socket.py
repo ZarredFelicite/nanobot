@@ -137,7 +137,7 @@ class CLISocketServer(BaseChannel):
         }
         self._write_json(writer, payload)
 
-    def mirror(self, msg: OutboundMessage) -> None:
+    async def mirror(self, msg: OutboundMessage) -> None:
         """Mirror a message from another channel to CLI clients sharing the same session."""
         if not msg.session_key:
             return

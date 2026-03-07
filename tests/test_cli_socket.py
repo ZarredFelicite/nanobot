@@ -310,7 +310,7 @@ async def test_mirror_sends_to_matching_session(server, socket_path):
             content="Hello from Telegram!",
             session_key="user:test",
         )
-        server.mirror(out_msg)
+        await server.mirror(out_msg)
 
         line = await asyncio.wait_for(reader.readline(), timeout=2.0)
         data = json.loads(line.decode().strip())
@@ -338,7 +338,7 @@ async def test_mirror_skips_different_session(server, socket_path):
             content="You should not see this",
             session_key="other:session",
         )
-        server.mirror(out_msg)
+        await server.mirror(out_msg)
 
         # Should time out — nothing delivered
         with pytest.raises(asyncio.TimeoutError):
@@ -363,7 +363,7 @@ async def test_mirror_progress_from_other_channel(server, socket_path):
             metadata={"_progress": True},
             session_key="user:test",
         )
-        server.mirror(out_msg)
+        await server.mirror(out_msg)
 
         line = await asyncio.wait_for(reader.readline(), timeout=2.0)
         data = json.loads(line.decode().strip())

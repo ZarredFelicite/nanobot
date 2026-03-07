@@ -30,6 +30,7 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
+        self._session_chat_ids: dict[str, str] = {}  # session_key -> chat_id for mirroring
 
     @abstractmethod
     async def start(self) -> None:
@@ -111,7 +112,36 @@ class BaseChannel(ABC):
             session_key_override=session_key,
         )
 
+        # Track session→chat_id for cross-channel mirroring
+        if session_key:
+            self._session_chat_ids[session_key] = str(chat_id)
+
         await self.bus.publish_inbound(msg)
+
+    async def mirror(self, msg: OutboundMessage) -> None:
+        """Mirror a message from another channel to this channel if sessions match.
+
+        Looks up the chat_id associated with the message's session_key and
+        forwards the content via send(), prefixed with the source channel.
+        """
+        if not msg.session_key or not msg.content:
+            return
+
+        chat_id = self._session_chat_ids.get(msg.session_key)
+        if not chat_id:
+            return
+
+        source = msg.channel
+        is_progress = msg.metadata.get("_progress", False)
+        if is_progress:
+            return  # Only mirror final responses, not progress
+
+        mirrored = OutboundMessage(
+            channel=self.name,
+            chat_id=chat_id,
+            content=f"[{source}] {msg.content}",
+        )
+        await self.send(mirrored)
 
     @property
     def is_running(self) -> bool:
