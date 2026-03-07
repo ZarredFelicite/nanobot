@@ -94,6 +94,14 @@ class CLISocketServer(BaseChannel):
         if self.default_session:
             welcome["defaultSession"] = self.default_session
         self._write_json(writer, welcome)
+        try:
+            await writer.drain()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Client disconnected immediately (e.g. connection test probe)
+            self._clients.pop(chat_id, None)
+            self._client_sessions.pop(chat_id, None)
+            logger.info("CLI client disconnected: {}", chat_id)
+            return
 
         try:
             while True:
@@ -131,15 +139,16 @@ class CLISocketServer(BaseChannel):
                 )
                 await self.bus.publish_inbound(msg)
 
-        except (asyncio.CancelledError, ConnectionResetError):
+        except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
             pass
         finally:
             self._clients.pop(chat_id, None)
             self._client_sessions.pop(chat_id, None)
             try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
+                if not writer.is_closing():
+                    writer.close()
+                    await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             logger.info("CLI client disconnected: {}", chat_id)
 
