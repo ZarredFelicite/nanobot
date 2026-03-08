@@ -56,6 +56,8 @@ class AgentLoop:
         temperature: float = 0.1,
         max_tokens: int = 4096,
         memory_window: int = 100,
+        context_tokens: int = 200000,
+        reserve_tokens_floor: int = 20000,
         reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
@@ -68,6 +70,7 @@ class AgentLoop:
         memu_config: MemUConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
+
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
@@ -77,6 +80,8 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.memory_window = memory_window
+        self.context_tokens = max(4096, context_tokens)
+        self.reserve_tokens_floor = max(0, reserve_tokens_floor)
         self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
@@ -105,6 +110,7 @@ class AgentLoop:
         self._memu_bridge = None
         if memu_config and memu_config.enabled:
             from nanobot.agent.memu_service import MemUBridge
+
             self._memu_bridge = MemUBridge(memu_config)
 
         self._running = False
@@ -114,9 +120,14 @@ class AgentLoop:
         self._mcp_connecting = False
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
-        self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
+        self._codex_provider: LLMProvider | None = None
+        self._last_context_stats: dict[str, dict[str, Any]] = {}
+        self._last_llm_usage: dict[str, dict[str, Any]] = {}
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -124,12 +135,14 @@ class AgentLoop:
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
-        self.tools.register(ExecTool(
-            working_dir=str(self.workspace),
-            timeout=self.exec_config.timeout,
-            restrict_to_workspace=self.restrict_to_workspace,
-            path_append=self.exec_config.path_append,
-        ))
+        self.tools.register(
+            ExecTool(
+                working_dir=str(self.workspace),
+                timeout=self.exec_config.timeout,
+                restrict_to_workspace=self.restrict_to_workspace,
+                path_append=self.exec_config.path_append,
+            )
+        )
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
@@ -138,6 +151,7 @@ class AgentLoop:
             self.tools.register(CronTool(self.cron_service))
         if self._memu_bridge:
             from nanobot.agent.tools.memu_retrieve import MemURetrieveTool
+
             self.tools.register(MemURetrieveTool(self._memu_bridge))
 
     async def _connect_mcp(self) -> None:
@@ -146,6 +160,7 @@ class AgentLoop:
             return
         self._mcp_connecting = True
         from nanobot.agent.tools.mcp import connect_mcp_servers
+
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
@@ -166,8 +181,9 @@ class AgentLoop:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                set_context = getattr(tool, "set_context", None)
+                if callable(set_context):
+                    set_context(channel, chat_id, *([message_id] if name == "message" else []))
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -179,36 +195,208 @@ class AgentLoop:
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
+
         def _fmt(tc):
             args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
             val = next(iter(args.values()), None) if isinstance(args, dict) else None
             if not isinstance(val, str):
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
+
         return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    @staticmethod
+    def _fallback_token_count(messages: list[dict[str, Any]]) -> int:
+        """Fallback token estimator when model tokenizer is unavailable."""
+        chars = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                chars += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
+                        chars += len(str(block.get("text", "")))
+                    elif block.get("type") == "image_url":
+                        chars += 256
+                    else:
+                        chars += len(str(block))
+            else:
+                chars += len(str(content))
+            chars += 24
+        return max(1, chars // 4)
+
+    def _count_tokens(self, messages: list[dict[str, Any]], model: str) -> int:
+        """Count prompt tokens with model-aware tokenization."""
+        if not messages:
+            return 0
+
+        try:
+            from litellm import token_counter
+
+            resolved_model = model
+            resolve_model = getattr(self.provider, "_resolve_model", None)
+            if callable(resolve_model):
+                candidate = resolve_model(model)
+                if isinstance(candidate, str) and candidate:
+                    resolved_model = candidate
+            model_name = resolved_model if isinstance(resolved_model, str) else model
+            return int(token_counter(model=model_name, messages=messages) or 0)
+        except Exception:
+            return self._fallback_token_count(messages)
+
+    def _context_budget(self) -> int:
+        """Maximum prompt tokens before compaction is required."""
+        return max(512, self.context_tokens - self.max_tokens - self.reserve_tokens_floor)
+
+    def _context_usage_breakdown(
+        self, messages: list[dict[str, Any]], model: str
+    ) -> dict[str, int]:
+        """Compute token breakdown for system/history/current message."""
+        total = self._count_tokens(messages, model)
+        if not messages:
+            return {"system": 0, "history": 0, "current": 0, "total": total}
+
+        system = self._count_tokens(messages[:1], model)
+        without_current = self._count_tokens(messages[:-1], model) if len(messages) > 1 else system
+        history = max(0, without_current - system)
+        current = max(0, total - without_current)
+        return {"system": system, "history": history, "current": current, "total": total}
+
+    def _trim_history_by_budget(
+        self,
+        history: list[dict[str, Any]],
+        current_message: str,
+        media: list[str] | None,
+        channel: str,
+        chat_id: str,
+        model: str,
+    ) -> list[dict[str, Any]]:
+        """Trim oldest turns until prompt fits the token budget."""
+        trimmed = list(history)
+        budget = self._context_budget()
+
+        while trimmed:
+            candidate = self.context.build_messages(
+                history=trimmed,
+                current_message=current_message,
+                media=media if media else None,
+                channel=channel,
+                chat_id=chat_id,
+            )
+            if self._count_tokens(candidate, model) <= budget:
+                break
+
+            trimmed = trimmed[1:]
+            while trimmed and trimmed[0].get("role") != "user":
+                trimmed = trimmed[1:]
+
+        return trimmed
+
+    def get_last_context_stats(self, session_key: str) -> dict[str, Any] | None:
+        """Get the most recent context usage stats for a session."""
+        return self._last_context_stats.get(session_key)
+
+    def get_last_llm_usage(self, session_key: str) -> dict[str, Any] | None:
+        """Get the most recent model usage payload for a session."""
+        return self._last_llm_usage.get(session_key)
+
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        """Best-effort integer conversion for persisted metadata values."""
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _record_context_usage(self, session: Session, stats: dict[str, Any]) -> None:
+        """Persist per-session context usage totals and latest breakdown."""
+        final = stats.get("final") if isinstance(stats, dict) else None
+        if not isinstance(final, dict):
+            return
+
+        usage = session.metadata.get("context_usage")
+        if not isinstance(usage, dict):
+            usage = {}
+
+        totals = usage.get("totals")
+        if not isinstance(totals, dict):
+            totals = {
+                "requests": 0,
+                "system_tokens": 0,
+                "history_tokens": 0,
+                "current_tokens": 0,
+                "total_tokens": 0,
+                "compaction_passes": 0,
+                "trimmed_history_messages": 0,
+            }
+
+        totals["requests"] = self._to_int(totals.get("requests")) + 1
+        totals["system_tokens"] = self._to_int(totals.get("system_tokens")) + self._to_int(
+            final.get("system")
+        )
+        totals["history_tokens"] = self._to_int(totals.get("history_tokens")) + self._to_int(
+            final.get("history")
+        )
+        totals["current_tokens"] = self._to_int(totals.get("current_tokens")) + self._to_int(
+            final.get("current")
+        )
+        totals["total_tokens"] = self._to_int(totals.get("total_tokens")) + self._to_int(
+            final.get("total")
+        )
+        totals["compaction_passes"] = self._to_int(totals.get("compaction_passes")) + self._to_int(
+            stats.get("compactionPasses")
+        )
+        totals["trimmed_history_messages"] = self._to_int(
+            totals.get("trimmed_history_messages")
+        ) + self._to_int(stats.get("trimmedHistoryMessages"))
+
+        usage["totals"] = totals
+        usage["last"] = stats
+        session.metadata["context_usage"] = usage
 
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
+        model: str | None = None,
+    ) -> tuple[str | None, list[str], list[dict], dict[str, Any]]:
+        """Run the agent loop. Returns (final_content, tools_used, messages, usage)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        latest_usage: dict[str, Any] = {}
+        active_model = model or self.model
+        active_provider = self.provider
+        if active_model.startswith(("openai-codex/", "openai_codex/")):
+            if self._codex_provider is None:
+                from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+
+                self._codex_provider = OpenAICodexProvider(default_model=active_model)
+            active_provider = self._codex_provider
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await self.provider.chat(
+            response = await active_provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model,
+                model=active_model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
             )
+            if isinstance(response.usage, dict):
+                latest_usage = response.usage
 
             if response.has_tool_calls:
                 if on_progress:
@@ -223,13 +411,15 @@ class AgentLoop:
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": json.dumps(tc.arguments, ensure_ascii=False)
-                        }
+                            "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                        },
                     }
                     for tc in response.tool_calls
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
+                    messages,
+                    response.content,
+                    tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
@@ -251,7 +441,9 @@ class AgentLoop:
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
-                    messages, clean, reasoning_content=response.reasoning_content,
+                    messages,
+                    clean,
+                    reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
                 final_content = clean
@@ -264,7 +456,7 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
-        return final_content, tools_used, messages
+        return final_content, tools_used, messages, latest_usage
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -286,7 +478,12 @@ class AgentLoop:
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                task.add_done_callback(
+                    lambda t, k=msg.session_key: self._active_tasks.get(k, [])
+                    and self._active_tasks[k].remove(t)
+                    if t in self._active_tasks.get(k, [])
+                    else None
+                )
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -300,10 +497,14 @@ class AgentLoop:
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
-        await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=content,
-            session_key=msg.session_key,
-        ))
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                session_key=msg.session_key,
+            )
+        )
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
@@ -313,21 +514,28 @@ class AgentLoop:
                 if response is not None:
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
-                        session_key=msg.session_key,
-                    ))
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="",
+                            metadata=msg.metadata or {},
+                            session_key=msg.session_key,
+                        )
+                    )
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
-                    session_key=msg.session_key,
-                ))
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="Sorry, I encountered an error.",
+                        session_key=msg.session_key,
+                    )
+                )
 
     async def close_mcp(self) -> None:
         """Close MCP connections and memU bridge."""
@@ -350,33 +558,45 @@ class AgentLoop:
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        model: str | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
-            channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
-                                else ("cli", msg.chat_id))
+            channel, chat_id = (
+                msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
+            )
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
+            active_model = model or self.model
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
             messages = self.context.build_messages(
                 history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
-            self._save_turn(session, all_msgs, 1 + len(history))
+            final_content, _, all_msgs, usage = await self._run_agent_loop(
+                messages, model=active_model
+            )
+            self._save_turn(session, all_msgs, 1 + len(history), usage=usage, model=active_model)
             self.sessions.save(session)
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.",
-                                  session_key=key)
+            self._last_llm_usage[key] = usage
+            return OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=final_content or "Background task completed.",
+                session_key=key,
+            )
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+        active_model = model or self.model
 
         # Slash commands
         cmd = msg.content.strip().lower()
@@ -385,20 +605,22 @@ class AgentLoop:
             self._consolidating.add(session.key)
             try:
                 async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
+                    snapshot = session.messages[session.last_consolidated :]
                     if snapshot:
                         temp = Session(key=session.key)
                         temp.messages = list(snapshot)
                         if not await self._consolidate_memory(temp, archive_all=True):
                             return OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
                                 content="Memory archival failed, session not cleared. Please try again.",
                                 session_key=key,
                             )
             except Exception:
                 logger.exception("/new archival failed for {}", session.key)
                 return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
                     content="Memory archival failed, session not cleared. Please try again.",
                     session_key=key,
                 )
@@ -408,15 +630,22 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.", session_key=key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="New session started.",
+                session_key=key,
+            )
         if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands",
-                                  session_key=key)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands",
+                session_key=key,
+            )
 
         unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
+        if unconsolidated >= self.memory_window and session.key not in self._consolidating:
             self._consolidating.add(session.key)
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
 
@@ -439,31 +668,131 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=self.memory_window)
+
+        # Token-aware context compaction before requesting the model.
+        initial_usage: dict[str, int] | None = None
+        final_usage: dict[str, int] | None = None
+        compaction_passes = 0
+        trimmed_history_messages = 0
+
+        for attempt in range(3):
+            probe = self.context.build_messages(
+                history=history,
+                current_message=msg.content,
+                media=msg.media if msg.media else None,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+            )
+            usage = self._context_usage_breakdown(probe, active_model)
+            if initial_usage is None:
+                initial_usage = usage
+            budget = self._context_budget()
+            logger.info(
+                "Context usage [{}]: total={} (system={}, history={}, current={}) / budget={} (ctx={}, reserve={}, max_out={})",
+                active_model,
+                usage["total"],
+                usage["system"],
+                usage["history"],
+                usage["current"],
+                budget,
+                self.context_tokens,
+                self.reserve_tokens_floor,
+                self.max_tokens,
+            )
+
+            if usage["total"] <= budget:
+                break
+
+            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
+            self._consolidating.add(session.key)
+            try:
+                async with lock:
+                    if not await self._consolidate_memory(session):
+                        break
+                    self.sessions.save(session)
+                    history = session.get_history(max_messages=self.memory_window)
+                    compaction_passes += 1
+                    logger.info("Compaction pass {} applied for {}", attempt + 1, session.key)
+            finally:
+                self._consolidating.discard(session.key)
+
+        preview = self.context.build_messages(
+            history=history,
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+        )
+        if self._count_tokens(preview, active_model) > self._context_budget() and history:
+            before_trim = len(history)
+            history = self._trim_history_by_budget(
+                history,
+                current_message=msg.content,
+                media=msg.media,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                model=active_model,
+            )
+            trimmed_history_messages = max(0, before_trim - len(history))
+
+        final_preview = self.context.build_messages(
+            history=history,
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+        )
+        final_usage = self._context_usage_breakdown(final_preview, active_model)
+        budget = self._context_budget()
+        self._last_context_stats[key] = {
+            "model": active_model,
+            "budget": budget,
+            "contextTokens": self.context_tokens,
+            "reserveTokensFloor": self.reserve_tokens_floor,
+            "maxOutputTokens": self.max_tokens,
+            "initial": initial_usage or final_usage,
+            "final": final_usage,
+            "compactionPasses": compaction_passes,
+            "trimmedHistoryMessages": trimmed_history_messages,
+            "withinBudget": final_usage["total"] <= budget,
+            "usagePercent": round((final_usage["total"] / budget) * 100, 2) if budget > 0 else 0.0,
+        }
+        self._record_context_usage(session, self._last_context_stats[key])
+
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-                session_key=key,
-            ))
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=content,
+                    metadata=meta,
+                    session_key=key,
+                )
+            )
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+        final_content, _, all_msgs, usage = await self._run_agent_loop(
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            model=active_model,
         )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        self._save_turn(session, all_msgs, 1 + len(history), usage=usage, model=active_model)
         self.sessions.save(session)
+        self._last_llm_usage[key] = usage
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -471,22 +800,41 @@ class AgentLoop:
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {}, session_key=key,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=final_content,
+            metadata=msg.metadata or {},
+            session_key=key,
         )
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
+    def _save_turn(
+        self,
+        session: Session,
+        messages: list[dict],
+        skip: int,
+        usage: dict[str, Any] | None = None,
+        model: str | None = None,
+    ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
+
+        saved_entries: list[dict[str, Any]] = []
+
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
-            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            if (
+                role == "tool"
+                and isinstance(content, str)
+                and len(content) > self._TOOL_RESULT_MAX_CHARS
+            ):
+                entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
             elif role == "user":
-                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                if isinstance(content, str) and content.startswith(
+                    ContextBuilder._RUNTIME_CONTEXT_TAG
+                ):
                     # Strip the runtime-context prefix, keep only the user text.
                     parts = content.split("\n\n", 1)
                     if len(parts) > 1 and parts[1].strip():
@@ -496,10 +844,15 @@ class AgentLoop:
                 if isinstance(content, list):
                     filtered = []
                     for c in content:
-                        if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                        if (
+                            c.get("type") == "text"
+                            and isinstance(c.get("text"), str)
+                            and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                        ):
                             continue  # Strip runtime context from multimodal messages
-                        if (c.get("type") == "image_url"
-                                and c.get("image_url", {}).get("url", "").startswith("data:image/")):
+                        if c.get("type") == "image_url" and c.get("image_url", {}).get(
+                            "url", ""
+                        ).startswith("data:image/"):
                             filtered.append({"type": "text", "text": "[image]"})
                         else:
                             filtered.append(c)
@@ -508,6 +861,24 @@ class AgentLoop:
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
+            saved_entries.append(entry)
+
+        if isinstance(usage, dict) and saved_entries:
+            target: dict[str, Any] | None = None
+            for entry in reversed(saved_entries):
+                if entry.get("role") == "assistant" and not entry.get("tool_calls"):
+                    target = entry
+                    break
+            if target is None:
+                for entry in reversed(saved_entries):
+                    if entry.get("role") == "assistant":
+                        target = entry
+                        break
+            if target is not None:
+                target["usage"] = dict(usage)
+                if model:
+                    target["model"] = model
+
         session.updated_at = datetime.now()
 
         # Feed new messages to memU for extraction
@@ -517,9 +888,36 @@ class AgentLoop:
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
         return await MemoryStore(self.workspace).consolidate(
-            session, self.provider, self.model,
-            archive_all=archive_all, memory_window=self.memory_window,
+            session,
+            self.provider,
+            self.model,
+            archive_all=archive_all,
+            memory_window=self.memory_window,
         )
+
+    async def compact_session(
+        self, session_key: str, *, archive_all: bool = False
+    ) -> dict[str, Any]:
+        """Force memory compaction for a session and return compaction status."""
+        session = self.sessions.get_or_create(session_key)
+        lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
+        self._consolidating.add(session.key)
+        try:
+            async with lock:
+                before = session.last_consolidated
+                success = await self._consolidate_memory(session, archive_all=archive_all)
+                self.sessions.save(session)
+                latest_history = MemoryStore(self.workspace).read_latest_history_entry()
+                return {
+                    "ok": bool(success),
+                    "archiveAll": archive_all,
+                    "lastConsolidatedBefore": before,
+                    "lastConsolidatedAfter": session.last_consolidated,
+                    "messageCount": len(session.messages),
+                    "historyEntry": latest_history,
+                }
+        finally:
+            self._consolidating.discard(session.key)
 
     async def process_direct(
         self,
@@ -528,11 +926,14 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        model: str | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
         if self._memu_bridge and not self._memu_bridge._available:
             await self._memu_bridge.initialize()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(
+            msg, session_key=session_key, on_progress=on_progress, model=model
+        )
         return response.content if response else ""

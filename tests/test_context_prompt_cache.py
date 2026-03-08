@@ -63,3 +63,26 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_identity_uses_identity_md_when_present(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    (workspace / "IDENTITY.md").write_text(
+        "- I am Zarred's focused coding copilot.", encoding="utf-8"
+    )
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt()
+
+    assert "You are based on nanobot - an AI assistant, here is your identity:" in prompt
+    assert "- I am Zarred's focused coding copilot." in prompt
+    assert "## IDENTITY.md" not in prompt
+
+
+def test_identity_falls_back_when_identity_md_missing(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt()
+
+    assert "You are nanobot, a helpful AI assistant." in prompt

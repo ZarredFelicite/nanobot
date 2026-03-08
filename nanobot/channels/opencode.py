@@ -24,7 +24,7 @@ from nanobot.channels.base import BaseChannel
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
-    from nanobot.config.schema import AgentDefaults, OpenCodeConfig
+    from nanobot.config.schema import AgentDefaults, ModelsConfig, OpenCodeConfig
     from nanobot.session.manager import Session, SessionManager
 
 
@@ -40,16 +40,19 @@ class OpenCodeChannel(BaseChannel):
         session_manager: SessionManager | None = None,
         agent_loop: AgentLoop | None = None,
         agent_config: AgentDefaults | None = None,
+        models_config: ModelsConfig | None = None,
     ):
         super().__init__(config, bus)
         self.session_manager = session_manager
         self.agent_loop = agent_loop
         self.agent_config = agent_config
+        self.models_config = models_config
         self.port = config.port
 
         self._sse_clients: list[web.StreamResponse] = []
         self._id_counter = 0
         self._active_tasks: dict[str, asyncio.Task] = {}
+        self._last_context_by_session: dict[str, dict[str, Any]] = {}
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
 
@@ -79,6 +82,103 @@ class OpenCodeChannel(BaseChannel):
             return True
         return any(s.get("key") == key for s in self.session_manager.list_sessions())
 
+    def _split_model(self, full_model: str) -> tuple[str, str]:
+        """Split full model name into (provider, short model id)."""
+        if "/" in full_model:
+            prefix, short = full_model.split("/", 1)
+            return prefix, short
+
+        provider = self.agent_config.provider if self.agent_config else "nanobot"
+
+        if provider == "auto":
+            provider = "nanobot"
+        return provider, full_model
+
+    def _configured_model_names(self) -> list[str]:
+        """Collect configured model names in priority order."""
+        ordered: list[str] = []
+
+        primary = (self.models_config.primary if self.models_config else "").strip()
+        if primary:
+            ordered.append(primary)
+
+        if self.models_config:
+            for model in self.models_config.fallbacks:
+                if isinstance(model, str) and model.strip() and model not in ordered:
+                    ordered.append(model)
+
+        if (
+            not ordered
+            and self.agent_config
+            and self.agent_config.model
+            and self.agent_config.model not in ordered
+        ):
+            ordered.append(self.agent_config.model)
+
+        if not ordered:
+            ordered.append("default")
+
+        return ordered
+
+    def _build_provider_entry(self, provider_name: str) -> dict[str, Any]:
+        return {
+            "id": provider_name,
+            "name": provider_name.title(),
+            "source": "env",
+            "env": [],
+            "options": {},
+            "models": {},
+        }
+
+    def _model_catalog(self) -> tuple[list[dict[str, Any]], str]:
+        """Build OpenCode provider catalog and return (providers, default model)."""
+        provider_entries: dict[str, dict[str, Any]] = {}
+        ordered_provider_names: list[str] = []
+        model_names = self._configured_model_names()
+
+        for full_model in model_names:
+            provider_name, model_id = self._split_model(full_model)
+
+            if provider_name not in provider_entries:
+                provider_entries[provider_name] = self._build_provider_entry(provider_name)
+                ordered_provider_names.append(provider_name)
+
+            provider_entries[provider_name]["models"][model_id] = {
+                "id": model_id,
+                "providerID": provider_name,
+                "name": model_id,
+                "api": {"id": "anthropic", "url": "", "npm": ""},
+                "capabilities": {
+                    "temperature": True,
+                    "reasoning": False,
+                    "attachment": False,
+                    "toolcall": True,
+                    "input": {
+                        "text": True,
+                        "audio": False,
+                        "image": True,
+                        "video": False,
+                        "pdf": False,
+                    },
+                    "output": {
+                        "text": True,
+                        "audio": False,
+                        "image": False,
+                        "video": False,
+                        "pdf": False,
+                    },
+                },
+                "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
+                "limit": {"context": 200000, "output": 8192},
+                "status": "active",
+                "options": {},
+                "headers": {},
+            }
+
+        providers = [provider_entries[name] for name in ordered_provider_names]
+        default_model = model_names[0]
+        return providers, default_model
+
     def _parse_model(self) -> tuple[str, str]:
         """Return (provider_name, short_model_id) from agent config.
 
@@ -86,18 +186,47 @@ class OpenCodeChannel(BaseChannel):
         OpenCode expects the provider ID and model ID to be separate, with the models
         dict keyed by the short model ID (without provider prefix).
         """
-        full_model = self.agent_config.model if self.agent_config else "default"
-        provider = self.agent_config.provider if self.agent_config else "nanobot"
+        full_model = self._configured_model_names()[0]
+        return self._split_model(full_model)
 
-        if "/" in full_model:
-            prefix, short = full_model.split("/", 1)
-            if provider == "auto":
-                provider = prefix
-            return provider, short
+    def _extract_requested_model(self, body: dict[str, Any] | None) -> str | None:
+        """Extract full model name from OpenCode request payload if provided."""
+        if not isinstance(body, dict):
+            return None
 
-        if provider == "auto":
-            provider = "nanobot"
-        return provider, full_model
+        model_value = body.get("model")
+        if isinstance(model_value, str) and model_value.strip():
+            return model_value.strip()
+
+        if isinstance(model_value, dict):
+            provider_id = model_value.get("providerID")
+            model_id = model_value.get("modelID")
+            if (
+                isinstance(provider_id, str)
+                and isinstance(model_id, str)
+                and provider_id
+                and model_id
+            ):
+                return f"{provider_id}/{model_id}"
+
+        provider_id = body.get("providerID")
+        model_id = body.get("modelID")
+        if isinstance(provider_id, str) and isinstance(model_id, str) and provider_id and model_id:
+            return f"{provider_id}/{model_id}"
+
+        return None
+
+    def _session_model(self, session: Session, body: dict[str, Any] | None = None) -> str:
+        requested = self._extract_requested_model(body)
+        if requested:
+            session.metadata["model"] = requested
+            return requested
+
+        stored = session.metadata.get("model")
+        if isinstance(stored, str) and stored.strip():
+            return stored.strip()
+
+        return self._configured_model_names()[0]
 
     # ------------------------------------------------------------------
     # BaseChannel interface
@@ -166,6 +295,7 @@ class OpenCodeChannel(BaseChannel):
         app.router.add_post("/session/{id}/prompt_async", self._handle_prompt_async)
         app.router.add_post("/session/{id}/abort", self._handle_session_abort)
         app.router.add_post("/session/{id}/init", self._handle_session_init)
+        app.router.add_post("/session/{id}/summarize", self._handle_session_summarize)
         app.router.add_get("/session/{id}/children", self._handle_stub_list)
         app.router.add_get("/session/{id}/todo", self._handle_stub_list)
         app.router.add_get("/session/{id}/diff", self._handle_stub_list)
@@ -199,103 +329,18 @@ class OpenCodeChannel(BaseChannel):
     # ------------------------------------------------------------------
 
     async def _handle_config_providers(self, request: web.Request) -> web.Response:
-        provider_name, model_id = self._parse_model()
-
-        provider_data = {
-            "id": provider_name,
-            "name": provider_name.title(),
-            "source": "env",
-            "env": [],
-            "options": {},
-            "models": {
-                model_id: {
-                    "id": model_id,
-                    "providerID": provider_name,
-                    "name": model_id,
-                    "api": {"id": "anthropic", "url": "", "npm": ""},
-                    "capabilities": {
-                        "temperature": True,
-                        "reasoning": False,
-                        "attachment": False,
-                        "toolcall": True,
-                        "input": {
-                            "text": True,
-                            "audio": False,
-                            "image": True,
-                            "video": False,
-                            "pdf": False,
-                        },
-                        "output": {
-                            "text": True,
-                            "audio": False,
-                            "image": False,
-                            "video": False,
-                            "pdf": False,
-                        },
-                    },
-                    "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
-                    "limit": {"context": 200000, "output": 8192},
-                    "status": "active",
-                    "options": {},
-                    "headers": {},
-                },
-            },
-        }
+        providers, default_model = self._model_catalog()
 
         return web.json_response(
             {
-                "providers": [provider_data],
-                "default": {"default": f"{provider_name}/{model_id}"},
+                "providers": providers,
+                "default": {"default": default_model},
             }
         )
 
     async def _handle_provider(self, request: web.Request) -> web.Response:
-        provider_name, model_id = self._parse_model()
-
-        return web.json_response(
-            [
-                {
-                    "id": provider_name,
-                    "name": provider_name.title(),
-                    "source": "env",
-                    "env": [],
-                    "options": {},
-                    "models": {
-                        model_id: {
-                            "id": model_id,
-                            "providerID": provider_name,
-                            "name": model_id,
-                            "api": {"id": "anthropic", "url": "", "npm": ""},
-                            "capabilities": {
-                                "temperature": True,
-                                "reasoning": False,
-                                "attachment": False,
-                                "toolcall": True,
-                                "input": {
-                                    "text": True,
-                                    "audio": False,
-                                    "image": True,
-                                    "video": False,
-                                    "pdf": False,
-                                },
-                                "output": {
-                                    "text": True,
-                                    "audio": False,
-                                    "image": False,
-                                    "video": False,
-                                    "pdf": False,
-                                },
-                            },
-                            "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
-                            "limit": {"context": 200000, "output": 8192},
-                            "status": "active",
-                            "options": {},
-                            "headers": {},
-                        },
-                    },
-                }
-            ]
-        )
+        providers, _ = self._model_catalog()
+        return web.json_response(providers)
 
     async def _handle_agent(self, request: web.Request) -> web.Response:
         return web.json_response(
@@ -313,20 +358,21 @@ class OpenCodeChannel(BaseChannel):
         )
 
     async def _handle_config(self, request: web.Request) -> web.Response:
-        provider_name, model_id = self._parse_model()
+        providers, default_model = self._model_catalog()
+        provider_map = {
+            provider["id"]: {
+                "models": {model_id: {} for model_id in provider["models"]},
+            }
+            for provider in providers
+        }
+
         return web.json_response(
             {
                 "theme": "catppuccin-mocha",
                 "keybinds": {},
                 "tui": {},
-                "model": f"{provider_name}/{model_id}",
-                "provider": {
-                    provider_name: {
-                        "models": {
-                            model_id: {},
-                        },
-                    },
-                },
+                "model": default_model,
+                "provider": provider_map,
                 "mcp": {},
                 "agent": {},
                 "permission": {},
@@ -450,6 +496,9 @@ class OpenCodeChannel(BaseChannel):
         body = await request.json()
         if "title" in body:
             session.metadata["title"] = body["title"]
+        requested_model = self._extract_requested_model(body)
+        if requested_model:
+            session.metadata["model"] = requested_model
         self.session_manager.save(session)
 
         info = self._session_to_info(session, session_id)
@@ -473,7 +522,27 @@ class OpenCodeChannel(BaseChannel):
         return web.json_response(info)
 
     async def _handle_session_status(self, request: web.Request) -> web.Response:
-        return web.json_response({})
+        session_id = request.query.get("sessionID") or request.query.get("id")
+
+        def _status_payload(sid: str) -> dict[str, Any]:
+            context = self._last_context_by_session.get(sid, {})
+            return {
+                "sessionID": sid,
+                "status": {"type": "idle", "context": context},
+            }
+
+        if session_id:
+            return web.json_response(_status_payload(session_id))
+
+        sessions: list[str] = []
+        if self.session_manager:
+            sessions = [
+                s.get("key", "") for s in self.session_manager.list_sessions() if s.get("key")
+            ]
+
+        known = {sid.split(":", 1)[1] if ":" in sid else sid for sid in sessions}
+        known.update(self._last_context_by_session.keys())
+        return web.json_response([_status_payload(sid) for sid in sorted(known)])
 
     async def _handle_session_init(self, request: web.Request) -> web.Response:
         return web.json_response({"ok": True})
@@ -505,6 +574,7 @@ class OpenCodeChannel(BaseChannel):
             return web.json_response({"error": "no agent"}, status=500)
 
         body = await request.json()
+        active_model = self._session_model(session, body)
 
         # Extract user text from request
         user_text = ""
@@ -523,7 +593,7 @@ class OpenCodeChannel(BaseChannel):
 
         now_s = time.time()
         now_ms = self._epoch_ms(now_s)
-        provider_name, model_id = self._parse_model()
+        provider_name, model_id = self._split_model(active_model)
 
         # Use deterministic IDs aligned with persisted session index mapping.
         # This avoids TUI reordering/duplication when it reconciles live SSE events
@@ -609,12 +679,33 @@ class OpenCodeChannel(BaseChannel):
                 channel="opencode",
                 chat_id=session_id,
                 on_progress=on_progress,
+                model=active_model,
             )
         except asyncio.CancelledError:
             response = "Task cancelled."
         except Exception as e:
             logger.exception("OpenCode message processing failed")
             response = f"Error: {e}"
+
+        usage = self.agent_loop.get_last_llm_usage(key) if self.agent_loop else None
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            reasoning_tokens = 0
+            details = usage.get("completion_tokens_details")
+            if isinstance(details, dict):
+                rt = details.get("reasoning_tokens")
+                if isinstance(rt, int):
+                    reasoning_tokens = rt
+
+            if isinstance(prompt_tokens, int):
+                asst_msg["tokens"]["input"] = prompt_tokens
+            if isinstance(completion_tokens, int):
+                asst_msg["tokens"]["output"] = completion_tokens
+            asst_msg["tokens"]["reasoning"] = reasoning_tokens
+
+            if isinstance(usage.get("cost"), (int, float)):
+                asst_msg["cost"] = float(usage["cost"])
 
         # Final assistant message
         final_text = response or "\n".join(accumulated_text) or ""
@@ -632,11 +723,18 @@ class OpenCodeChannel(BaseChannel):
         await self._broadcast_sse("message.updated", {"info": asst_msg})
 
         # Session idle
+        context_stats = self.agent_loop.get_last_context_stats(key) if self.agent_loop else None
+        if isinstance(context_stats, dict):
+            self._last_context_by_session[session_id] = context_stats
+
         await self._broadcast_sse(
             "session.status",
             {
                 "sessionID": session_id,
-                "status": {"type": "idle"},
+                "status": {
+                    "type": "idle",
+                    "context": self._last_context_by_session.get(session_id, {}),
+                },
             },
         )
 
@@ -653,6 +751,7 @@ class OpenCodeChannel(BaseChannel):
             {
                 "info": asst_msg,
                 "parts": [asst_part_final],
+                "context": self._last_context_by_session.get(session_id, {}),
             }
         )
 
@@ -678,6 +777,110 @@ class OpenCodeChannel(BaseChannel):
         if task and not task.done():
             task.cancel()
         return web.json_response({"ok": True})
+
+    async def _handle_session_summarize(self, request: web.Request) -> web.Response:
+        session_id = request.match_info["id"]
+        session, key = self._find_session(session_id)
+        if not session:
+            return web.json_response({"error": "not found"}, status=404)
+        if not self.agent_loop:
+            return web.json_response({"error": "no agent"}, status=500)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        archive_all = isinstance(body, dict) and bool(body.get("archiveAll", False))
+
+        await self._broadcast_sse(
+            "session.status",
+            {
+                "sessionID": session_id,
+                "status": {"type": "busy"},
+            },
+        )
+
+        result = await self.agent_loop.compact_session(key, archive_all=archive_all)
+
+        before = int(result.get("lastConsolidatedBefore", 0))
+        after = int(result.get("lastConsolidatedAfter", 0))
+        compacted = max(0, after - before)
+        history_entry = (
+            result.get("historyEntry") if isinstance(result.get("historyEntry"), str) else ""
+        )
+        if result.get("ok"):
+            if compacted > 0:
+                summary_text = f"Context compacted: consolidated {compacted} messages into memory."
+                if history_entry:
+                    summary_text += f"\n\nSummary:\n{history_entry}"
+            else:
+                summary_text = (
+                    "Context is already compact; no additional messages needed summarization."
+                )
+        else:
+            summary_text = "Context compaction failed."
+
+        now_ms = self._epoch_ms(time.time())
+        model_name = self._session_model(session, None)
+        provider_name, model_id = self._split_model(model_name)
+        note_index = len(session.messages)
+        note_msg_id = f"msg_{session_id}_{note_index}"
+        note_part_id = f"part_{session_id}_{note_index}"
+        note_msg = {
+            "id": note_msg_id,
+            "sessionID": session_id,
+            "role": "assistant",
+            "time": {"created": now_ms, "completed": now_ms},
+            "modelID": model_id,
+            "providerID": provider_name,
+            "mode": "default",
+            "agent": "default",
+            "path": {"cwd": str(self.agent_loop.workspace), "root": str(self.agent_loop.workspace)},
+            "cost": 0,
+            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        }
+        note_part = {
+            "id": note_part_id,
+            "sessionID": session_id,
+            "messageID": note_msg_id,
+            "type": "text",
+            "text": summary_text,
+            "time": {"created": now_ms},
+        }
+
+        session.add_message("assistant", summary_text, compact_event=True)
+        self.session_manager.save(session)
+
+        await self._broadcast_sse("message.updated", {"info": note_msg})
+        await self._broadcast_sse("message.part.updated", {"part": note_part})
+
+        context_stats = self.agent_loop.get_last_context_stats(key)
+        if isinstance(context_stats, dict):
+            self._last_context_by_session[session_id] = context_stats
+
+        await self._broadcast_sse(
+            "session.status",
+            {
+                "sessionID": session_id,
+                "status": {
+                    "type": "idle",
+                    "context": self._last_context_by_session.get(session_id, {}),
+                },
+            },
+        )
+
+        session_info = self._session_to_info(session, session_id)
+        await self._broadcast_sse("session.updated", {"info": session_info})
+
+        return web.json_response(
+            {
+                **result,
+                "sessionID": session_id,
+                "context": self._last_context_by_session.get(session_id, {}),
+                "info": note_msg,
+                "parts": [note_part],
+            }
+        )
 
     # ------------------------------------------------------------------
     # Stub endpoints

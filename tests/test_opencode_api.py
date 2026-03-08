@@ -11,7 +11,7 @@ from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.opencode import OpenCodeChannel
-from nanobot.config.schema import AgentDefaults, OpenCodeConfig
+from nanobot.config.schema import AgentDefaults, ModelsConfig, OpenCodeConfig
 from nanobot.session.manager import Session, SessionManager
 
 
@@ -111,6 +111,72 @@ async def test_config(client):
     assert "/" in data["model"]
 
 
+async def test_config_providers_uses_models_catalog(bus, session_manager, mock_agent_loop):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+        models_config=ModelsConfig(
+            primary="openrouter/minimax/minimax-m2.5",
+            fallbacks=["openrouter/moonshotai/kimi-k2.5", "openrouter/z-ai/glm-5"],
+        ),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        resp = await client.get("/config/providers")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["default"]["default"] == "openrouter/minimax/minimax-m2.5"
+        assert len(data["providers"]) == 1
+        models = data["providers"][0]["models"]
+        assert "minimax/minimax-m2.5" in models
+        assert "moonshotai/kimi-k2.5" in models
+        assert "z-ai/glm-5" in models
+    finally:
+        await client.close()
+
+
+async def test_config_exposes_all_configured_providers(bus, session_manager, mock_agent_loop):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+        models_config=ModelsConfig(
+            primary="openrouter/minimax/minimax-m2.5",
+            fallbacks=["openai-codex/gpt-5.3-codex", "anthropic/claude-sonnet-4-20250514"],
+        ),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        resp = await client.get("/config")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["model"] == "openrouter/minimax/minimax-m2.5"
+        assert "openrouter" in data["provider"]
+        assert "openai-codex" in data["provider"]
+        assert "anthropic" in data["provider"]
+    finally:
+        await client.close()
+
+
 # ------------------------------------------------------------------
 # Session endpoints
 # ------------------------------------------------------------------
@@ -184,6 +250,190 @@ async def test_send_message(client, mock_agent_loop):
     )
     assert resp.status == 200
     mock_agent_loop.process_direct.assert_awaited_once()
+
+
+async def test_send_message_uses_requested_model(bus, session_manager, mock_agent_loop):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        create_resp = await client.post("/session")
+        session = await create_resp.json()
+        sid = session["id"]
+
+        resp = await client.post(
+            f"/session/{sid}/message",
+            json={
+                "parts": [{"type": "text", "text": "Hello!"}],
+                "model": {"providerID": "openai-codex", "modelID": "gpt-5.3-codex"},
+            },
+        )
+        assert resp.status == 200
+        assert (
+            mock_agent_loop.process_direct.await_args.kwargs["model"]
+            == "openai-codex/gpt-5.3-codex"
+        )
+    finally:
+        await client.close()
+
+
+async def test_session_status_returns_context_breakdown(bus, session_manager):
+    mock_loop = MagicMock()
+    mock_loop.workspace = session_manager.workspace
+    mock_loop.process_direct = AsyncMock(return_value="ok")
+    mock_loop.get_last_context_stats = MagicMock(
+        return_value={
+            "model": "openrouter/minimax/minimax-m2.5",
+            "budget": 171808,
+            "contextTokens": 200000,
+            "reserveTokensFloor": 20000,
+            "maxOutputTokens": 8192,
+            "initial": {"system": 3000, "history": 4000, "current": 50, "total": 7050},
+            "final": {"system": 3000, "history": 4000, "current": 50, "total": 7050},
+            "compactionPasses": 0,
+            "trimmedHistoryMessages": 0,
+            "withinBudget": True,
+            "usagePercent": 4.1,
+        }
+    )
+
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_loop,
+        agent_config=AgentDefaults(model="openrouter/minimax/minimax-m2.5", provider="auto"),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        create_resp = await client.post("/session")
+        session = await create_resp.json()
+        sid = session["id"]
+
+        send_resp = await client.post(
+            f"/session/{sid}/message",
+            json={"parts": [{"type": "text", "text": "hello"}]},
+        )
+        assert send_resp.status == 200
+        send_data = await send_resp.json()
+        assert "context" in send_data
+        assert send_data["context"]["final"]["total"] == 7050
+
+        status_resp = await client.get(f"/session/status?sessionID={sid}")
+        assert status_resp.status == 200
+        status = await status_resp.json()
+        assert status["sessionID"] == sid
+        assert status["status"]["context"]["final"]["total"] == 7050
+    finally:
+        await client.close()
+
+
+async def test_send_message_includes_usage_tokens(bus, session_manager):
+    mock_loop = MagicMock()
+    mock_loop.workspace = session_manager.workspace
+    mock_loop.process_direct = AsyncMock(return_value="ok")
+    mock_loop.get_last_context_stats = MagicMock(return_value={})
+    mock_loop.get_last_llm_usage = MagicMock(
+        return_value={
+            "prompt_tokens": 123,
+            "completion_tokens": 45,
+            "completion_tokens_details": {"reasoning_tokens": 7},
+            "cost": 0.00123,
+        }
+    )
+
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_loop,
+        agent_config=AgentDefaults(model="openrouter/minimax/minimax-m2.5", provider="auto"),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        create_resp = await client.post("/session")
+        session = await create_resp.json()
+        sid = session["id"]
+
+        send_resp = await client.post(
+            f"/session/{sid}/message",
+            json={"parts": [{"type": "text", "text": "hello"}]},
+        )
+        assert send_resp.status == 200
+        data = await send_resp.json()
+        assert data["info"]["tokens"]["input"] == 123
+        assert data["info"]["tokens"]["output"] == 45
+        assert data["info"]["tokens"]["reasoning"] == 7
+        assert data["info"]["cost"] == 0.00123
+    finally:
+        await client.close()
+
+
+async def test_session_summarize_calls_compaction(bus, session_manager):
+    mock_loop = MagicMock()
+    mock_loop.workspace = session_manager.workspace
+    mock_loop.process_direct = AsyncMock(return_value="ok")
+    mock_loop.get_last_context_stats = MagicMock(return_value={"final": {"total": 100}})
+    mock_loop.compact_session = AsyncMock(
+        return_value={
+            "ok": True,
+            "archiveAll": False,
+            "lastConsolidatedBefore": 0,
+            "lastConsolidatedAfter": 12,
+            "messageCount": 20,
+        }
+    )
+
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_loop,
+        agent_config=AgentDefaults(model="openrouter/minimax/minimax-m2.5", provider="auto"),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        create_resp = await client.post("/session")
+        session = await create_resp.json()
+        sid = session["id"]
+
+        resp = await client.post(f"/session/{sid}/summarize", json={})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ok"] is True
+        assert data["sessionID"] == sid
+        assert data["info"]["role"] == "assistant"
+        assert data["parts"][0]["type"] == "text"
+        mock_loop.compact_session.assert_awaited_once_with(sid, archive_all=False)
+    finally:
+        await client.close()
 
 
 async def test_send_empty_message(client):

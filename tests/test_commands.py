@@ -10,6 +10,7 @@ from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_model
+from nanobot.session.manager import SessionManager
 
 runner = CliRunner()
 
@@ -17,11 +18,12 @@ runner = CliRunner()
 @pytest.fixture
 def mock_paths():
     """Mock config/workspace paths for test isolation."""
-    with patch("nanobot.config.loader.get_config_path") as mock_cp, \
-         patch("nanobot.config.loader.save_config") as mock_sc, \
-         patch("nanobot.config.loader.load_config") as mock_lc, \
-         patch("nanobot.utils.helpers.get_workspace_path") as mock_ws:
-
+    with (
+        patch("nanobot.config.loader.get_config_path") as mock_cp,
+        patch("nanobot.config.loader.save_config") as mock_sc,
+        patch("nanobot.config.loader.load_config") as mock_lc,
+        patch("nanobot.utils.helpers.get_workspace_path") as mock_ws,
+    ):
         base_dir = Path("./test_onboard_data")
         if base_dir.exists():
             shutil.rmtree(base_dir)
@@ -128,3 +130,112 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_context_command_shows_session_breakdown(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "AGENTS.md").write_text("Project agent rules.", encoding="utf-8")
+
+    config = Config()
+    config.agents.defaults.workspace = str(workspace)
+
+    sessions = SessionManager(workspace)
+    s = sessions.get_or_create("cli:direct")
+    s.add_message("user", "hello")
+    s.add_message("assistant", "hi")
+    sessions.save(s)
+
+    with patch("nanobot.config.loader.load_config", return_value=config):
+        result = runner.invoke(app, ["context", "--session", "cli:direct"])
+
+    assert result.exit_code == 0
+    assert "Context Usage By Session" in result.stdout
+    assert "User Msgs" in result.stdout
+    assert "System Prompt Breakdown" in result.stdout
+    assert "Skills Breakdown" in result.stdout
+    assert "Bootstrap: AGENTS.md" in result.stdout
+    assert "No context usage data recorded yet" not in result.stdout
+
+
+def test_context_command_no_usage_data(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+
+    config = Config()
+    config.agents.defaults.workspace = str(workspace)
+
+    sessions = SessionManager(workspace)
+    s = sessions.get_or_create("cli:direct")
+    sessions.save(s)
+
+    with patch("nanobot.config.loader.load_config", return_value=config):
+        result = runner.invoke(app, ["context"])
+
+    assert result.exit_code == 0
+    assert "No context usage data recorded yet" in result.stdout
+
+
+def test_context_command_recomputes_from_session_history(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+
+    config = Config()
+    config.agents.defaults.workspace = str(workspace)
+
+    sessions = SessionManager(workspace)
+    s = sessions.get_or_create("cli:direct")
+    s.add_message("user", "Hello")
+    s.add_message("assistant", "Hi there")
+    s.add_message("user", "Can you summarize this session?")
+    sessions.save(s)
+
+    with patch("nanobot.config.loader.load_config", return_value=config):
+        result = runner.invoke(app, ["context", "--session", "cli:direct"])
+
+    assert result.exit_code == 0
+    assert "Context Usage By Session" in result.stdout
+    assert "User Msgs" in result.stdout
+
+    reloaded = SessionManager(workspace).get_or_create("cli:direct")
+    usage = reloaded.metadata.get("context_usage")
+    assert isinstance(usage, dict)
+    totals = usage.get("totals", {})
+    assert isinstance(totals, dict)
+    assert totals.get("user_messages") == 2
+    assert int(totals.get("conversation_tokens", 0)) == int(
+        totals.get("user_request_tokens", 0)
+    ) + int(totals.get("agent_response_tokens", 0))
+
+
+def test_context_command_prefers_persisted_assistant_usage(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+
+    config = Config()
+    config.agents.defaults.workspace = str(workspace)
+
+    sessions = SessionManager(workspace)
+    s = sessions.get_or_create("cli:direct")
+    s.add_message("user", "hello")
+    s.add_message(
+        "assistant",
+        "hi",
+        usage={"prompt_tokens": 1234, "completion_tokens": 777},
+    )
+    sessions.save(s)
+
+    with patch("nanobot.config.loader.load_config", return_value=config):
+        result = runner.invoke(app, ["context", "--session", "cli:direct"])
+
+    assert result.exit_code == 0
+
+    reloaded = SessionManager(workspace).get_or_create("cli:direct")
+    usage = reloaded.metadata.get("context_usage")
+    assert isinstance(usage, dict)
+    totals = usage.get("totals", {})
+    assert isinstance(totals, dict)
+    assert int(totals.get("agent_response_tokens", 0)) == 777
+    assert int(totals.get("llm_prompt_tokens", 0)) == 1234
+    assert int(totals.get("llm_completion_tokens", 0)) == 777
+    assert int(totals.get("llm_total_tokens", 0)) == 2011

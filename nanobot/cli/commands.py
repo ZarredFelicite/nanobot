@@ -7,6 +7,7 @@ import select
 import signal
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 import typer
 from prompt_toolkit import PromptSession
@@ -50,6 +51,7 @@ def _flush_pending_tty_input() -> None:
 
     try:
         import termios
+
         termios.tcflush(fd, termios.TCIFLUSH)
         return
     except Exception:
@@ -72,6 +74,7 @@ def _restore_terminal() -> None:
         return
     try:
         import termios
+
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _SAVED_TERM_ATTRS)
     except Exception:
         pass
@@ -84,6 +87,7 @@ def _init_prompt_session() -> None:
     # Save terminal state so we can restore it on exit
     try:
         import termios
+
         _SAVED_TERM_ATTRS = termios.tcgetattr(sys.stdin.fileno())
     except Exception:
         pass
@@ -94,7 +98,7 @@ def _init_prompt_session() -> None:
     _PROMPT_SESSION = PromptSession(
         history=FileHistory(str(history_file)),
         enable_open_in_editor=False,
-        multiline=False,   # Enter submits (single line mode)
+        multiline=False,  # Enter submits (single line mode)
     )
 
 
@@ -132,7 +136,6 @@ async def _read_interactive_input_async() -> str:
         raise KeyboardInterrupt from exc
 
 
-
 def version_callback(value: bool):
     if value:
         console.print(f"{__logo__} nanobot v{__version__}")
@@ -141,9 +144,7 @@ def version_callback(value: bool):
 
 @app.callback()
 def main(
-    version: bool = typer.Option(
-        None, "--version", "-v", callback=version_callback, is_eager=True
-    ),
+    version: bool = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True),
 ):
     """nanobot - Personal AI Assistant."""
     pass
@@ -166,7 +167,9 @@ def onboard():
     if config_path.exists():
         console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
         console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
-        console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
+        console.print(
+            "  [bold]N[/bold] = refresh config, keeping existing values and adding new fields"
+        )
         if typer.confirm("Overwrite?"):
             config = Config()
             save_config(config)
@@ -174,7 +177,9 @@ def onboard():
         else:
             config = load_config()
             save_config(config)
-            console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+            console.print(
+                f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)"
+            )
     else:
         save_config(Config())
         console.print(f"[green]✓[/green] Created config at {config_path}")
@@ -192,11 +197,10 @@ def onboard():
     console.print("\nNext steps:")
     console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
-    console.print("  2. Chat: [cyan]nanobot agent -m \"Hello!\"[/cyan]")
-    console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
-
-
-
+    console.print('  2. Chat: [cyan]nanobot agent -m "Hello!"[/cyan]')
+    console.print(
+        "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
+    )
 
 
 def _make_provider(config: Config):
@@ -207,6 +211,10 @@ def _make_provider(config: Config):
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
+    if provider_name is None:
+        console.print(f"[red]Error: Could not determine provider for model '{model}'.[/red]")
+        raise typer.Exit(1)
+    provider_name = str(provider_name)
     p = config.get_provider(model)
 
     # OpenAI Codex (OAuth)
@@ -222,6 +230,7 @@ def _make_provider(config: Config):
         )
 
     from nanobot.providers.registry import find_by_name
+
     spec = find_by_name(provider_name)
     if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
         console.print("[red]Error: No API key configured.[/red]")
@@ -259,6 +268,7 @@ def gateway(
 
     if verbose:
         import logging
+
         logging.basicConfig(level=logging.DEBUG)
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
@@ -283,6 +293,8 @@ def gateway(
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
+        context_tokens=config.agents.defaults.context_tokens,
+        reserve_tokens_floor=config.agents.defaults.reserve_tokens_floor,
         reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
@@ -300,6 +312,7 @@ def gateway(
         """Execute a cron job through the agent."""
         from nanobot.agent.tools.cron import CronTool
         from nanobot.agent.tools.message import MessageTool
+
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
@@ -328,12 +341,14 @@ def gateway(
 
         if job.payload.deliver and job.payload.to and response:
             from nanobot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response
-            ))
+
+            await bus.publish_outbound(
+                OutboundMessage(
+                    channel=job.payload.channel or "cli", chat_id=job.payload.to, content=response
+                )
+            )
         return response
+
     cron.on_job = on_cron_job
 
     # Create channel manager
@@ -374,10 +389,13 @@ def gateway(
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
         from nanobot.bus.events import OutboundMessage
+
         channel, chat_id = _pick_heartbeat_target()
         if channel == "cli":
             return  # No external channel available to deliver to
-        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
+        await bus.publish_outbound(
+            OutboundMessage(channel=channel, chat_id=chat_id, content=response)
+        )
 
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
@@ -421,8 +439,6 @@ def gateway(
     asyncio.run(run())
 
 
-
-
 # ============================================================================
 # Gateway Client Helpers
 # ============================================================================
@@ -446,7 +462,10 @@ def _test_gateway_connection(socket_path: Path) -> bool:
 
 
 def _run_as_client_single(
-    socket_path: Path, message: str, session: str | None, render_markdown: bool,
+    socket_path: Path,
+    message: str,
+    session: str | None,
+    render_markdown: bool,
 ) -> None:
     """Send a single message to the gateway and print the response."""
 
@@ -494,11 +513,15 @@ def _run_as_client_single(
 
 
 def _run_as_client_interactive(
-    socket_path: Path, session: str | None, render_markdown: bool,
+    socket_path: Path,
+    session: str | None,
+    render_markdown: bool,
 ) -> None:
     """Run an interactive session connected to the gateway."""
     _init_prompt_session()
-    console.print(f"{__logo__} Connected to gateway (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+    console.print(
+        f"{__logo__} Connected to gateway (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+    )
 
     def _exit_on_sigint(signum, frame):
         _restore_terminal()
@@ -616,8 +639,12 @@ def _run_as_client_interactive(
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
-    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
-    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
+    markdown: bool = typer.Option(
+        True, "--markdown/--no-markdown", help="Render assistant output as Markdown"
+    ),
+    logs: bool = typer.Option(
+        False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"
+    ),
 ):
     """Interact with the agent directly."""
     from loguru import logger
@@ -647,11 +674,17 @@ def agent(
                     _run_as_client_interactive(socket_path, explicit_session, markdown)
                 return
             except ConnectionRefusedError:
-                console.print("[yellow]Gateway not responding, falling back to standalone mode[/yellow]")
+                console.print(
+                    "[yellow]Gateway not responding, falling back to standalone mode[/yellow]"
+                )
             except Exception as e:
-                console.print(f"[yellow]Gateway connection failed ({e}), falling back to standalone[/yellow]")
+                console.print(
+                    f"[yellow]Gateway connection failed ({e}), falling back to standalone[/yellow]"
+                )
         else:
-            console.print("[yellow]Gateway socket exists but not reachable, falling back to standalone[/yellow]")
+            console.print(
+                "[yellow]Gateway socket exists but not reachable, falling back to standalone[/yellow]"
+            )
 
     # --- Standalone mode (existing behavior) ---
 
@@ -676,6 +709,8 @@ def agent(
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
+        context_tokens=config.agents.defaults.context_tokens,
+        reserve_tokens_floor=config.agents.defaults.reserve_tokens_floor,
         reasoning_effort=config.agents.defaults.reasoning_effort,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
@@ -691,6 +726,7 @@ def agent(
     def _thinking_ctx():
         if logs:
             from contextlib import nullcontext
+
             return nullcontext()
         # Animated spinner is safe to use with prompt_toolkit input handling
         return console.status("[dim]nanobot is thinking...[/dim]", spinner="dots")
@@ -718,7 +754,9 @@ def agent(
 
             try:
                 with _thinking_ctx():
-                    response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
+                    response = await agent_loop.process_direct(
+                        message, session_id, on_progress=_cli_progress
+                    )
 
                 # Give channels time to send any outbound messages
                 await asyncio.sleep(0.5)
@@ -735,8 +773,11 @@ def agent(
     else:
         # Interactive mode — route through bus like other channels
         from nanobot.bus.events import InboundMessage
+
         _init_prompt_session()
-        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+        console.print(
+            f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+        )
 
         if ":" in session_id:
             cli_channel, cli_chat_id = session_id.split(":", 1)
@@ -800,12 +841,14 @@ def agent(
                         turn_done.clear()
                         turn_response.clear()
 
-                        await bus.publish_inbound(InboundMessage(
-                            channel=cli_channel,
-                            sender_id="user",
-                            chat_id=cli_chat_id,
-                            content=user_input,
-                        ))
+                        await bus.publish_inbound(
+                            InboundMessage(
+                                channel=cli_channel,
+                                sender_id="user",
+                                chat_id=cli_chat_id,
+                                content=user_input,
+                            )
+                        )
 
                         with _thinking_ctx():
                             await turn_done.wait()
@@ -852,81 +895,47 @@ def channels_status():
 
     # WhatsApp
     wa = config.channels.whatsapp
-    table.add_row(
-        "WhatsApp",
-        "✓" if wa.enabled else "✗",
-        wa.bridge_url
-    )
+    table.add_row("WhatsApp", "✓" if wa.enabled else "✗", wa.bridge_url)
 
     dc = config.channels.discord
-    table.add_row(
-        "Discord",
-        "✓" if dc.enabled else "✗",
-        dc.gateway_url
-    )
+    table.add_row("Discord", "✓" if dc.enabled else "✗", dc.gateway_url)
 
     # Feishu
     fs = config.channels.feishu
     fs_config = f"app_id: {fs.app_id[:10]}..." if fs.app_id else "[dim]not configured[/dim]"
-    table.add_row(
-        "Feishu",
-        "✓" if fs.enabled else "✗",
-        fs_config
-    )
+    table.add_row("Feishu", "✓" if fs.enabled else "✗", fs_config)
 
     # Mochat
     mc = config.channels.mochat
     mc_base = mc.base_url or "[dim]not configured[/dim]"
-    table.add_row(
-        "Mochat",
-        "✓" if mc.enabled else "✗",
-        mc_base
-    )
+    table.add_row("Mochat", "✓" if mc.enabled else "✗", mc_base)
 
     # Telegram
     tg = config.channels.telegram
     tg_config = f"token: {tg.token[:10]}..." if tg.token else "[dim]not configured[/dim]"
-    table.add_row(
-        "Telegram",
-        "✓" if tg.enabled else "✗",
-        tg_config
-    )
+    table.add_row("Telegram", "✓" if tg.enabled else "✗", tg_config)
 
     # Slack
     slack = config.channels.slack
     slack_config = "socket" if slack.app_token and slack.bot_token else "[dim]not configured[/dim]"
-    table.add_row(
-        "Slack",
-        "✓" if slack.enabled else "✗",
-        slack_config
-    )
+    table.add_row("Slack", "✓" if slack.enabled else "✗", slack_config)
 
     # DingTalk
     dt = config.channels.dingtalk
-    dt_config = f"client_id: {dt.client_id[:10]}..." if dt.client_id else "[dim]not configured[/dim]"
-    table.add_row(
-        "DingTalk",
-        "✓" if dt.enabled else "✗",
-        dt_config
+    dt_config = (
+        f"client_id: {dt.client_id[:10]}..." if dt.client_id else "[dim]not configured[/dim]"
     )
+    table.add_row("DingTalk", "✓" if dt.enabled else "✗", dt_config)
 
     # QQ
     qq = config.channels.qq
     qq_config = f"app_id: {qq.app_id[:10]}..." if qq.app_id else "[dim]not configured[/dim]"
-    table.add_row(
-        "QQ",
-        "✓" if qq.enabled else "✗",
-        qq_config
-    )
+    table.add_row("QQ", "✓" if qq.enabled else "✗", qq_config)
 
     # Email
     em = config.channels.email
     em_config = em.imap_host if em.imap_host else "[dim]not configured[/dim]"
-    table.add_row(
-        "Email",
-        "✓" if em.enabled else "✗",
-        em_config
-    )
+    table.add_row("Email", "✓" if em.enabled else "✗", em_config)
 
     console.print(table)
 
@@ -1030,8 +1039,12 @@ def status():
 
     console.print(f"{__logo__} nanobot Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
+    console.print(
+        f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}"
+    )
+    console.print(
+        f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}"
+    )
 
     if config_path.exists():
         from nanobot.providers.registry import PROVIDERS
@@ -1053,7 +1066,432 @@ def status():
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
                 has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+                console.print(
+                    f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}"
+                )
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """Convert mixed metadata values to int."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_session_key(
+    session_manager, requested_session: str, all_session_keys: list[str]
+) -> str | None:
+    """Resolve a session key by exact key or suffix match."""
+    if requested_session in all_session_keys:
+        return requested_session
+
+    suffix_matches = [
+        key for key in all_session_keys if ":" in key and key.split(":", 1)[1] == requested_session
+    ]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    if len(suffix_matches) > 1:
+        console.print(
+            f"[red]Ambiguous session '{requested_session}'[/red]. Matches: {', '.join(suffix_matches)}"
+        )
+        raise typer.Exit(1)
+
+    return None
+
+
+def _fallback_token_count(messages: list[dict[str, Any]]) -> int:
+    """Fallback token estimator for prompt messages."""
+    chars = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    chars += len(str(block.get("text", "")))
+                elif block.get("type") == "image_url":
+                    chars += 256
+                else:
+                    chars += len(str(block))
+        else:
+            chars += len(str(content))
+        chars += 24
+    return max(1, chars // 4)
+
+
+def _count_tokens(messages: list[dict[str, Any]], model: str) -> int:
+    """Count prompt tokens for a model with safe fallback."""
+    if not messages:
+        return 0
+
+    try:
+        from litellm import token_counter
+
+        return int(token_counter(model=model, messages=messages) or 0)
+    except Exception:
+        return _fallback_token_count(messages)
+
+
+def _context_usage_breakdown(messages: list[dict[str, Any]], model: str) -> dict[str, int]:
+    """Compute system/history/current/total token usage."""
+    total = _count_tokens(messages, model)
+    if not messages:
+        return {"system": 0, "history": 0, "current": 0, "total": total}
+
+    system = _count_tokens(messages[:1], model)
+    without_current = _count_tokens(messages[:-1], model) if len(messages) > 1 else system
+    history = max(0, without_current - system)
+    current = max(0, total - without_current)
+    return {"system": system, "history": history, "current": current, "total": total}
+
+
+def _extract_text_content(content: Any) -> str:
+    """Normalize persisted message content into plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _usage_completion_tokens(message: dict[str, Any]) -> int | None:
+    """Read completion/output tokens from persisted assistant usage."""
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    completion = usage.get("completion_tokens")
+    if isinstance(completion, int):
+        return completion
+    output = usage.get("output_tokens")
+    if isinstance(output, int):
+        return output
+    return None
+
+
+def _usage_prompt_tokens(message: dict[str, Any]) -> int | None:
+    """Read prompt/input tokens from persisted assistant usage."""
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt = usage.get("prompt_tokens")
+    if isinstance(prompt, int):
+        return prompt
+    input_tokens = usage.get("input_tokens")
+    if isinstance(input_tokens, int):
+        return input_tokens
+    return None
+
+
+def _recompute_context_usage_for_session(config: Config, session_obj) -> dict[str, Any] | None:
+    """Recompute per-session token totals from persisted user/assistant turns."""
+    from nanobot.agent.context import ContextBuilder
+
+    model = session_obj.metadata.get("model") if isinstance(session_obj.metadata, dict) else None
+    if not isinstance(model, str) or not model.strip():
+        model = config.agents.defaults.model
+
+    context_builder = ContextBuilder(config.workspace_path)
+    system_prompt = context_builder.build_system_prompt()
+    system_prompt_tokens = _count_tokens([{"role": "system", "content": system_prompt}], model)
+
+    totals = {
+        "user_messages": 0,
+        "user_request_tokens": 0,
+        "agent_response_tokens": 0,
+        "conversation_tokens": 0,
+        "system_prompt_tokens": system_prompt_tokens,
+        "llm_prompt_tokens": 0,
+        "llm_completion_tokens": 0,
+        "llm_total_tokens": 0,
+    }
+
+    for message in session_obj.messages:
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        text = _extract_text_content(message.get("content"))
+        if role == "user":
+            token_count = _count_tokens([{"role": role, "content": text}], model)
+            totals["user_messages"] += 1
+            totals["user_request_tokens"] += token_count
+        else:
+            prompt_tokens = _usage_prompt_tokens(message)
+            completion_tokens = _usage_completion_tokens(message)
+            if prompt_tokens is not None:
+                totals["llm_prompt_tokens"] += prompt_tokens
+            if completion_tokens is None:
+                completion_tokens = _count_tokens([{"role": role, "content": text}], model)
+            totals["agent_response_tokens"] += completion_tokens
+            totals["llm_completion_tokens"] += completion_tokens
+
+    totals["conversation_tokens"] = totals["user_request_tokens"] + totals["agent_response_tokens"]
+    totals["llm_total_tokens"] = totals["llm_prompt_tokens"] + totals["llm_completion_tokens"]
+
+    if totals["user_messages"] == 0 and totals["agent_response_tokens"] == 0:
+        return None
+
+    return {
+        "totals": totals,
+        "meta": {
+            "model": model,
+        },
+    }
+
+
+def _system_prompt_breakdown(config: Config) -> tuple[int, list[tuple[str, int]]]:
+    """Return total system prompt tokens and per-component contributions."""
+    from nanobot.agent.context import ContextBuilder
+
+    builder = ContextBuilder(config.workspace_path)
+    parts: list[tuple[str, str]] = []
+
+    identity = builder._get_identity()
+    if identity:
+        parts.append(("Identity", identity))
+
+    for filename in builder.BOOTSTRAP_FILES:
+        file_path = builder.workspace / filename
+        if not file_path.exists():
+            parts.append((f"Bootstrap: {filename} (missing)", ""))
+            continue
+        content = file_path.read_text(encoding="utf-8")
+        parts.append((f"Bootstrap: {filename}", f"## {filename}\n\n{content}"))
+
+    memory = builder.memory.get_memory_context()
+    if memory:
+        parts.append(("Memory", f"# Memory\n\n{memory}"))
+
+    always_skills = builder.skills.get_always_skills()
+    if always_skills:
+        always_content = builder.skills.load_skills_for_context(always_skills)
+        if always_content:
+            parts.append(("Active Skills", f"# Active Skills\n\n{always_content}"))
+
+    skills_summary = builder.skills.build_skills_summary()
+    if skills_summary:
+        parts.append(
+            (
+                "Skills Summary",
+                "# Skills\n\n"
+                "The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.\n"
+                'Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.\n\n'
+                f"{skills_summary}",
+            )
+        )
+
+    model = config.agents.defaults.model
+    breakdown: list[tuple[str, int]] = []
+    assembled = ""
+    prev_tokens = 0
+    separator_tokens = 0
+
+    for index, (label, content) in enumerate(parts):
+        if content == "":
+            breakdown.append((label, 0))
+            continue
+        if index == 0:
+            next_prompt = content
+        else:
+            next_prompt = assembled + "\n\n---\n\n" + content
+            sep_only_tokens = _count_tokens(
+                [{"role": "system", "content": assembled + "\n\n---\n\n"}], model
+            )
+            separator_tokens += max(0, sep_only_tokens - prev_tokens)
+
+        total_tokens = _count_tokens([{"role": "system", "content": next_prompt}], model)
+        contribution = max(0, total_tokens - prev_tokens)
+        breakdown.append((label, contribution))
+        assembled = next_prompt
+        prev_tokens = total_tokens
+
+    if separator_tokens > 0 and len(parts) > 1:
+        breakdown.append(("Separators", separator_tokens))
+
+    return prev_tokens, breakdown
+
+
+def _skills_breakdown(config: Config) -> list[tuple[str, int, int, bool]]:
+    """Return per-skill summary and full-content token usage."""
+    from nanobot.agent.skills import SkillsLoader
+
+    loader = SkillsLoader(config.workspace_path)
+    skills = loader.list_skills(filter_unavailable=False)
+    model = config.agents.defaults.model
+    always = set(loader.get_always_skills())
+
+    def _escape_xml(value: str) -> str:
+        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    out: list[tuple[str, int, int, bool]] = []
+    for skill in skills:
+        name = skill["name"]
+        esc_name = _escape_xml(name)
+        desc = _escape_xml(loader._get_skill_description(name))
+        skill_meta = loader._get_skill_meta(name)
+        available = loader._check_requirements(skill_meta)
+
+        summary_lines = [
+            f'  <skill available="{str(available).lower()}">',
+            f"    <name>{esc_name}</name>",
+            f"    <description>{desc}</description>",
+            f"    <location>{skill['path']}</location>",
+        ]
+        if not available:
+            missing = loader._get_missing_requirements(skill_meta)
+            if missing:
+                summary_lines.append(f"    <requires>{_escape_xml(missing)}</requires>")
+        summary_lines.append("  </skill>")
+        summary_entry = "\n".join(summary_lines)
+        summary_tokens = _count_tokens([{"role": "system", "content": summary_entry}], model)
+
+        full_tokens = 0
+        raw = loader.load_skill(name)
+        if raw:
+            stripped = loader._strip_frontmatter(raw)
+            full_block = f"### Skill: {name}\n\n{stripped}"
+            full_tokens = _count_tokens([{"role": "system", "content": full_block}], model)
+
+        out.append((name, summary_tokens, full_tokens, name in always))
+
+    return out
+
+
+@app.command()
+def context(
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Show context usage for one session (exact key or suffix)",
+    ),
+):
+    """Show context token usage breakdown by session."""
+    from nanobot.config.loader import load_config
+    from nanobot.session.manager import SessionManager
+
+    config = load_config()
+    session_manager = SessionManager(config.workspace_path)
+    listed = session_manager.list_sessions()
+    all_keys = [s.get("key", "") for s in listed if s.get("key")]
+
+    if not all_keys:
+        console.print("No sessions found.")
+        return
+
+    target_key = None
+    if session:
+        target_key = _resolve_session_key(session_manager, session, all_keys)
+        if not target_key:
+            console.print(f"No session found for '{session}'.")
+            raise typer.Exit(1)
+
+    keys = [target_key] if target_key else all_keys
+
+    rows: list[tuple[str, dict[str, Any]]] = []
+    for key in keys:
+        s = session_manager.get_or_create(key)
+        recomputed = _recompute_context_usage_for_session(config, s)
+        if recomputed:
+            s.metadata["context_usage"] = recomputed
+            session_manager.save(s)
+
+        usage = s.metadata.get("context_usage", {}) if isinstance(s.metadata, dict) else {}
+        if not isinstance(usage, dict):
+            continue
+        totals = usage.get("totals", {})
+        if not isinstance(totals, dict):
+            continue
+        if (
+            _safe_int(totals.get("user_messages")) <= 0
+            and _safe_int(totals.get("agent_response_tokens")) <= 0
+        ):
+            continue
+        rows.append((key, totals))
+
+    if not rows:
+        if target_key:
+            console.print(f"No context usage data recorded yet for '{target_key}'.")
+        else:
+            console.print("No context usage data recorded yet.")
+        return
+
+    table = Table(title="Context Usage By Session")
+    table.add_column("Session", style="cyan")
+    table.add_column("User Msgs", justify="right")
+    table.add_column("User Tokens", justify="right")
+    table.add_column("Agent Tokens", justify="right")
+    table.add_column("Sum", justify="right")
+    table.add_column("System Prompt", justify="right")
+    table.add_column("LLM Total", justify="right")
+
+    for key, totals in rows:
+        user_messages = _safe_int(totals.get("user_messages"))
+        user_tokens = _safe_int(totals.get("user_request_tokens"))
+        agent_tokens = _safe_int(totals.get("agent_response_tokens"))
+        conversation_tokens = _safe_int(totals.get("conversation_tokens"))
+        system_prompt_tokens = _safe_int(totals.get("system_prompt_tokens"))
+        llm_total_tokens = _safe_int(totals.get("llm_total_tokens"))
+
+        table.add_row(
+            key,
+            str(user_messages),
+            str(user_tokens),
+            str(agent_tokens),
+            str(conversation_tokens),
+            str(system_prompt_tokens),
+            str(llm_total_tokens),
+        )
+
+    console.print(table)
+
+    system_total, breakdown = _system_prompt_breakdown(config)
+    skills_breakdown = _skills_breakdown(config)
+    if breakdown:
+        detail = Table(title="System Prompt Breakdown")
+        detail.add_column("Component", style="cyan")
+        detail.add_column("Tokens", justify="right")
+        for label, tokens in breakdown:
+            detail.add_row(label, str(tokens))
+        detail.add_row("Total", str(system_total))
+
+        skills_table = Table(title="Skills Breakdown")
+        skills_table.add_column("Skill", style="cyan")
+        skills_table.add_column("Summary", justify="right")
+        skills_table.add_column("Full", justify="right")
+        skills_table.add_column("Active", justify="center")
+
+        for name, summary_tokens, full_tokens, active in skills_breakdown:
+            skills_table.add_row(
+                name,
+                str(summary_tokens),
+                str(full_tokens),
+                "yes" if active else "",
+            )
+
+        if skills_breakdown:
+            skills_table.add_row(
+                "Total",
+                str(sum(item[1] for item in skills_breakdown)),
+                str(sum(item[2] for item in skills_breakdown)),
+                "",
+            )
+
+        console.print(detail)
+        console.print(skills_table)
 
 
 # ============================================================================
@@ -1064,19 +1502,22 @@ provider_app = typer.Typer(help="Manage providers")
 app.add_typer(provider_app, name="provider")
 
 
-_LOGIN_HANDLERS: dict[str, callable] = {}
+_LOGIN_HANDLERS: dict[str, Callable[[], None]] = {}
 
 
 def _register_login(name: str):
     def decorator(fn):
         _LOGIN_HANDLERS[name] = fn
         return fn
+
     return decorator
 
 
 @provider_app.command("login")
 def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    provider: str = typer.Argument(
+        ..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"
+    ),
 ):
     """Authenticate with an OAuth provider."""
     from nanobot.providers.registry import PROVIDERS
@@ -1101,6 +1542,7 @@ def provider_login(
 def _login_openai_codex() -> None:
     try:
         from oauth_cli_kit import get_token, login_oauth_interactive
+
         token = None
         try:
             token = get_token()
@@ -1115,7 +1557,9 @@ def _login_openai_codex() -> None:
         if not (token and token.access):
             console.print("[red]✗ Authentication failed[/red]")
             raise typer.Exit(1)
-        console.print(f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]")
+        console.print(
+            f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]"
+        )
     except ImportError:
         console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
         raise typer.Exit(1)
@@ -1129,7 +1573,12 @@ def _login_github_copilot() -> None:
 
     async def _trigger():
         from litellm import acompletion
-        await acompletion(model="github_copilot/gpt-4o", messages=[{"role": "user", "content": "hi"}], max_tokens=1)
+
+        await acompletion(
+            model="github_copilot/gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
 
     try:
         asyncio.run(_trigger())
