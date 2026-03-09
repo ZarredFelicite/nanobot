@@ -24,7 +24,7 @@ from nanobot.channels.base import BaseChannel
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
-    from nanobot.config.schema import AgentDefaults, ModelsConfig, OpenCodeConfig
+    from nanobot.config.schema import AgentDefaults, ModelsConfig, OpenCodeConfig, PermissionConfig
     from nanobot.session.manager import Session, SessionManager
 
 
@@ -41,17 +41,20 @@ class OpenCodeChannel(BaseChannel):
         agent_loop: AgentLoop | None = None,
         agent_config: AgentDefaults | None = None,
         models_config: ModelsConfig | None = None,
+        permission_config: PermissionConfig | None = None,
     ):
         super().__init__(config, bus)
         self.session_manager = session_manager
         self.agent_loop = agent_loop
         self.agent_config = agent_config
         self.models_config = models_config
+        self.permission_config = permission_config
         self.port = config.port
 
         self._sse_clients: list[web.StreamResponse] = []
         self._id_counter = 0
         self._active_tasks: dict[str, asyncio.Task] = {}
+        self._pending_permissions: dict[str, asyncio.Future] = {}
         self._last_context_by_session: dict[str, dict[str, Any]] = {}
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
@@ -237,6 +240,12 @@ class OpenCodeChannel(BaseChannel):
         self._app = web.Application()
         self._register_routes(self._app)
 
+        # Wire up permission callback on the agent loop
+        if self.agent_loop:
+            self.agent_loop._permission_callback = self._permission_callback
+            if self.permission_config:
+                self.agent_loop._require_approval = list(self.permission_config.require_approval)
+
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "127.0.0.1", self.port)
@@ -292,16 +301,27 @@ class OpenCodeChannel(BaseChannel):
         # Messages
         app.router.add_get("/session/{id}/message", self._handle_session_messages)
         app.router.add_post("/session/{id}/message", self._handle_session_send)
+        app.router.add_delete(
+            "/session/{id}/message/{messageId}", self._handle_message_revert
+        )
+        app.router.add_post(
+            "/session/{id}/message/{messageId}/unrevert", self._handle_message_unrevert
+        )
         app.router.add_post("/session/{id}/prompt_async", self._handle_prompt_async)
         app.router.add_post("/session/{id}/abort", self._handle_session_abort)
+        app.router.add_post(
+            "/session/{id}/permissions/{permissionId}", self._handle_permission_reply
+        )
         app.router.add_post("/session/{id}/init", self._handle_session_init)
+        app.router.add_post("/session/{id}/fork", self._handle_session_fork)
+        app.router.add_post("/session/{id}/command", self._handle_session_command)
         app.router.add_post("/session/{id}/summarize", self._handle_session_summarize)
         app.router.add_get("/session/{id}/children", self._handle_stub_list)
         app.router.add_get("/session/{id}/todo", self._handle_stub_list)
         app.router.add_get("/session/{id}/diff", self._handle_stub_list)
 
         # Stubs
-        app.router.add_get("/command", self._handle_stub_list)
+        app.router.add_get("/command", self._handle_command_list)
         app.router.add_get("/skill", self._handle_stub_list)
         app.router.add_get("/lsp", self._handle_stub_dict)
         app.router.add_get("/mcp", self._handle_stub_dict)
@@ -399,10 +419,10 @@ class OpenCodeChannel(BaseChannel):
         await self._sse_write(resp, "server.connected", {})
 
         try:
-            while not resp.task.done():
+            while resp.task is not None and not resp.task.done():
                 await self._sse_write(resp, "server.heartbeat", {})
                 await asyncio.sleep(10)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, ConnectionResetError):
             pass
         finally:
             if resp in self._sse_clients:
@@ -547,6 +567,28 @@ class OpenCodeChannel(BaseChannel):
     async def _handle_session_init(self, request: web.Request) -> web.Response:
         return web.json_response({"ok": True})
 
+    async def _handle_session_fork(self, request: web.Request) -> web.Response:
+        """Fork a session — copy its history to a new session."""
+        session_id = request.match_info["id"]
+        session, key = self._find_session(session_id)
+        if not session:
+            return web.json_response({"error": "session not found"}, status=404)
+        if not self.session_manager:
+            return web.json_response({"error": "no session manager"}, status=500)
+
+        new_id = self._new_session_id()
+        new_session = self.session_manager.get_or_create(new_id)
+        new_session.messages = list(session.messages)
+        new_session.metadata = dict(session.metadata)
+        new_session.metadata["title"] = f"Fork of {session.metadata.get('title', session_id)}"
+        new_session.metadata.pop("revert_point", None)
+        new_session.last_consolidated = session.last_consolidated
+        self.session_manager.save(new_session)
+
+        info = self._session_to_info(new_session, new_id)
+        await self._broadcast_sse("session.created", {"info": info})
+        return web.json_response(info)
+
     # ------------------------------------------------------------------
     # Message endpoints
     # ------------------------------------------------------------------
@@ -572,6 +614,13 @@ class OpenCodeChannel(BaseChannel):
 
         if not self.agent_loop:
             return web.json_response({"error": "no agent"}, status=500)
+
+        # If a revert_point is active, permanently truncate before continuing
+        revert_point = session.metadata.get("revert_point")
+        if isinstance(revert_point, int) and 0 <= revert_point < len(session.messages):
+            session.messages = session.messages[:revert_point]
+            session.metadata.pop("revert_point", None)
+            self.session_manager.save(session)
 
         body = await request.json()
         active_model = self._session_model(session, body)
@@ -652,8 +701,90 @@ class OpenCodeChannel(BaseChannel):
 
         # Process via agent
         accumulated_text = []
+        tool_part_counter = 0  # Track tool part indices for SSE events
 
-        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+        async def on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_event: dict | None = None,
+        ) -> None:
+            nonlocal tool_part_counter
+
+            # Handle structured tool lifecycle events
+            if tool_event:
+                evt_type = tool_event.get("type", "")
+                call_id = tool_event.get("call_id", "")
+                tool_name = tool_event.get("name", "")
+                tool_input = tool_event.get("input", {})
+
+                if evt_type == "tool_start":
+                    tool_part_counter += 1
+                    tool_title = tool_name
+                    first_val = next(iter(tool_input.values()), None) if isinstance(tool_input, dict) else None
+                    if isinstance(first_val, str):
+                        short = first_val[:40] + "…" if len(first_val) > 40 else first_val
+                        tool_title = f'{tool_name}("{short}")'
+                    await self._broadcast_sse(
+                        "message.part.updated",
+                        {
+                            "part": {
+                                "id": f"{asst_part_id}_tool_{tool_part_counter}",
+                                "sessionID": session_id,
+                                "messageID": asst_msg_id,
+                                "type": "tool",
+                                "callID": call_id,
+                                "tool": tool_name,
+                                "state": {
+                                    "status": "running",
+                                    "input": tool_input,
+                                    "output": "",
+                                    "title": tool_title,
+                                    "metadata": {},
+                                    "time": self._epoch_ms(time.time()),
+                                },
+                                "time": {"start": self._epoch_ms(time.time())},
+                            }
+                        },
+                    )
+                elif evt_type == "tool_done":
+                    tool_output = tool_event.get("output", "")
+                    is_error = isinstance(tool_output, str) and tool_output.startswith("Error")
+                    metadata: dict = {}
+                    diff = tool_event.get("diff")
+                    if isinstance(diff, dict):
+                        metadata = {
+                            "path": diff.get("path", ""),
+                            "before": diff.get("before", ""),
+                            "after": diff.get("after", ""),
+                        }
+                    await self._broadcast_sse(
+                        "message.part.updated",
+                        {
+                            "part": {
+                                "id": f"{asst_part_id}_tool_{tool_part_counter}",
+                                "sessionID": session_id,
+                                "messageID": asst_msg_id,
+                                "type": "tool",
+                                "callID": call_id,
+                                "tool": tool_name,
+                                "state": {
+                                    "status": "error" if is_error else "completed",
+                                    "input": tool_input,
+                                    "output": tool_output,
+                                    "title": tool_name,
+                                    "metadata": metadata,
+                                    "time": self._epoch_ms(time.time()),
+                                },
+                                "time": {
+                                    "start": self._epoch_ms(time.time()),
+                                    "end": self._epoch_ms(time.time()),
+                                },
+                            }
+                        },
+                    )
+                return
+
             if tool_hint:
                 return
             accumulated_text.append(content)
@@ -768,7 +899,9 @@ class OpenCodeChannel(BaseChannel):
             except Exception:
                 logger.exception("prompt_async failed")
 
-        asyncio.create_task(_process())
+        task = asyncio.create_task(_process())
+        self._active_tasks[session_id] = task
+        task.add_done_callback(lambda _: self._active_tasks.pop(session_id, None))
         return web.Response(status=204)
 
     async def _handle_session_abort(self, request: web.Request) -> web.Response:
@@ -777,6 +910,103 @@ class OpenCodeChannel(BaseChannel):
         if task and not task.done():
             task.cancel()
         return web.json_response({"ok": True})
+
+    # ------------------------------------------------------------------
+    # Revert / Unrevert (undo/redo)
+    # ------------------------------------------------------------------
+
+    async def _handle_message_revert(self, request: web.Request) -> web.Response:
+        """Revert (undo) — hide messages from the given message onward."""
+        session_id = request.match_info["id"]
+        message_id = request.match_info["messageId"]
+        session, key = self._find_session(session_id)
+        if not session:
+            return web.json_response({"error": "session not found"}, status=404)
+
+        # Parse index from message ID: msg_{session_id}_{index}
+        try:
+            index = int(message_id.rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            return web.json_response({"error": "invalid message ID"}, status=400)
+
+        if index < 0 or index >= len(session.messages):
+            return web.json_response({"error": "message index out of range"}, status=400)
+
+        session.metadata["revert_point"] = index
+        self.session_manager.save(session)
+
+        info = self._session_to_info(session, session_id)
+        await self._broadcast_sse("session.updated", {"info": info})
+        return web.json_response({"ok": True, "revertPoint": index})
+
+    async def _handle_message_unrevert(self, request: web.Request) -> web.Response:
+        """Unrevert (redo) — restore visibility of all messages."""
+        session_id = request.match_info["id"]
+        session, key = self._find_session(session_id)
+        if not session:
+            return web.json_response({"error": "session not found"}, status=404)
+
+        session.metadata.pop("revert_point", None)
+        self.session_manager.save(session)
+
+        info = self._session_to_info(session, session_id)
+        await self._broadcast_sse("session.updated", {"info": info})
+        return web.json_response({"ok": True})
+
+    # ------------------------------------------------------------------
+    # Permissions
+    # ------------------------------------------------------------------
+
+    async def _handle_permission_reply(self, request: web.Request) -> web.Response:
+        """Handle user reply to a tool permission request."""
+        perm_id = request.match_info["permissionId"]
+        future = self._pending_permissions.get(perm_id)
+        if not future or future.done():
+            return web.json_response({"error": "permission not found or expired"}, status=404)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        reply = body.get("reply", "reject") if isinstance(body, dict) else "reject"
+        if reply not in ("once", "always", "reject"):
+            reply = "reject"
+
+        future.set_result(reply)
+        await self._broadcast_sse(
+            "permission.replied",
+            {"permissionID": perm_id, "reply": reply},
+        )
+        return web.json_response({"ok": True, "reply": reply})
+
+    async def _permission_callback(
+        self, tool_name: str, call_id: str, args: dict
+    ) -> str:
+        """Async callback invoked by AgentLoop when a tool needs permission.
+
+        Emits a permission.asked SSE event and waits for the user to reply
+        via the /permissions/{id} endpoint.
+        """
+        perm_id = f"perm_{uuid.uuid4().hex[:16]}"
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        self._pending_permissions[perm_id] = future
+
+        await self._broadcast_sse(
+            "permission.asked",
+            {
+                "permissionID": perm_id,
+                "tool": tool_name,
+                "callID": call_id,
+                "input": args,
+            },
+        )
+
+        try:
+            return await future
+        finally:
+            self._pending_permissions.pop(perm_id, None)
 
     async def _handle_session_summarize(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
@@ -883,6 +1113,115 @@ class OpenCodeChannel(BaseChannel):
         )
 
     # ------------------------------------------------------------------
+    # Command endpoints
+    # ------------------------------------------------------------------
+
+    _COMMANDS = [
+        {
+            "name": "clear",
+            "description": "Clear session history",
+            "source": "command",
+            "template": "/clear",
+            "hints": [],
+        },
+        {
+            "name": "help",
+            "description": "Show available commands",
+            "source": "command",
+            "template": "/help",
+            "hints": [],
+        },
+    ]
+
+    _COMMANDS_BY_NAME = {c["name"]: c for c in _COMMANDS}
+
+    async def _handle_command_list(self, request: web.Request) -> web.Response:
+        return web.json_response(self._COMMANDS)
+
+    async def _handle_session_command(self, request: web.Request) -> web.Response:
+        """Execute a slash command by resolving its template and processing as a message."""
+        session_id = request.match_info["id"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        command_name = body.get("command", "") if isinstance(body, dict) else ""
+        cmd = self._COMMANDS_BY_NAME.get(command_name)
+        if not cmd:
+            return web.json_response({"error": f"unknown command: {command_name}"}, status=404)
+
+        # Resolve template — substitute $ARGUMENTS if present
+        template = cmd["template"]
+        arguments = body.get("arguments", "") if isinstance(body, dict) else ""
+        if "$ARGUMENTS" in template:
+            template = template.replace("$ARGUMENTS", arguments)
+
+        session, key = self._find_session(session_id)
+        if not session:
+            key = session_id
+            session = self.session_manager.get_or_create(key)
+            self.session_manager.save(session)
+        if not self.agent_loop:
+            return web.json_response({"error": "no agent"}, status=500)
+
+        active_model = self._session_model(session, body)
+
+        try:
+            response = await self.agent_loop.process_direct(
+                content=template,
+                session_key=key,
+                channel="opencode",
+                chat_id=session_id,
+                model=active_model,
+            )
+        except Exception as e:
+            logger.exception("Command execution failed")
+            response = f"Error: {e}"
+
+        now_ms = self._epoch_ms(time.time())
+        provider_name, model_id = self._split_model(active_model)
+        base_index = len(session.messages)
+        msg_id = f"msg_{session_id}_{base_index}"
+        part_id = f"part_{session_id}_{base_index}"
+
+        asst_msg = {
+            "id": msg_id,
+            "sessionID": session_id,
+            "role": "assistant",
+            "time": {"created": now_ms, "completed": now_ms},
+            "modelID": model_id,
+            "providerID": provider_name,
+            "mode": "default",
+            "agent": "default",
+            "path": {"cwd": str(self.agent_loop.workspace), "root": ""},
+            "cost": 0,
+            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        }
+        asst_part = {
+            "id": part_id,
+            "sessionID": session_id,
+            "messageID": msg_id,
+            "type": "text",
+            "text": response or "",
+            "time": {"created": now_ms},
+        }
+
+        await self._broadcast_sse("message.updated", {"info": asst_msg})
+        await self._broadcast_sse("message.part.updated", {"part": asst_part})
+
+        session_info = self._session_to_info(session, session_id)
+        await self._broadcast_sse("session.updated", {"info": session_info})
+        await self._broadcast_sse(
+            "session.status",
+            {"sessionID": session_id, "status": {"type": "idle"}},
+        )
+
+        return web.json_response({
+            "info": asst_msg,
+            "parts": [asst_part],
+        })
+
+    # ------------------------------------------------------------------
     # Stub endpoints
     # ------------------------------------------------------------------
 
@@ -975,17 +1314,27 @@ class OpenCodeChannel(BaseChannel):
         """Convert nanobot message list to OpenCode MessageV2.WithParts format."""
         result = []
         provider_name, model_id = self._parse_model()
+        messages = session.messages
+
+        # Respect revert_point — hide messages at or beyond the cutoff
+        revert_point = session.metadata.get("revert_point")
+        if isinstance(revert_point, int) and 0 <= revert_point < len(messages):
+            messages = messages[:revert_point]
 
         prev_user_id = None
         prev_user_created_ms: int | None = None
 
-        for i, m in enumerate(session.messages):
+        # Pre-index tool results by tool_call_id for pairing with assistant tool_calls
+        tool_results: dict[str, dict[str, Any]] = {}
+        for m in messages:
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                tool_results[m["tool_call_id"]] = m
+
+        for i, m in enumerate(messages):
             role = m.get("role", "")
             content = m.get("content", "")
             ts = m.get("timestamp", "")
             try:
-                from datetime import datetime
-
                 created = (
                     self._epoch_ms(datetime.fromisoformat(ts).timestamp())
                     if ts
@@ -1025,11 +1374,100 @@ class OpenCodeChannel(BaseChannel):
 
             elif role == "assistant":
                 text = content if isinstance(content, str) else str(content)
-                if not text:
+                tool_calls = m.get("tool_calls", [])
+
+                # Skip assistant messages with no text and no tool calls
+                if not text and not tool_calls:
                     continue
+
                 created_assistant = created
                 if prev_user_created_ms is not None and created_assistant <= prev_user_created_ms:
                     created_assistant = prev_user_created_ms + 1
+
+                parts: list[dict[str, Any]] = []
+                part_idx = 0
+
+                # Text part (if any)
+                if text:
+                    parts.append({
+                        "id": f"{part_id}_{part_idx}",
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                        "type": "text",
+                        "text": text,
+                        "time": {"start": created_assistant, "end": created_assistant},
+                    })
+                    part_idx += 1
+
+                # Tool parts from tool_calls
+                for tc in tool_calls:
+                    tc_id = tc.get("id", "")
+                    tc_func = tc.get("function", {})
+                    tc_name = tc_func.get("name", "unknown")
+                    tc_args_raw = tc_func.get("arguments", "{}")
+                    try:
+                        tc_input = json.loads(tc_args_raw) if isinstance(tc_args_raw, str) else tc_args_raw
+                    except (json.JSONDecodeError, TypeError):
+                        tc_input = tc_args_raw
+
+                    # Find matching tool result
+                    tr = tool_results.get(tc_id)
+                    tc_output = ""
+                    tc_status = "completed"
+                    if tr:
+                        tc_output = tr.get("content", "")
+                        if isinstance(tc_output, str) and tc_output.startswith("Error"):
+                            tc_status = "error"
+                    else:
+                        tc_status = "pending"
+
+                    tool_title = tc_name
+                    first_val = next(iter(tc_input.values()), None) if isinstance(tc_input, dict) else None
+                    if isinstance(first_val, str):
+                        short = first_val[:40] + "…" if len(first_val) > 40 else first_val
+                        tool_title = f'{tc_name}("{short}")'
+
+                    parts.append({
+                        "id": f"{part_id}_{part_idx}",
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                        "type": "tool",
+                        "callID": tc_id,
+                        "tool": tc_name,
+                        "state": {
+                            "status": tc_status,
+                            "input": tc_input,
+                            "output": tc_output,
+                            "title": tool_title,
+                            "metadata": {},
+                            "time": created_assistant,
+                        },
+                        "time": {"start": created_assistant, "end": created_assistant},
+                    })
+                    part_idx += 1
+
+                # Fall back to single text part if no parts were generated
+                if not parts:
+                    parts.append({
+                        "id": part_id,
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                        "type": "text",
+                        "text": "",
+                        "time": {"start": created_assistant, "end": created_assistant},
+                    })
+
+                usage = m.get("usage", {})
+                tokens = {
+                    "input": usage.get("prompt_tokens", 0),
+                    "output": usage.get("completion_tokens", 0),
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0},
+                }
+                details = usage.get("completion_tokens_details")
+                if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
+                    tokens["reasoning"] = details["reasoning_tokens"]
+
                 msg = {
                     "info": {
                         "id": msg_id,
@@ -1045,25 +1483,13 @@ class OpenCodeChannel(BaseChannel):
                             "cwd": str(self.agent_loop.workspace) if self.agent_loop else "",
                             "root": "",
                         },
-                        "cost": 0,
-                        "tokens": {
-                            "input": 0,
-                            "output": 0,
-                            "reasoning": 0,
-                            "cache": {"read": 0, "write": 0},
-                        },
+                        "cost": float(usage.get("cost", 0)) if usage else 0,
+                        "tokens": tokens,
                     },
-                    "parts": [
-                        {
-                            "id": part_id,
-                            "sessionID": session_id,
-                            "messageID": msg_id,
-                            "type": "text",
-                            "text": text,
-                            "time": {"start": created_assistant, "end": created_assistant},
-                        }
-                    ],
+                    "parts": parts,
                 }
                 result.append(msg)
+
+            # role == "tool" messages are consumed via tool_results dict above
 
         return result

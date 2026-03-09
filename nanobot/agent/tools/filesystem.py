@@ -79,6 +79,7 @@ class WriteFileTool(Tool):
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        self.last_diff: dict[str, str] | None = None
 
     @property
     def name(self) -> str:
@@ -102,12 +103,21 @@ class WriteFileTool(Tool):
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            before = ""
+            if file_path.exists() and file_path.is_file():
+                try:
+                    before = file_path.read_text(encoding="utf-8")
+                except Exception:
+                    pass
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
+            self.last_diff = {"path": str(file_path), "before": before, "after": content}
             return f"Successfully wrote {len(content)} bytes to {file_path}"
         except PermissionError as e:
+            self.last_diff = None
             return f"Error: {e}"
         except Exception as e:
+            self.last_diff = None
             return f"Error writing file: {str(e)}"
 
 
@@ -117,6 +127,7 @@ class EditFileTool(Tool):
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        self.last_diff: dict[str, str] | None = None
 
     @property
     def name(self) -> str:
@@ -157,10 +168,13 @@ class EditFileTool(Tool):
             new_content = content.replace(old_text, new_text, 1)
             file_path.write_text(new_content, encoding="utf-8")
 
+            self.last_diff = {"path": str(file_path), "before": content, "after": new_content}
             return f"Successfully edited {file_path}"
         except PermissionError as e:
+            self.last_diff = None
             return f"Error: {e}"
         except Exception as e:
+            self.last_diff = None
             return f"Error editing file: {str(e)}"
 
     @staticmethod

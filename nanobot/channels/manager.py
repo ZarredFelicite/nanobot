@@ -170,6 +170,7 @@ class ChannelManager:
                     agent_loop=self.agent_loop,
                     agent_config=self.config.agents.defaults,
                     models_config=self.config.models,
+                    permission_config=self.config.tools.permissions,
                 )
                 logger.info(
                     "OpenCode channel enabled on port {}", self.config.channels.opencode.port

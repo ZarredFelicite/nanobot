@@ -319,6 +319,7 @@ class HeartbeatConfig(Base):
 
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
+    model: str | None = None  # Override model for heartbeat execution (must support tool use)
 
 
 class GatewayConfig(Base):
@@ -352,15 +353,27 @@ class ExecToolConfig(Base):
     path_append: str = ""
 
 
-class MemUConfig(Base):
-    """memU proactive memory service configuration."""
+class SubconsciousConfig(Base):
+    """Subconscious memory service configuration."""
 
     enabled: bool = False
-    db_path: str = "~/.nanobot/workspace/memory/memu.db"
-    batch_message_threshold: int = 5
-    batch_time_threshold_s: int = 120
-    max_retrieval_results: int = 10
-    extraction_model: str | None = None
+    extraction_model: str = "openai/gpt-5-mini"
+    classifier_model: str = "openrouter/google/gemini-2.0-flash-lite-001"
+    auto_inject_budget: int = 1000  # Max tokens of memories to auto-inject per turn
+    auto_inject_results: int = 5  # Max qmd results to consider for injection
+    batch_message_threshold: int = 5  # Messages before extraction flush
+    batch_time_threshold_s: int = 120  # Seconds before time-based flush
+    compaction_enabled: bool = True  # Generate weekly/monthly history summaries
+    qmd_collection_name: str = "nanobot-memory"
+
+
+class PermissionConfig(Base):
+    """Tool permission configuration for ACP compliance."""
+
+    require_approval: list[str] = Field(
+        default_factory=lambda: ["exec", "write_file", "edit_file"]
+    )
+    auto_approve: list[str] = Field(default_factory=list)
 
 
 class MCPServerConfig(Base):
@@ -379,7 +392,8 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    memu: MemUConfig = Field(default_factory=MemUConfig)
+    subconscious: SubconsciousConfig = Field(default_factory=SubconsciousConfig)
+    permissions: PermissionConfig = Field(default_factory=PermissionConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 

@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -28,7 +27,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, MemUConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, SubconsciousConfig
     from nanobot.cron.service import CronService
 
 
@@ -67,7 +66,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
-        memu_config: MemUConfig | None = None,
+        subconscious_config: SubconsciousConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -106,12 +105,13 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
         )
 
-        # memU bridge (lazy init)
-        self._memu_bridge = None
-        if memu_config and memu_config.enabled:
-            from nanobot.agent.memu_service import MemUBridge
+        # Subconscious memory service (lazy init)
+        self._subconscious = None
+        self._subconscious_config = subconscious_config
+        if subconscious_config and subconscious_config.enabled:
+            from nanobot.agent.subconscious import SubconsciousService
 
-            self._memu_bridge = MemUBridge(memu_config)
+            self._subconscious = SubconsciousService(workspace, subconscious_config)
 
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -128,6 +128,10 @@ class AgentLoop:
         self._codex_provider: LLMProvider | None = None
         self._last_context_stats: dict[str, dict[str, Any]] = {}
         self._last_llm_usage: dict[str, dict[str, Any]] = {}
+        # Permission callback: async (tool_name, tool_call_id, args) -> "once"|"always"|"reject"
+        self._permission_callback: Callable[..., Awaitable[str]] | None = None
+        self._require_approval: list[str] = []  # Tool names that need user approval
+        self._session_auto_approve: dict[str, set[str]] = {}  # session_key -> auto-approved tools
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -149,10 +153,10 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
-        if self._memu_bridge:
-            from nanobot.agent.tools.memu_retrieve import MemURetrieveTool
+        if self._subconscious:
+            from nanobot.agent.tools.memory_recall import MemoryRecallTool
 
-            self.tools.register(MemURetrieveTool(self._memu_bridge))
+            self.tools.register(MemoryRecallTool(self._subconscious))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -273,6 +277,7 @@ class AgentLoop:
         channel: str,
         chat_id: str,
         model: str,
+        relevant_memories: str | None = None,
     ) -> list[dict[str, Any]]:
         """Trim oldest turns until prompt fits the token budget."""
         trimmed = list(history)
@@ -285,6 +290,7 @@ class AgentLoop:
                 media=media if media else None,
                 channel=channel,
                 chat_id=chat_id,
+                relevant_memories=relevant_memories,
             )
             if self._count_tokens(candidate, model) <= budget:
                 break
@@ -368,6 +374,8 @@ class AgentLoop:
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
         model: str | None = None,
+        session_key: str | None = None,
+        require_approval: list[str] | None = None,
     ) -> tuple[str | None, list[str], list[dict], dict[str, Any]]:
         """Run the agent loop. Returns (final_content, tools_used, messages, usage)."""
         messages = initial_messages
@@ -428,7 +436,76 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+
+                    # Permission check
+                    needs_approval = (
+                        require_approval
+                        and tool_call.name in require_approval
+                        and tool_call.name not in self._session_auto_approve.get(session_key or "", set())
+                    )
+                    if needs_approval and self._permission_callback:
+                        if on_progress:
+                            await on_progress("", tool_event={
+                                "type": "permission_asked",
+                                "call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "input": tool_call.arguments,
+                            })
+                        try:
+                            reply = await asyncio.wait_for(
+                                self._permission_callback(
+                                    tool_call.name, tool_call.id, tool_call.arguments
+                                ),
+                                timeout=300,
+                            )
+                        except asyncio.TimeoutError:
+                            reply = "reject"
+
+                        if on_progress:
+                            await on_progress("", tool_event={
+                                "type": "permission_replied",
+                                "call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "reply": reply,
+                            })
+
+                        if reply == "always" and session_key:
+                            self._session_auto_approve.setdefault(session_key, set()).add(
+                                tool_call.name
+                            )
+                        if reply == "reject":
+                            result = f"Error: Permission denied by user for tool '{tool_call.name}'."
+                            messages = self.context.add_tool_result(
+                                messages, tool_call.id, tool_call.name, result
+                            )
+                            continue
+
+                    # Emit tool-start event
+                    if on_progress:
+                        await on_progress("", tool_event={
+                            "type": "tool_start",
+                            "call_id": tool_call.id,
+                            "name": tool_call.name,
+                            "input": tool_call.arguments,
+                        })
+
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
+                    # Emit tool-done event (with diff metadata for file tools)
+                    tool_done_event: dict[str, Any] = {
+                        "type": "tool_done",
+                        "call_id": tool_call.id,
+                        "name": tool_call.name,
+                        "output": result[:500] if isinstance(result, str) else str(result)[:500],
+                    }
+                    if tool_call.name in ("write_file", "edit_file"):
+                        tool_obj = self.tools.get(tool_call.name)
+                        if tool_obj and hasattr(tool_obj, "last_diff") and tool_obj.last_diff:
+                            tool_done_event["diff"] = tool_obj.last_diff
+                            tool_obj.last_diff = None
+                    if on_progress:
+                        await on_progress("", tool_event=tool_done_event)
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -462,9 +539,10 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
-        if self._memu_bridge:
-            await self._memu_bridge.initialize()
-            self._memu_bridge.start_background_task()
+        if self._subconscious:
+            await self._subconscious.initialize()
+            self._subconscious.set_provider(self.provider)
+            self._subconscious.start_background_task()
         logger.info("Agent loop started")
 
         while self._running:
@@ -538,9 +616,9 @@ class AgentLoop:
                 )
 
     async def close_mcp(self) -> None:
-        """Close MCP connections and memU bridge."""
-        if self._memu_bridge:
-            await self._memu_bridge.close()
+        """Close MCP connections and subconscious service."""
+        if self._subconscious:
+            await self._subconscious.close()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -552,6 +630,27 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+
+    async def _recall_memories(self, query: str, prev_assistant: str | None = None) -> str | None:
+        """Auto-recall relevant memories, gated by a fast classifier."""
+        if not self._subconscious or not self._subconscious_config:
+            return None
+        try:
+            if not await self._subconscious.should_inject(query, prev_assistant):
+                logger.info("Memory classifier: skip injection")
+                return None
+            result = await self._subconscious.recall(
+                query,
+                budget=self._subconscious_config.auto_inject_budget,
+                n=self._subconscious_config.auto_inject_results,
+            )
+            if result:
+                compact = result.replace("\n", "\\n").replace("\t", "\\t")
+                logger.info("Memory recall ({} chars): {}", len(result), compact[:300])
+            return result or None
+        except Exception:
+            logger.debug("Memory recall failed, continuing without")
+            return None
 
     async def _process_message(
         self,
@@ -572,6 +671,7 @@ class AgentLoop:
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
+            # System messages are internal (cron, heartbeat routing) — skip memory
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content,
@@ -582,6 +682,7 @@ class AgentLoop:
                 messages, model=active_model
             )
             self._save_turn(session, all_msgs, 1 + len(history), usage=usage, model=active_model)
+            # Don't feed system messages to subconscious (handled in _save_turn via key check)
             self.sessions.save(session)
             self._last_llm_usage[key] = usage
             return OutboundMessage(
@@ -591,7 +692,8 @@ class AgentLoop:
                 session_key=key,
             )
 
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+        compact_in = msg.content.replace("\n", "\\n").replace("\t", "\\t")
+        preview = compact_in[:80] + "..." if len(compact_in) > 80 else compact_in
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
@@ -600,47 +702,21 @@ class AgentLoop:
 
         # Slash commands
         cmd = msg.content.strip().lower()
-        if cmd == "/new":
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
-            self._consolidating.add(session.key)
-            try:
-                async with lock:
-                    snapshot = session.messages[session.last_consolidated :]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
-                            return OutboundMessage(
-                                channel=msg.channel,
-                                chat_id=msg.chat_id,
-                                content="Memory archival failed, session not cleared. Please try again.",
-                                session_key=key,
-                            )
-            except Exception:
-                logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                    session_key=key,
-                )
-            finally:
-                self._consolidating.discard(session.key)
-
+        if cmd == "/clear":
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content="New session started.",
+                content="Session cleared.",
                 session_key=key,
             )
         if cmd == "/help":
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands",
+                content="🐈 nanobot commands:\n/clear — Clear session history\n/compact — Summarize and compact context\n/stop — Stop the current task\n/help — Show available commands",
                 session_key=key,
             )
 
@@ -667,7 +743,48 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = session.get_history(max_messages=self.memory_window)
+        is_heartbeat = key == "heartbeat"
+
+        if is_heartbeat:
+            if "title" not in session.metadata:
+                session.metadata["title"] = "Heartbeat"
+            # Keep last 5 user/assistant exchanges for context on recent heartbeats,
+            # but strip tool_calls/tool messages that incompatible models reject.
+            _HB_KEEP = 5
+            raw = session.get_history(max_messages=self.memory_window)
+            pairs: list[dict] = []
+            for m in raw:
+                role = m.get("role")
+                if role == "user":
+                    pairs.append(m)
+                elif role == "assistant" and m.get("content") and not m.get("tool_calls"):
+                    pairs.append(m)
+                # skip tool / tool_calls-only assistant messages
+            # Take last N pairs (each pair = user + assistant)
+            assistant_count = sum(1 for m in pairs if m.get("role") == "assistant")
+            if assistant_count > _HB_KEEP:
+                trim = assistant_count - _HB_KEEP
+                trimmed: list[dict] = []
+                seen = 0
+                for m in pairs:
+                    if m.get("role") == "assistant":
+                        seen += 1
+                        if seen <= trim:
+                            continue
+                    elif seen < trim:
+                        continue
+                    trimmed.append(m)
+                pairs = trimmed
+            history = pairs
+        else:
+            history = session.get_history(max_messages=self.memory_window)
+        relevant_memories: str | None = None
+        if not is_heartbeat:
+            prev_assistant = next(
+                (m.get("content") for m in reversed(history) if m.get("role") == "assistant" and isinstance(m.get("content"), str)),
+                None,
+            )
+            relevant_memories = await self._recall_memories(msg.content, prev_assistant)
 
         # Token-aware context compaction before requesting the model.
         initial_usage: dict[str, int] | None = None
@@ -682,6 +799,7 @@ class AgentLoop:
                 media=msg.media if msg.media else None,
                 channel=msg.channel,
                 chat_id=msg.chat_id,
+                relevant_memories=relevant_memories,
             )
             usage = self._context_usage_breakdown(probe, active_model)
             if initial_usage is None:
@@ -722,6 +840,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            relevant_memories=relevant_memories,
         )
         if self._count_tokens(preview, active_model) > self._context_budget() and history:
             before_trim = len(history)
@@ -732,6 +851,7 @@ class AgentLoop:
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 model=active_model,
+                relevant_memories=relevant_memories,
             )
             trimmed_history_messages = max(0, before_trim - len(history))
 
@@ -741,6 +861,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            relevant_memories=relevant_memories,
         )
         final_usage = self._context_usage_breakdown(final_preview, active_model)
         budget = self._context_budget()
@@ -765,12 +886,20 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            relevant_memories=relevant_memories,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+        async def _bus_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_event: dict | None = None,
+        ) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            if tool_event:
+                meta["_tool_event"] = tool_event
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel=msg.channel,
@@ -785,6 +914,8 @@ class AgentLoop:
             initial_messages,
             on_progress=on_progress or _bus_progress,
             model=active_model,
+            session_key=key,
+            require_approval=self._require_approval or None,
         )
 
         if final_content is None:
@@ -797,7 +928,8 @@ class AgentLoop:
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+        compact_out = final_content.replace("\n", "\\n").replace("\t", "\\t")
+        preview = compact_out[:120] + "..." if len(compact_out) > 120 else compact_out
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         return OutboundMessage(
             channel=msg.channel,
@@ -832,24 +964,29 @@ class AgentLoop:
             ):
                 entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
             elif role == "user":
-                if isinstance(content, str) and content.startswith(
-                    ContextBuilder._RUNTIME_CONTEXT_TAG
-                ):
-                    # Strip the runtime-context prefix, keep only the user text.
-                    parts = content.split("\n\n", 1)
-                    if len(parts) > 1 and parts[1].strip():
-                        entry["content"] = parts[1]
-                    else:
+                if isinstance(content, str):
+                    # Strip the runtime-context prefix
+                    if content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                        parts = content.split("\n\n", 1)
+                        content = parts[1].strip() if len(parts) > 1 else ""
+                    # Strip recalled memories suffix
+                    mem_tag = ContextBuilder._MEMORY_CONTEXT_TAG
+                    if mem_tag in content:
+                        content = content[: content.index(mem_tag)].strip()
+                    if not content:
                         continue
+                    entry["content"] = content
                 if isinstance(content, list):
                     filtered = []
                     for c in content:
-                        if (
-                            c.get("type") == "text"
-                            and isinstance(c.get("text"), str)
-                            and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                        if not isinstance(c, dict):
+                            continue
+                        text = c.get("text", "") if c.get("type") == "text" else None
+                        if text is not None and (
+                            text.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                            or text.startswith(ContextBuilder._MEMORY_CONTEXT_TAG)
                         ):
-                            continue  # Strip runtime context from multimodal messages
+                            continue
                         if c.get("type") == "image_url" and c.get("image_url", {}).get(
                             "url", ""
                         ).startswith("data:image/"):
@@ -881,12 +1018,31 @@ class AgentLoop:
 
         session.updated_at = datetime.now()
 
-        # Feed new messages to memU for extraction
-        if self._memu_bridge:
-            self._memu_bridge.feed_messages(messages[skip:])
+        # Feed new messages to subconscious for extraction (skip heartbeat/system tasks)
+        if self._subconscious and session.key != "heartbeat":
+            self._subconscious.feed_messages(messages[skip:], session_key=session.key)
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
-        """Delegate to MemoryStore.consolidate(). Returns True on success."""
+        """Consolidate session history by trimming old messages.
+
+        When subconscious is active, extraction happens continuously so
+        consolidation only needs to trim the session. Falls back to the
+        legacy MemoryStore consolidation when subconscious is disabled.
+        """
+        if self._subconscious:
+            # Subconscious handles extraction; just trim session messages
+            if archive_all:
+                session.last_consolidated = len(session.messages)
+                return True
+            keep_count = self.memory_window // 2
+            if len(session.messages) <= keep_count:
+                return True
+            session.last_consolidated = len(session.messages) - keep_count
+            return True
+
+        # Legacy fallback
+        from nanobot.agent.memory import MemoryStore
+
         return await MemoryStore(self.workspace).consolidate(
             session,
             self.provider,
@@ -907,14 +1063,12 @@ class AgentLoop:
                 before = session.last_consolidated
                 success = await self._consolidate_memory(session, archive_all=archive_all)
                 self.sessions.save(session)
-                latest_history = MemoryStore(self.workspace).read_latest_history_entry()
                 return {
                     "ok": bool(success),
                     "archiveAll": archive_all,
                     "lastConsolidatedBefore": before,
                     "lastConsolidatedAfter": session.last_consolidated,
                     "messageCount": len(session.messages),
-                    "historyEntry": latest_history,
                 }
         finally:
             self._consolidating.discard(session.key)
@@ -930,8 +1084,8 @@ class AgentLoop:
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
-        if self._memu_bridge and not self._memu_bridge._available:
-            await self._memu_bridge.initialize()
+        if self._subconscious and not self._subconscious._qmd.available:
+            await self._subconscious.initialize()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(
             msg, session_key=session_key, on_progress=on_progress, model=model
