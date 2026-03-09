@@ -55,15 +55,19 @@ class ExecTool(Tool):
                     "type": "string",
                     "description": "The shell command to execute"
                 },
+                "description": {
+                    "type": "string",
+                    "description": "Brief human-readable summary of what this command does (shown as title)"
+                },
                 "working_dir": {
                     "type": "string",
                     "description": "Optional working directory for the command"
                 }
             },
-            "required": ["command"]
+            "required": ["command", "description"]
         }
     
-    async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
+    async def execute(self, command: str, description: str = "", working_dir: str | None = None, **kwargs: Any) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
         guard_error = self._guard_command(command, cwd)
         if guard_error:

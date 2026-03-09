@@ -1,6 +1,6 @@
 ---
 name: memory
-description: Two-layer memory system with grep-based recall.
+description: Subconscious memory with automatic extraction and semantic recall.
 always: true
 ---
 
@@ -8,24 +8,28 @@ always: true
 
 ## Structure
 
-- `memory/MEMORY.md` — Long-term facts (preferences, project context, relationships). Always loaded into your context.
-- `memory/HISTORY.md` — Append-only event log. NOT loaded into context. Search it with grep. Each entry starts with [YYYY-MM-DD HH:MM].
+Your memory is organized as interlinked markdown notes:
 
-## Search Past Events
+- `memory/entities/` — People, projects, tools, organizations. One file per entity.
+- `memory/preferences/` — User preferences, habits, workflow choices. One file per topic.
+- `memory/decisions/` — Technical decisions with rationale. One file per decision.
+- `memory/history/` — Daily logs (`YYYY-MM-DD.md`), weekly and monthly summaries.
 
-```bash
-grep -i "keyword" memory/HISTORY.md
-```
+Notes use `[[Name]]` wikilinks to cross-reference each other.
 
-Use the `exec` tool to run grep. Combine patterns: `grep -iE "meeting|deadline" memory/HISTORY.md`
+## How It Works
 
-## When to Update MEMORY.md
+- **Auto-extraction**: Conversations are automatically analyzed and memories are extracted into the appropriate category files.
+- **Auto-surfacing**: Relevant memories are injected into your context each turn based on the user's message.
+- **Explicit recall**: Use the `memory_search` tool to search for specific memories.
 
-Write important facts immediately using `edit_file` or `write_file`:
-- User preferences ("I prefer dark mode")
-- Project context ("The API uses OAuth2")
-- Relationships ("Alice is the project lead")
+## Manual Updates
 
-## Auto-consolidation
+You can also read and edit memory files directly with `read_file` and `edit_file`:
+- `memory/entities/alice.md` — Update facts about a person
+- `memory/preferences/editor.md` — Record a user preference
+- `memory/decisions/use-postgresql.md` — Document a decision
 
-Old conversations are automatically summarized and appended to HISTORY.md when the session grows large. Long-term facts are extracted to MEMORY.md. You don't need to manage this.
+## History
+
+Daily activity is logged in `memory/history/YYYY-MM-DD.md`. Weekly and monthly summaries are generated automatically over time.

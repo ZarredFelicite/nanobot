@@ -27,6 +27,100 @@ if TYPE_CHECKING:
     from nanobot.config.schema import AgentDefaults, ModelsConfig, OpenCodeConfig, PermissionConfig
     from nanobot.session.manager import Session, SessionManager
 
+# Map nanobot tool names → OpenCode tool names so the TUI uses the right renderer.
+_TOOL_NAME_MAP: dict[str, str] = {
+    "edit_file": "edit",
+    "write_file": "write",
+    "read_file": "read",
+    "list_dir": "list_dir",
+    "exec": "bash",
+    "web_search": "web_search",
+    "web_fetch": "web_fetch",
+}
+
+
+def _map_tool_input(tool_name: str, raw_input: dict | Any) -> dict:
+    """Map nanobot tool arguments to the field names OpenCode renderers expect."""
+    if not isinstance(raw_input, dict):
+        return raw_input if isinstance(raw_input, dict) else {}
+
+    if tool_name == "exec":
+        # Bash renderer reads input.command and input.description
+        return {
+            "command": raw_input.get("command", ""),
+            "description": raw_input.get("description", ""),
+        }
+    # Other tools: pass through as-is (read_file→path, edit_file→path, etc.)
+    return dict(raw_input)
+
+
+def _tool_title(oc_name: str, oc_input: dict) -> str:
+    """Build a human-readable title for a tool part."""
+    first_val = next(iter(oc_input.values()), None) if isinstance(oc_input, dict) else None
+    if isinstance(first_val, str) and first_val:
+        short = first_val[:50] + "…" if len(first_val) > 50 else first_val
+        return f'{oc_name}("{short}")'
+    return oc_name
+
+
+def _build_tool_metadata(tool_name: str, tool_event: dict, tool_output: str = "") -> dict:
+    """Build OpenCode-compatible metadata for a tool_done event.
+
+    For bash/exec tools: includes ``output`` so the TUI renders the block view
+    with ``$ command`` and output display.
+    For edit tools: includes ``diff`` (unified text) and ``filediff``
+    (before/after + line counts) so the TUI can render a diff view.
+    For write tools: includes ``filepath`` and ``exists``.
+    """
+    import difflib
+
+    # Bash: metadata.output triggers block rendering in the TUI
+    if tool_name == "exec":
+        raw_input = tool_event.get("input", {})
+        return {
+            "output": tool_output,
+            "description": raw_input.get("description", "") if isinstance(raw_input, dict) else "",
+        }
+
+    diff_data = tool_event.get("diff")
+    if not isinstance(diff_data, dict):
+        return {}
+
+    file_path = diff_data.get("path", "")
+    before = diff_data.get("before", "")
+    after = diff_data.get("after", "")
+
+    if tool_name == "edit_file":
+        # Compute unified diff text
+        before_lines = before.splitlines(keepends=True)
+        after_lines = after.splitlines(keepends=True)
+        unified = "".join(
+            difflib.unified_diff(
+                before_lines, after_lines,
+                fromfile=file_path, tofile=file_path,
+            )
+        )
+        additions = sum(1 for ln in after_lines if ln not in before_lines)
+        deletions = sum(1 for ln in before_lines if ln not in after_lines)
+        return {
+            "diff": unified,
+            "filediff": {
+                "file": file_path,
+                "before": before,
+                "after": after,
+                "additions": additions,
+                "deletions": deletions,
+            },
+        }
+
+    if tool_name == "write_file":
+        return {
+            "filepath": file_path,
+            "exists": bool(before),
+        }
+
+    return {}
+
 
 class OpenCodeChannel(BaseChannel):
     """HTTP+SSE channel compatible with the OpenCode TUI."""
@@ -55,6 +149,8 @@ class OpenCodeChannel(BaseChannel):
         self._id_counter = 0
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._pending_permissions: dict[str, asyncio.Future] = {}
+        self._pending_permission_info: dict[str, dict[str, Any]] = {}  # perm_id -> metadata
+        self._current_session_id: str = ""  # session_id currently being processed
         self._last_context_by_session: dict[str, dict[str, Any]] = {}
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
@@ -338,7 +434,8 @@ class OpenCodeChannel(BaseChannel):
         app.router.add_get("/file/status", self._handle_stub_list)
         app.router.add_get("/global/health", self._handle_health)
         app.router.add_get("/global/config", self._handle_config)
-        app.router.add_get("/permission", self._handle_stub_list)
+        app.router.add_get("/permission", self._handle_permission_list)
+        app.router.add_post("/permission/{requestID}/reply", self._handle_permission_reply_v2)
         app.router.add_get("/question", self._handle_stub_list)
         app.router.add_post("/log", self._handle_stub_ok)
         app.router.add_post("/instance/dispose", self._handle_stub_ok)
@@ -700,8 +797,16 @@ class OpenCodeChannel(BaseChannel):
         )
 
         # Process via agent
-        accumulated_text = []
-        tool_part_counter = 0  # Track tool part indices for SSE events
+        self._current_session_id = session_id
+        accumulated_text: list[str] = []
+        # Unified part counter so text/tool parts are ordered correctly.
+        # Part 0 is reserved for the first text chunk; tools and subsequent
+        # text segments get incrementing indices.
+        part_counter = 0
+        current_text_part_id = f"{asst_part_id}_p0"
+        has_seen_tools = False  # track if tools appeared since last text
+        # Map tool call_id → part index for updating tool_done on the right part
+        tool_call_part: dict[str, int] = {}
 
         async def on_progress(
             content: str,
@@ -709,7 +814,7 @@ class OpenCodeChannel(BaseChannel):
             tool_hint: bool = False,
             tool_event: dict | None = None,
         ) -> None:
-            nonlocal tool_part_counter
+            nonlocal part_counter, current_text_part_id, has_seen_tools
 
             # Handle structured tool lifecycle events
             if tool_event:
@@ -718,68 +823,71 @@ class OpenCodeChannel(BaseChannel):
                 tool_name = tool_event.get("name", "")
                 tool_input = tool_event.get("input", {})
 
+                # Map nanobot tool names to OpenCode tool names for renderer matching
+                oc_tool_name = _TOOL_NAME_MAP.get(tool_name, tool_name)
+
                 if evt_type == "tool_start":
-                    tool_part_counter += 1
-                    tool_title = tool_name
-                    first_val = next(iter(tool_input.values()), None) if isinstance(tool_input, dict) else None
-                    if isinstance(first_val, str):
-                        short = first_val[:40] + "…" if len(first_val) > 40 else first_val
-                        tool_title = f'{tool_name}("{short}")'
+                    has_seen_tools = True
+                    part_counter += 1
+                    tool_call_part[call_id] = part_counter
+                    oc_input = _map_tool_input(tool_name, tool_input)
+                    start_ms = self._epoch_ms(time.time())
                     await self._broadcast_sse(
                         "message.part.updated",
                         {
                             "part": {
-                                "id": f"{asst_part_id}_tool_{tool_part_counter}",
+                                "id": f"{asst_part_id}_p{part_counter}",
                                 "sessionID": session_id,
                                 "messageID": asst_msg_id,
                                 "type": "tool",
                                 "callID": call_id,
-                                "tool": tool_name,
+                                "tool": oc_tool_name,
                                 "state": {
                                     "status": "running",
-                                    "input": tool_input,
-                                    "output": "",
-                                    "title": tool_title,
+                                    "input": oc_input,
+                                    "title": _tool_title(oc_tool_name, oc_input),
                                     "metadata": {},
-                                    "time": self._epoch_ms(time.time()),
+                                    "time": {"start": start_ms},
                                 },
-                                "time": {"start": self._epoch_ms(time.time())},
                             }
                         },
                     )
                 elif evt_type == "tool_done":
                     tool_output = tool_event.get("output", "")
                     is_error = isinstance(tool_output, str) and tool_output.startswith("Error")
-                    metadata: dict = {}
-                    diff = tool_event.get("diff")
-                    if isinstance(diff, dict):
-                        metadata = {
-                            "path": diff.get("path", ""),
-                            "before": diff.get("before", ""),
-                            "after": diff.get("after", ""),
+                    oc_input = _map_tool_input(tool_name, tool_input)
+                    metadata = _build_tool_metadata(tool_name, tool_event, tool_output)
+                    tc_part_idx = tool_call_part.get(call_id, part_counter)
+                    done_ms = self._epoch_ms(time.time())
+                    state: dict[str, Any]
+                    if is_error:
+                        state = {
+                            "status": "error",
+                            "input": oc_input,
+                            "error": tool_output,
+                            "metadata": metadata,
+                            "time": {"start": done_ms, "end": done_ms},
+                        }
+                    else:
+                        state = {
+                            "status": "completed",
+                            "input": oc_input,
+                            "output": tool_output,
+                            "title": _tool_title(oc_tool_name, oc_input),
+                            "metadata": metadata,
+                            "time": {"start": done_ms, "end": done_ms},
                         }
                     await self._broadcast_sse(
                         "message.part.updated",
                         {
                             "part": {
-                                "id": f"{asst_part_id}_tool_{tool_part_counter}",
+                                "id": f"{asst_part_id}_p{tc_part_idx}",
                                 "sessionID": session_id,
                                 "messageID": asst_msg_id,
                                 "type": "tool",
                                 "callID": call_id,
-                                "tool": tool_name,
-                                "state": {
-                                    "status": "error" if is_error else "completed",
-                                    "input": tool_input,
-                                    "output": tool_output,
-                                    "title": tool_name,
-                                    "metadata": metadata,
-                                    "time": self._epoch_ms(time.time()),
-                                },
-                                "time": {
-                                    "start": self._epoch_ms(time.time()),
-                                    "end": self._epoch_ms(time.time()),
-                                },
+                                "tool": oc_tool_name,
+                                "state": state,
                             }
                         },
                     )
@@ -787,12 +895,21 @@ class OpenCodeChannel(BaseChannel):
 
             if tool_hint:
                 return
+
+            # If text arrives after tool parts, start a new text part
+            # so the TUI positions it after the tools.
+            if has_seen_tools:
+                part_counter += 1
+                current_text_part_id = f"{asst_part_id}_p{part_counter}"
+                accumulated_text.clear()
+                has_seen_tools = False
+
             accumulated_text.append(content)
             await self._broadcast_sse(
                 "message.part.updated",
                 {
                     "part": {
-                        "id": asst_part_id,
+                        "id": current_text_part_id,
                         "sessionID": session_id,
                         "messageID": asst_msg_id,
                         "type": "text",
@@ -838,10 +955,16 @@ class OpenCodeChannel(BaseChannel):
             if isinstance(usage.get("cost"), (int, float)):
                 asst_msg["cost"] = float(usage["cost"])
 
-        # Final assistant message
+        # Final assistant text part — use the current text part ID so it
+        # lands after any tool parts in the TUI ordering.
         final_text = response or "\n".join(accumulated_text) or ""
+        # If response came back but no text was streamed after tools, allocate
+        # a new part so it appears after tool parts.
+        if response and has_seen_tools:
+            part_counter += 1
+            current_text_part_id = f"{asst_part_id}_p{part_counter}"
         asst_part_final = {
-            "id": asst_part_id,
+            "id": current_text_part_id,
             "sessionID": session_id,
             "messageID": asst_msg_id,
             "type": "text",
@@ -958,8 +1081,25 @@ class OpenCodeChannel(BaseChannel):
     # ------------------------------------------------------------------
 
     async def _handle_permission_reply(self, request: web.Request) -> web.Response:
-        """Handle user reply to a tool permission request."""
+        """Handle user reply to a tool permission request (v1 legacy endpoint)."""
         perm_id = request.match_info["permissionId"]
+        return await self._resolve_permission(perm_id, request)
+
+    async def _handle_permission_reply_v2(self, request: web.Request) -> web.Response:
+        """Handle user reply to a tool permission request (v2: POST /permission/{requestID}/reply)."""
+        perm_id = request.match_info["requestID"]
+        return await self._resolve_permission(perm_id, request)
+
+    async def _handle_permission_list(self, request: web.Request) -> web.Response:
+        """List pending permission requests."""
+        pending = [
+            info for perm_id, info in self._pending_permission_info.items()
+            if perm_id in self._pending_permissions and not self._pending_permissions[perm_id].done()
+        ]
+        return web.json_response(pending)
+
+    async def _resolve_permission(self, perm_id: str, request: web.Request) -> web.Response:
+        """Resolve a pending permission future."""
         future = self._pending_permissions.get(perm_id)
         if not future or future.done():
             return web.json_response({"error": "permission not found or expired"}, status=404)
@@ -969,16 +1109,28 @@ class OpenCodeChannel(BaseChannel):
         except Exception:
             body = {}
 
-        reply = body.get("reply", "reject") if isinstance(body, dict) else "reject"
+        # Support both "reply" (v2) and "response" (v1) field names
+        reply = "reject"
+        if isinstance(body, dict):
+            reply = body.get("reply", body.get("response", "reject"))
         if reply not in ("once", "always", "reject"):
             reply = "reject"
 
         future.set_result(reply)
+
+        # Get session ID from stored info
+        info = self._pending_permission_info.get(perm_id, {})
+        session_id = info.get("sessionID", "")
+
         await self._broadcast_sse(
             "permission.replied",
-            {"permissionID": perm_id, "reply": reply},
+            {
+                "sessionID": session_id,
+                "requestID": perm_id,
+                "reply": reply,
+            },
         )
-        return web.json_response({"ok": True, "reply": reply})
+        return web.json_response(True)
 
     async def _permission_callback(
         self, tool_name: str, call_id: str, args: dict
@@ -986,27 +1138,67 @@ class OpenCodeChannel(BaseChannel):
         """Async callback invoked by AgentLoop when a tool needs permission.
 
         Emits a permission.asked SSE event and waits for the user to reply
-        via the /permissions/{id} endpoint.
+        via the /permission/{id}/reply endpoint.
         """
         perm_id = f"perm_{uuid.uuid4().hex[:16]}"
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
         self._pending_permissions[perm_id] = future
 
-        await self._broadcast_sse(
-            "permission.asked",
-            {
-                "permissionID": perm_id,
-                "tool": tool_name,
+        # Map tool name to OpenCode permission type
+        perm_type_map = {
+            "exec": "bash",
+            "write_file": "edit",
+            "edit_file": "edit",
+            "read_file": "read",
+            "list_dir": "list",
+            "web_search": "websearch",
+            "web_fetch": "webfetch",
+        }
+        permission_type = perm_type_map.get(tool_name, tool_name)
+
+        # Extract patterns (file paths, commands, etc.) from args
+        patterns: list[str] = []
+        metadata: dict[str, Any] = {}
+        if isinstance(args, dict):
+            for k in ("path", "filepath", "file"):
+                if k in args and isinstance(args[k], str):
+                    patterns.append(args[k])
+                    metadata["filepath"] = args[k]
+                    break
+            if "command" in args and isinstance(args["command"], str):
+                patterns.append(args["command"])
+            if "query" in args and isinstance(args["query"], str):
+                patterns.append(args["query"])
+            if not patterns:
+                # Use first string arg value as pattern
+                for v in args.values():
+                    if isinstance(v, str):
+                        patterns.append(v)
+                        break
+
+        session_id = self._current_session_id
+
+        perm_info = {
+            "id": perm_id,
+            "sessionID": session_id,
+            "permission": permission_type,
+            "patterns": patterns,
+            "metadata": metadata,
+            "always": patterns or ["*"],
+            "tool": {
                 "callID": call_id,
-                "input": args,
             },
-        )
+        }
+        self._pending_permission_info[perm_id] = perm_info
+
+        await self._broadcast_sse("permission.asked", perm_info)
 
         try:
             return await future
         finally:
             self._pending_permissions.pop(perm_id, None)
+            self._pending_permission_info.pop(perm_id, None)
 
     async def _handle_session_summarize(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
@@ -1373,7 +1565,7 @@ class OpenCodeChannel(BaseChannel):
                 prev_user_created_ms = created
 
             elif role == "assistant":
-                text = content if isinstance(content, str) else str(content)
+                text = content if isinstance(content, str) else ""
                 tool_calls = m.get("tool_calls", [])
 
                 # Skip assistant messages with no text and no tool calls
@@ -1404,6 +1596,7 @@ class OpenCodeChannel(BaseChannel):
                     tc_id = tc.get("id", "")
                     tc_func = tc.get("function", {})
                     tc_name = tc_func.get("name", "unknown")
+                    oc_name = _TOOL_NAME_MAP.get(tc_name, tc_name)
                     tc_args_raw = tc_func.get("arguments", "{}")
                     try:
                         tc_input = json.loads(tc_args_raw) if isinstance(tc_args_raw, str) else tc_args_raw
@@ -1421,11 +1614,37 @@ class OpenCodeChannel(BaseChannel):
                     else:
                         tc_status = "pending"
 
-                    tool_title = tc_name
-                    first_val = next(iter(tc_input.values()), None) if isinstance(tc_input, dict) else None
-                    if isinstance(first_val, str):
-                        short = first_val[:40] + "…" if len(first_val) > 40 else first_val
-                        tool_title = f'{tc_name}("{short}")'
+                    oc_input = _map_tool_input(tc_name, tc_input)
+                    tool_title = _tool_title(oc_name, oc_input)
+
+                    # Build metadata matching what each tool renderer expects
+                    tc_metadata: dict[str, Any] = {}
+                    if tc_name == "exec" and tc_output:
+                        tc_metadata = {"output": tc_output}
+
+                    if tc_status == "error":
+                        tc_state: dict[str, Any] = {
+                            "status": "error",
+                            "input": oc_input,
+                            "error": tc_output,
+                            "metadata": tc_metadata,
+                            "time": {"start": created_assistant, "end": created_assistant},
+                        }
+                    elif tc_status == "completed":
+                        tc_state = {
+                            "status": "completed",
+                            "input": oc_input,
+                            "output": tc_output,
+                            "title": tool_title,
+                            "metadata": tc_metadata,
+                            "time": {"start": created_assistant, "end": created_assistant},
+                        }
+                    else:
+                        tc_state = {
+                            "status": "pending",
+                            "input": oc_input,
+                            "raw": "",
+                        }
 
                     parts.append({
                         "id": f"{part_id}_{part_idx}",
@@ -1433,16 +1652,8 @@ class OpenCodeChannel(BaseChannel):
                         "messageID": msg_id,
                         "type": "tool",
                         "callID": tc_id,
-                        "tool": tc_name,
-                        "state": {
-                            "status": tc_status,
-                            "input": tc_input,
-                            "output": tc_output,
-                            "title": tool_title,
-                            "metadata": {},
-                            "time": created_assistant,
-                        },
-                        "time": {"start": created_assistant, "end": created_assistant},
+                        "tool": oc_name,
+                        "state": tc_state,
                     })
                     part_idx += 1
 

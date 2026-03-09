@@ -1,4 +1,4 @@
-"""memU memory retrieval tool."""
+"""Subconscious memory recall tool."""
 
 from __future__ import annotations
 
@@ -7,17 +7,17 @@ from typing import TYPE_CHECKING, Any
 from nanobot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
-    from nanobot.agent.memu_service import MemUBridge
+    from nanobot.agent.subconscious import SubconsciousService
 
 
-class MemURetrieveTool(Tool):
+class MemoryRecallTool(Tool):
     """Search long-term memory for facts extracted from past conversations."""
 
     name = "memory_search"
     description = (
-        "Search your long-term memory for relevant facts, preferences, and context "
-        "from past conversations. Use when the user references prior interactions or "
-        "when background context would improve your response."
+        "Search your subconscious memory for relevant entities, preferences, decisions, "
+        "and past events. Use when the user references prior interactions, people, projects, "
+        "or when background context would improve your response."
     )
     parameters = {
         "type": "object",
@@ -30,8 +30,9 @@ class MemURetrieveTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, bridge: MemUBridge):
-        self._bridge = bridge
+    def __init__(self, service: SubconsciousService):
+        self._service = service
 
     async def execute(self, query: str, **kwargs: Any) -> str:
-        return await self._bridge.retrieve(query)
+        result = await self._service.search(query)
+        return result or "No relevant memories found."

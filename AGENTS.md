@@ -1,26 +1,63 @@
 # Development Notes
 
-Branch: `feature/memu-qmd-integration`
+Branch: `feature/subconscious-memory`
 
 ---
 
-## 1. memU Proactive Memory + qmd MCP Support
+## 1. Subconscious Memory System
 
-**Files**: `nanobot/agent/memu_service.py`, `nanobot/agent/tools/memu_retrieve.py`, `nanobot/config/schema.py`, `nanobot/agent/loop.py`, `shell.nix`
+**Files**: `nanobot/agent/subconscious.py`, `nanobot/agent/qmd.py`, `nanobot/agent/tools/memory_recall.py`, `nanobot/config/schema.py`, `nanobot/agent/context.py`, `nanobot/agent/loop.py`, `nanobot/skills/memory/SKILL.md`
 
-Optional memory backend that extracts structured facts from conversations and enables semantic retrieval via a `memory_search` tool. Keeps existing MEMORY.md system intact.
+Replaces the old memU integration and MEMORY.md/HISTORY.md system with a hierarchical markdown-based memory that uses qmd for semantic retrieval.
 
-- **MemUConfig**: Pydantic config (batch thresholds, db path, extraction model)
-- **MemUBridge**: Async service with buffered extraction and graceful degradation if `memu-py` not installed
-- **MemURetrieveTool**: LLM-callable tool delegating to `bridge.retrieve()`
-- **AgentLoop + CLI**: Wire memU lifecycle (init, feed messages, flush, close)
-- **shell.nix**: NixOS dev environment with Python 3.13, uv, Node.js, Rust
-- **qmd**: Zero-code-change MCP server for hybrid markdown search (docs only)
+### Architecture
+- **SubconsciousConfig**: Pydantic config (extraction model, classifier model, auto-inject budget, batch thresholds, qmd collection name)
+- **SubconsciousService**: Async service with buffered extraction, LLM-driven fact extraction into dynamic markdown notes, qmd-backed semantic recall, idle-based conversation summarization, and classifier-gated memory injection
+- **QMDClient**: Async subprocess wrapper around the `qmd` CLI — `vsearch()` for fast vector similarity (memory injection), `query()` for full reranking + lexical search (explicit tool use)
+- **MemoryRecallTool**: LLM-callable `memory_search` tool delegating to `service.search()` (full reranking)
+- **Auto-injection**: Gated by fast LLM classifier (`should_inject()`), memories queried via `qmd vsearch` and appended to user message as tagged text block (preserves prompt caching — system prompt stays stable)
+- **ContextBuilder**: Appends memories to user message with `_MEMORY_CONTEXT_TAG`, stripped before saving to session
+
+### Memory Directory Structure
+```
+~/.nanobot/workspace/memory/
+├── entities/          # Dynamic subdirs (people/, machines/, programs/, etc.)
+│   ├── people/
+│   ├── machines/
+│   └── programs/
+├── preferences/       # User preferences, workflows
+├── decisions/         # Technical decisions with rationale
+└── history/           # Daily logs (YYYY-MM-DD.md) + weekly/monthly summaries
+```
+Structure is fully dynamic — the extraction LLM discovers existing folders via `_list_existing_notes()` and can create/delete files and directories freely. Notes use `[[Name]]` wikilinks for cross-referencing.
+
+### Extraction Flow
+1. User/assistant messages are buffered after each turn (skipped for heartbeat sessions)
+2. When threshold reached (5 messages or 120s), extraction LLM (gpt-5-mini by default) is called
+3. LLM returns structured JSON via tool call: entities (with `path` and `subcategory`), notes (with `path`). Both support `create`/`update`/`delete` actions
+4. Markdown files are written/updated/deleted, empty parent dirs cleaned up, qmd reindexes
+5. Path traversal protection via `resolve()` check against memory root
+
+### History (Conversation Summarization)
+Separated from extraction. Messages are buffered in `_conversation_buffer`. After 30 minutes idle, an LLM summarizes the whole conversation into a daily history file (`history/YYYY-MM-DD.md`) with session ID and timestamp: `[HH:MM] [session_key] summary`.
+
+### Classifier-Gated Injection
+Fast LLM call (`classifier_model`, default `gemini-2.0-flash-lite-001`) decides yes/no before running qmd vsearch. Skips injection for greetings, simple questions, math, code syntax, etc. Heartbeat sessions bypass the classifier and injection entirely.
+
+### Contradiction Handling
+Extraction LLM sees existing note filenames and is instructed to use action="update" with complete replacement content when facts change. Supports action="delete" to remove stale notes.
 
 Config:
 ```json
-{ "tools": { "memu": { "enabled": true, "dbPath": "~/.nanobot/workspace/memory/memu.db" } } }
+{ "tools": { "subconscious": { "enabled": true, "extractionModel": "openai/gpt-5-mini", "classifierModel": "openrouter/google/gemini-2.0-flash-lite-001" } } }
 ```
+
+### Removed
+- `nanobot/agent/memu_service.py` (MemUBridge)
+- `nanobot/agent/tools/memu_retrieve.py` (MemURetrieveTool)
+- `tests/test_memu_bridge.py`
+- `memu-py` optional dependency
+- qmd MCP server config (now invoked directly via CLI)
 
 ---
 
@@ -92,14 +129,40 @@ Config:
 - `GET /agent` — Agent list (single "default" agent)
 - `GET /config` — Workspace config
 
-**Sessions:** `POST /session`, `GET /session`, `GET /session/{id}`, `PATCH /session/{id}`, `DELETE /session/{id}`, `GET /session/{id}/message`, `POST /session/{id}/message`, `POST /session/{id}/abort`
+**Sessions:** `POST /session`, `GET /session`, `GET /session/{id}`, `PATCH /session/{id}`, `DELETE /session/{id}`, `GET /session/{id}/message`, `POST /session/{id}/message`, `POST /session/{id}/abort`, `POST /session/{id}/summarize` (context compaction)
 
-**SSE:** `GET /event` — Emits `server.connected`, heartbeat, `message.updated`, `message.part.updated`, `session.status`
+**Commands:** `GET /command` — Returns available slash commands (`/clear`, `/help`) in ACP `Command.Info` format for the TUI slash popover
 
-**Stubs** (empty responses): `/command`, `/skill`, `/lsp`, `/mcp`, `/formatter`, `/vcs`, `/path`, `/find`, `/file`, `/global/health`, `/permission`, `/question`, etc.
+**SSE:** `GET /event` — Emits `server.connected`, heartbeat, `message.updated`, `message.part.updated`, `session.status`, `session.updated`
+
+**Stubs** (empty responses): `/skill`, `/lsp`, `/mcp`, `/formatter`, `/vcs`, `/path`, `/find`, `/file`, `/global/health`, `/permission`, `/question`, etc.
+
+### Slash Commands
+- `/clear` — Clears current session history (server-side, exposed via `GET /command`)
+- `/compact` — Summarizes and compacts context (TUI built-in → `POST /session/{id}/summarize`)
+- `/new` — Creates a new session (TUI built-in, client-side navigation)
+- `/help` — Shows available commands (server-side)
 
 ### Model ID Handling
 Nanobot models are `"provider/model-name"` (e.g. `"anthropic/claude-opus-4-5"`). OpenCode expects separate provider and model IDs. `_parse_model()` splits the full string into `(provider_name, short_model_id)` to avoid double-prefixing that caused `model.split is not a function` in the TUI.
+
+---
+
+## 5. Heartbeat Isolation
+
+**Files**: `nanobot/agent/loop.py`, `nanobot/config/schema.py`, `nanobot/cli/commands.py`
+
+Heartbeat sessions are isolated from the memory system and use a separate model for tool compatibility.
+
+- **No memory recall/write**: Heartbeat sessions (`key == "heartbeat"`) skip the classifier, qmd queries, and subconscious extraction entirely
+- **Separate model**: `HeartbeatConfig.model` overrides the default model for heartbeat execution (default model may not support tool use)
+- **History window**: Keeps last 5 user/assistant text exchanges for context on recent heartbeats, stripping tool_calls/tool messages that incompatible models reject
+- **Session title**: Auto-set to "Heartbeat" for visibility in OpenCode TUI
+
+Config:
+```json
+{ "gateway": { "heartbeat": { "enabled": true, "intervalS": 1800, "model": "openrouter/minimax/minimax-m2.5" } } }
+```
 
 ---
 
@@ -107,6 +170,8 @@ Nanobot models are `"provider/model-name"` (e.g. `"anthropic/claude-opus-4-5"`).
 
 | File | Coverage |
 |------|----------|
-| `tests/test_memu_bridge.py` | memU buffer filtering, no-op, retrieval, tool |
 | `tests/test_cli_socket.py` | Socket lifecycle, protocol, session routing |
 | `tests/test_opencode_api.py` | Bootstrap, session CRUD, message send, SSE, stubs |
+| `tests/test_consolidate_offset.py` | Session consolidation, /clear command, cache immutability |
+| `tests/test_context_prompt_cache.py` | Memory injection via user message, system prompt stability |
+| `tests/test_loop_save_turn.py` | Turn saving, memory tag stripping |

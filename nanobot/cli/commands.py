@@ -304,7 +304,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        memu_config=config.tools.memu,
+        subconscious_config=config.tools.subconscious,
     )
 
     # Set cron callback (needs agent)
@@ -384,6 +384,7 @@ def gateway(
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
+            model=hb_cfg.model,
         )
 
     async def on_heartbeat_notify(response: str) -> None:
@@ -719,7 +720,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        memu_config=config.tools.memu,
+        subconscious_config=config.tools.subconscious,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -1271,9 +1272,7 @@ def _system_prompt_breakdown(config: Config) -> tuple[int, list[tuple[str, int]]
         content = file_path.read_text(encoding="utf-8")
         parts.append((f"Bootstrap: {filename}", f"## {filename}\n\n{content}"))
 
-    memory = builder.memory.get_memory_context()
-    if memory:
-        parts.append(("Memory", f"# Memory\n\n{memory}"))
+    # Memory is now auto-injected by the subconscious service at runtime
 
     always_skills = builder.skills.get_always_skills()
     if always_skills:

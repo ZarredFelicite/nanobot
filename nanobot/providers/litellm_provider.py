@@ -57,8 +57,6 @@ class LiteLLMProvider(LLMProvider):
 
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
-        # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
-        litellm.drop_params = True
 
     def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
         """Set environment variables based on detected provider."""
@@ -178,6 +176,56 @@ class LiteLLMProvider(LLMProvider):
             sanitized.append(clean)
         return sanitized
 
+    @staticmethod
+    def _collapse_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Collapse tool call sequences into plain text for providers that reject them.
+
+        Converts:
+          assistant (tool_calls=[...]) → assistant (content="[Used tool: name(args)]")
+          tool (content="result")      → dropped (folded into the assistant text)
+        """
+        import json as _json
+
+        # Check if there are any tool messages to collapse
+        has_tools = any(
+            m.get("role") == "tool" or m.get("tool_calls")
+            for m in messages
+        )
+        if not has_tools:
+            return messages  # return same object — caller checks identity
+
+        result: list[dict[str, Any]] = []
+        # Index tool results by tool_call_id
+        tool_outputs: dict[str, str] = {}
+        for m in messages:
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                tool_outputs[m["tool_call_id"]] = m.get("content", "") or ""
+
+        for m in messages:
+            if m.get("role") == "tool":
+                continue  # consumed above
+
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                # Collapse tool calls into text
+                parts = []
+                text = m.get("content")
+                if text:
+                    parts.append(text)
+                for tc in m["tool_calls"]:
+                    tc_id = tc.get("id", "")
+                    func = tc.get("function", {})
+                    name = func.get("name", "unknown")
+                    args = func.get("arguments", "")
+                    output = tool_outputs.get(tc_id, "")
+                    parts.append(f"[Used tool: {name}({args}) → {output[:200]}]")
+                result.append({"role": "assistant", "content": "\n".join(parts)})
+            else:
+                # Strip tool_calls key from any message just in case
+                clean = {k: v for k, v in m.items() if k != "tool_calls"}
+                result.append(clean)
+
+        return result
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -245,9 +293,22 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
+            err_str = str(e)
+            # Some providers (e.g. StepFun via OpenRouter) reject tool message
+            # history in the conversation.  Retry with tool turns collapsed to
+            # plain text so the context is preserved without the unsupported
+            # message format.
+            if "400" in err_str and kwargs.get("messages"):
+                collapsed = self._collapse_tool_messages(kwargs["messages"])
+                if collapsed is not kwargs["messages"]:
+                    kwargs["messages"] = collapsed
+                    try:
+                        response = await acompletion(**kwargs)
+                        return self._parse_response(response)
+                    except Exception:
+                        pass  # fall through to original error
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=f"Error calling LLM: {err_str}",
                 finish_reason="error",
             )
 

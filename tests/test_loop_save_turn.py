@@ -6,7 +6,7 @@ from nanobot.session.manager import Session
 def _mk_loop() -> AgentLoop:
     loop = AgentLoop.__new__(AgentLoop)
     loop._TOOL_RESULT_MAX_CHARS = 500
-    loop._memu_bridge = None
+    loop._subconscious = None
     return loop
 
 

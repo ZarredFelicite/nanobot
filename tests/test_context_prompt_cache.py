@@ -86,3 +86,61 @@ def test_identity_falls_back_when_identity_md_missing(tmp_path) -> None:
     prompt = builder.build_system_prompt()
 
     assert "You are nanobot, a helpful AI assistant." in prompt
+
+
+def test_memories_appended_to_user_message_not_system_prompt(tmp_path) -> None:
+    """Relevant memories should be appended to the user message, not the system prompt."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+    memories = "User prefers dark mode.\n[[Zarred]] works on nanobot."
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="Hello",
+        relevant_memories=memories,
+    )
+
+    # System prompt must NOT contain memories
+    assert memories not in messages[0]["content"]
+
+    # Should have just: system, user
+    assert len(messages) == 2
+    # Memories appended to user message with context tag
+    user_content = messages[1]["content"]
+    assert memories in user_content
+    assert ContextBuilder._MEMORY_CONTEXT_TAG in user_content
+
+
+def test_no_memories_skips_injection(tmp_path) -> None:
+    """When no memories, user message should not contain memory tag."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="Hello",
+        relevant_memories=None,
+    )
+
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert ContextBuilder._MEMORY_CONTEXT_TAG not in messages[1]["content"]
+
+
+def test_system_prompt_stable_with_different_memories(tmp_path) -> None:
+    """System prompt should be identical regardless of what memories are injected."""
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    msgs1 = builder.build_messages(
+        history=[], current_message="Hi", relevant_memories="memory A",
+    )
+    msgs2 = builder.build_messages(
+        history=[], current_message="Hi", relevant_memories="memory B",
+    )
+    msgs3 = builder.build_messages(
+        history=[], current_message="Hi", relevant_memories=None,
+    )
+
+    assert msgs1[0]["content"] == msgs2[0]["content"] == msgs3[0]["content"]

@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 
 
@@ -20,20 +19,18 @@ class ContextBuilder:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+    ) -> str:
+        """Build the system prompt from identity, bootstrap files, and skills."""
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
-
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -73,8 +70,8 @@ Skills with available="false" need dependencies installed first - you can try in
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+- Memory: {workspace_path}/memory/ (entities/, preferences/, decisions/, history/)
+- Relevant memories are auto-surfaced each turn. Use memory_search for explicit recall.
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 ## nanobot Guidelines
@@ -108,6 +105,8 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         return "\n\n".join(parts) if parts else ""
 
+    _MEMORY_CONTEXT_TAG = "[Recalled Memories — context only, not part of conversation]"
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -116,6 +115,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        relevant_memories: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
@@ -127,6 +127,16 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             merged = f"{runtime_ctx}\n\n{user_content}"
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
+
+        # Append recalled memories to the user message. This keeps the system
+        # prompt and conversation history as a stable cacheable prefix, and is
+        # universally compatible across all model providers.
+        if relevant_memories:
+            memory_block = f"\n\n{self._MEMORY_CONTEXT_TAG}\n{relevant_memories}"
+            if isinstance(merged, str):
+                merged = f"{merged}{memory_block}"
+            else:
+                merged.append({"type": "text", "text": memory_block})
 
         return [
             {"role": "system", "content": self.build_system_prompt(skill_names)},

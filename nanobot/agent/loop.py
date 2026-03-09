@@ -496,6 +496,7 @@ class AgentLoop:
                         "type": "tool_done",
                         "call_id": tool_call.id,
                         "name": tool_call.name,
+                        "input": tool_call.arguments,
                         "output": result[:500] if isinstance(result, str) else str(result)[:500],
                     }
                     if tool_call.name in ("write_file", "edit_file"):
