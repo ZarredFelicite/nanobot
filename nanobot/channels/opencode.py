@@ -8,6 +8,7 @@ to nanobot as its backend.
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from datetime import datetime
 import json
 import time
@@ -152,10 +153,13 @@ class OpenCodeChannel(BaseChannel):
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._pending_permissions: dict[str, asyncio.Future] = {}
         self._pending_permission_info: dict[str, dict[str, Any]] = {}  # perm_id -> metadata
-        self._current_session_id: str = ""  # session_id currently being processed
+        self._permission_session_id: ContextVar[str] = ContextVar(
+            "opencode_permission_session_id", default=""
+        )
         self._last_context_by_session: dict[str, dict[str, Any]] = {}
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
+        self._sse_write_timeout_s = 2.0
 
     # ------------------------------------------------------------------
     # ID generation
@@ -175,6 +179,13 @@ class OpenCodeChannel(BaseChannel):
 
     def _new_session_id(self) -> str:
         return f"session-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')[:22]}"
+
+    def _display_count(self, session: Session, session_id: str) -> int:
+        return len(self._messages_to_opencode(session, session_id))
+
+    @staticmethod
+    def _ids_for_index(session_id: str, index: int) -> tuple[str, str]:
+        return (f"msg_{session_id}_{index}", f"part_{session_id}_{index}")
 
     def _session_exists(self, key: str) -> bool:
         if not self.session_manager:
@@ -545,8 +556,23 @@ class OpenCodeChannel(BaseChannel):
             return False
 
     async def _broadcast_sse(self, event_type: str, properties: dict) -> None:
-        for client in list(self._sse_clients):
-            await self._sse_write(client, event_type, properties)
+        clients = list(self._sse_clients)
+        if not clients:
+            return
+
+        writes = [
+            asyncio.wait_for(
+                self._sse_write(client, event_type, properties),
+                timeout=self._sse_write_timeout_s,
+            )
+            for client in clients
+        ]
+        results = await asyncio.gather(*writes, return_exceptions=True)
+        for client, result in zip(clients, results, strict=False):
+            if isinstance(result, Exception):
+                logger.debug("OpenCode SSE broadcast failed for {}: {}", event_type, result)
+                if client in self._sse_clients:
+                    self._sse_clients.remove(client)
 
     # ------------------------------------------------------------------
     # Session endpoints
@@ -706,52 +732,59 @@ class OpenCodeChannel(BaseChannel):
 
     async def _handle_session_send(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        payload, status = await self._process_session_send(session_id, body)
+        return web.json_response(payload, status=status)
+
+    async def _process_session_send(
+        self,
+        session_id: str,
+        body: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], int]:
         session, key = self._find_session(session_id)
 
         if not session:
-            # Auto-create session
+            if not self.session_manager:
+                return {"error": "no session manager"}, 500
             key = session_id
             session = self.session_manager.get_or_create(key)
             self.session_manager.save(session)
 
         if not self.agent_loop:
-            return web.json_response({"error": "no agent"}, status=500)
+            return {"error": "no agent"}, 500
 
-        # If a revert_point is active, permanently truncate before continuing
+        if not isinstance(body, dict):
+            body = {}
+
         revert_point = session.metadata.get("revert_point")
         if isinstance(revert_point, int) and 0 <= revert_point < len(session.messages):
             session.messages = session.messages[:revert_point]
             session.metadata.pop("revert_point", None)
-            self.session_manager.save(session)
+            if self.session_manager:
+                self.session_manager.save(session)
 
-        body = await request.json()
         active_model = self._session_model(session, body)
 
-        # Extract user text from request
         user_text = ""
-        if isinstance(body, dict):
-            # { parts: [{ type: "text", text: "..." }] } or { content: "..." }
-            parts = body.get("parts", [])
-            for part in parts:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    user_text = part.get("text", "")
-                    break
-            if not user_text:
-                user_text = body.get("content", body.get("text", ""))
+        parts = body.get("parts", [])
+        for part in parts:
+            if isinstance(part, dict) and part.get("type") == "text":
+                user_text = part.get("text", "")
+                break
+        if not user_text:
+            user_text = body.get("content", body.get("text", ""))
 
         if not user_text:
-            return web.json_response({"error": "empty message"}, status=400)
+            return {"error": "empty message"}, 400
 
         now_s = time.time()
         now_ms = self._epoch_ms(now_s)
         provider_name, model_id = self._split_model(active_model)
-
-        # Use deterministic IDs aligned with persisted session index mapping.
-        # This avoids TUI reordering/duplication when it reconciles live SSE events
-        # with /session/{id}/message history.
-        base_index = len(self._messages_to_opencode(session, session_id))
-        user_msg_id = f"msg_{session_id}_{base_index}"
-        user_part_id = f"part_{session_id}_{base_index}"
+        base_index = self._display_count(session, session_id)
+        user_msg_id, user_part_id = self._ids_for_index(session_id, base_index)
 
         user_msg = {
             "id": user_msg_id,
@@ -773,10 +806,7 @@ class OpenCodeChannel(BaseChannel):
         await self._broadcast_sse("message.updated", {"info": user_msg})
         await self._broadcast_sse("message.part.updated", {"part": user_part})
 
-        # Assistant placeholder ID follows the expected next raw message index.
-        asst_msg_id = f"msg_{session_id}_{base_index + 1}"
-        asst_part_id = f"part_{session_id}_{base_index + 1}"
-
+        asst_msg_id, asst_part_id = self._ids_for_index(session_id, base_index + 1)
         asst_msg = {
             "id": asst_msg_id,
             "sessionID": session_id,
@@ -801,16 +831,10 @@ class OpenCodeChannel(BaseChannel):
             },
         )
 
-        # Process via agent
-        self._current_session_id = session_id
         accumulated_text: list[str] = []
-        # Unified part counter so text/tool parts are ordered correctly.
-        # Part 0 is reserved for the first text chunk; tools and subsequent
-        # text segments get incrementing indices.
         part_counter = 0
         current_text_part_id = f"{asst_part_id}_p0"
-        has_seen_tools = False  # track if tools appeared since last text
-        # Map tool call_id → part index for updating tool_done on the right part
+        has_seen_tools = False
         tool_call_part: dict[str, int] = {}
 
         async def on_progress(
@@ -821,7 +845,6 @@ class OpenCodeChannel(BaseChannel):
         ) -> None:
             nonlocal part_counter, current_text_part_id, has_seen_tools
 
-            # Handle structured tool lifecycle events
             if tool_event:
                 evt_type = tool_event.get("type", "")
                 call_id = tool_event.get("call_id", "")
@@ -830,7 +853,6 @@ class OpenCodeChannel(BaseChannel):
                 if not isinstance(tool_name, str):
                     tool_name = "unknown"
 
-                # Map nanobot tool names to OpenCode tool names for renderer matching
                 oc_tool_name: str = str(_TOOL_NAME_MAP.get(tool_name) or tool_name)
 
                 if evt_type == "tool_start":
@@ -903,8 +925,6 @@ class OpenCodeChannel(BaseChannel):
             if tool_hint:
                 return
 
-            # If text arrives after tool parts, start a new text part
-            # so the TUI positions it after the tools.
             if has_seen_tools:
                 part_counter += 1
                 current_text_part_id = f"{asst_part_id}_p{part_counter}"
@@ -927,20 +947,24 @@ class OpenCodeChannel(BaseChannel):
                 },
             )
 
+        token = self._permission_session_id.set(session_id)
         try:
-            response = await self.agent_loop.process_direct(
-                content=user_text,
-                session_key=key,
-                channel="opencode",
-                chat_id=session_id,
-                on_progress=on_progress,
-                model=active_model,
-            )
-        except asyncio.CancelledError:
-            response = "Task cancelled."
-        except Exception as e:
-            logger.exception("OpenCode message processing failed")
-            response = f"Error: {e}"
+            try:
+                response = await self.agent_loop.process_direct(
+                    content=user_text,
+                    session_key=key,
+                    channel="opencode",
+                    chat_id=session_id,
+                    on_progress=on_progress,
+                    model=active_model,
+                )
+            except asyncio.CancelledError:
+                response = "Task cancelled."
+            except Exception as e:
+                logger.exception("OpenCode message processing failed")
+                response = f"Error: {e}"
+        finally:
+            self._permission_session_id.reset(token)
 
         usage = self.agent_loop.get_last_llm_usage(key) if self.agent_loop else None
         if isinstance(usage, dict):
@@ -962,11 +986,7 @@ class OpenCodeChannel(BaseChannel):
             if isinstance(usage.get("cost"), (int, float)):
                 asst_msg["cost"] = float(usage["cost"])
 
-        # Final assistant text part — use the current text part ID so it
-        # lands after any tool parts in the TUI ordering.
         final_text = response or "\n".join(accumulated_text) or ""
-        # If response came back but no text was streamed after tools, allocate
-        # a new part so it appears after tool parts.
         if response and has_seen_tools:
             part_counter += 1
             current_text_part_id = f"{asst_part_id}_p{part_counter}"
@@ -983,7 +1003,6 @@ class OpenCodeChannel(BaseChannel):
         asst_msg["time"]["completed"] = self._epoch_ms(time.time())
         await self._broadcast_sse("message.updated", {"info": asst_msg})
 
-        # Session idle
         context_stats = self.agent_loop.get_last_context_stats(key) if self.agent_loop else None
         if isinstance(context_stats, dict):
             self._last_context_by_session[session_id] = context_stats
@@ -999,28 +1018,28 @@ class OpenCodeChannel(BaseChannel):
             },
         )
 
-        # Update session info
         session_info = self._session_to_info(session, session_id)
         await self._broadcast_sse("session.updated", {"info": session_info})
 
-        return web.json_response(
-            {
-                "info": asst_msg,
-                "parts": [asst_part_final],
-                "context": self._last_context_by_session.get(session_id, {}),
-            }
-        )
+        return {
+            "info": asst_msg,
+            "parts": [asst_part_final],
+            "context": self._last_context_by_session.get(session_id, {}),
+        }, 200
 
     async def _handle_prompt_async(self, request: web.Request) -> web.Response:
         # Fire-and-forget version of message send
         session_id = request.match_info["id"]
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
 
         async def _process():
-            # Reuse the send logic
-            fake_request = request
             try:
-                await self._handle_session_send(fake_request)
+                await self._process_session_send(session_id, body)
             except Exception:
                 logger.exception("prompt_async failed")
 
@@ -1179,7 +1198,7 @@ class OpenCodeChannel(BaseChannel):
                         patterns.append(v)
                         break
 
-        session_id = self._current_session_id
+        session_id = self._permission_session_id.get()
 
         perm_info = {
             "id": perm_id,
@@ -1247,9 +1266,8 @@ class OpenCodeChannel(BaseChannel):
         now_ms = self._epoch_ms(time.time())
         model_name = self._session_model(session, None)
         provider_name, model_id = self._split_model(model_name)
-        note_index = len(session.messages)
-        note_msg_id = f"msg_{session_id}_{note_index}"
-        note_part_id = f"part_{session_id}_{note_index}"
+        note_index = self._display_count(session, session_id)
+        note_msg_id, note_part_id = self._ids_for_index(session_id, note_index)
         note_msg = {
             "id": note_msg_id,
             "sessionID": session_id,
@@ -1273,7 +1291,8 @@ class OpenCodeChannel(BaseChannel):
         }
 
         session.add_message("assistant", summary_text, compact_event=True)
-        self.session_manager.save(session)
+        if self.session_manager:
+            self.session_manager.save(session)
 
         await self._broadcast_sse("message.updated", {"info": note_msg})
         await self._broadcast_sse("message.part.updated", {"part": note_part})
@@ -1352,6 +1371,8 @@ class OpenCodeChannel(BaseChannel):
 
         session, key = self._find_session(session_id)
         if not session:
+            if not self.session_manager:
+                return web.json_response({"error": "no session manager"}, status=500)
             key = session_id
             session = self.session_manager.get_or_create(key)
             self.session_manager.save(session)
@@ -1359,24 +1380,31 @@ class OpenCodeChannel(BaseChannel):
             return web.json_response({"error": "no agent"}, status=500)
 
         active_model = self._session_model(session, body)
+        before_display_count = self._display_count(session, session_id)
 
+        token = self._permission_session_id.set(session_id)
         try:
-            response = await self.agent_loop.process_direct(
-                content=template,
-                session_key=key,
-                channel="opencode",
-                chat_id=session_id,
-                model=active_model,
-            )
-        except Exception as e:
-            logger.exception("Command execution failed")
-            response = f"Error: {e}"
+            try:
+                response = await self.agent_loop.process_direct(
+                    content=template,
+                    session_key=key,
+                    channel="opencode",
+                    chat_id=session_id,
+                    model=active_model,
+                )
+            except Exception as e:
+                logger.exception("Command execution failed")
+                response = f"Error: {e}"
+        finally:
+            self._permission_session_id.reset(token)
 
         now_ms = self._epoch_ms(time.time())
         provider_name, model_id = self._split_model(active_model)
-        base_index = len(session.messages)
-        msg_id = f"msg_{session_id}_{base_index}"
-        part_id = f"part_{session_id}_{base_index}"
+        after_display_count = self._display_count(session, session_id)
+        msg_index = before_display_count
+        if after_display_count > before_display_count:
+            msg_index = after_display_count - 1
+        msg_id, part_id = self._ids_for_index(session_id, msg_index)
 
         asst_msg = {
             "id": msg_id,
@@ -1572,6 +1600,8 @@ class OpenCodeChannel(BaseChannel):
                         if isinstance(c, str) and c.strip():
                             text_parts.append(c.strip())
                             usage_source = candidate
+                        j += 1
+                        break
                     j += 1
 
                 merged["content"] = "\n\n".join(text_parts)
@@ -1643,19 +1673,6 @@ class OpenCodeChannel(BaseChannel):
             parts: list[dict[str, Any]] = []
             part_idx = 0
 
-            if text:
-                parts.append(
-                    {
-                        "id": f"{part_id}_{part_idx}",
-                        "sessionID": session_id,
-                        "messageID": msg_id,
-                        "type": "text",
-                        "text": text,
-                        "time": {"start": created_assistant, "end": created_assistant},
-                    }
-                )
-                part_idx += 1
-
             for tc in tool_calls:
                 tc_id = tc.get("id", "")
                 tc_func = tc.get("function", {})
@@ -1721,6 +1738,19 @@ class OpenCodeChannel(BaseChannel):
                         "callID": tc_id,
                         "tool": oc_name,
                         "state": tc_state,
+                    }
+                )
+                part_idx += 1
+
+            if text:
+                parts.append(
+                    {
+                        "id": f"{part_id}_{part_idx}",
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                        "type": "text",
+                        "text": text,
+                        "time": {"start": created_assistant, "end": created_assistant},
                     }
                 )
                 part_idx += 1

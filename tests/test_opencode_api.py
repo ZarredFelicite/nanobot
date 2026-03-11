@@ -253,6 +253,27 @@ async def test_send_message(client, mock_agent_loop):
     mock_agent_loop.process_direct.assert_awaited_once()
 
 
+async def test_prompt_async_uses_original_request_body(client, mock_agent_loop):
+    create_resp = await client.post("/session")
+    session = await create_resp.json()
+    sid = session["id"]
+
+    resp = await client.post(
+        f"/session/{sid}/prompt_async",
+        json={"parts": [{"type": "text", "text": "queued hello"}]},
+    )
+    assert resp.status == 204
+
+    for _ in range(50):
+        if mock_agent_loop.process_direct.await_count > 0:
+            break
+        await asyncio.sleep(0.01)
+
+    assert mock_agent_loop.process_direct.await_count == 1
+    kwargs = mock_agent_loop.process_direct.await_args.kwargs
+    assert kwargs["content"] == "queued hello"
+
+
 async def test_send_message_passes_resolved_session_key_to_model_input(
     bus, session_manager, mock_agent_loop
 ):
@@ -474,6 +495,154 @@ async def test_session_summarize_calls_compaction(bus, session_manager):
         await client.close()
 
 
+async def test_session_summarize_id_matches_projected_history(bus, session_manager):
+    mock_loop = MagicMock()
+    mock_loop.workspace = session_manager.workspace
+    mock_loop.process_direct = AsyncMock(return_value="ok")
+    mock_loop.get_last_context_stats = MagicMock(return_value={})
+    mock_loop.compact_session = AsyncMock(
+        return_value={
+            "ok": True,
+            "archiveAll": False,
+            "lastConsolidatedBefore": 0,
+            "lastConsolidatedAfter": 3,
+            "messageCount": 4,
+        }
+    )
+
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_loop,
+        agent_config=AgentDefaults(model="openrouter/minimax/minimax-m2.5", provider="auto"),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        create_resp = await client.post("/session")
+        session = await create_resp.json()
+        sid = session["id"]
+
+        stored = session_manager.get_or_create(sid)
+        stored.messages = [
+            {"role": "user", "content": "check", "timestamp": "2026-03-10T23:58:10"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec",
+                            "arguments": '{"command": "himalaya envelope list --output json"}',
+                        },
+                    }
+                ],
+                "timestamp": "2026-03-10T23:58:11",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "exec",
+                "content": "[]",
+                "timestamp": "2026-03-10T23:58:12",
+            },
+            {
+                "role": "assistant",
+                "content": "Nothing new",
+                "timestamp": "2026-03-10T23:58:13",
+            },
+        ]
+        session_manager.save(stored)
+
+        resp = await client.post(f"/session/{sid}/summarize", json={})
+        assert resp.status == 200
+        summary = await resp.json()
+
+        history_resp = await client.get(f"/session/{sid}/message")
+        history = await history_resp.json()
+
+        assert summary["info"]["id"] == history[-1]["info"]["id"]
+    finally:
+        await client.close()
+
+
+async def test_session_command_id_matches_projected_history(bus, session_manager):
+    async def fake_process_direct(*, content, session_key, **kwargs):
+        session = session_manager.get_or_create(session_key)
+        session.add_message("user", content)
+        session.messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": '{"command": "pwd"}'},
+                    }
+                ],
+                "timestamp": "2026-03-10T23:58:11",
+            }
+        )
+        session.messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "exec",
+                "content": "/tmp",
+                "timestamp": "2026-03-10T23:58:12",
+            }
+        )
+        session.messages.append(
+            {
+                "role": "assistant",
+                "content": "Done",
+                "timestamp": "2026-03-10T23:58:13",
+            }
+        )
+        session_manager.save(session)
+        return "Done"
+
+    mock_loop = MagicMock()
+    mock_loop.workspace = session_manager.workspace
+    mock_loop.process_direct = AsyncMock(side_effect=fake_process_direct)
+
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_loop,
+        agent_config=AgentDefaults(model="openrouter/minimax/minimax-m2.5", provider="auto"),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        create_resp = await client.post("/session")
+        session = await create_resp.json()
+        sid = session["id"]
+
+        cmd_resp = await client.post(f"/session/{sid}/command", json={"command": "help"})
+        assert cmd_resp.status == 200
+        cmd_data = await cmd_resp.json()
+
+        history_resp = await client.get(f"/session/{sid}/message")
+        history = await history_resp.json()
+        assert cmd_data["info"]["id"] == history[-1]["info"]["id"]
+    finally:
+        await client.close()
+
+
 async def test_send_empty_message(client):
     create_resp = await client.post("/session")
     session = await create_resp.json()
@@ -544,8 +713,9 @@ def test_messages_to_opencode_merges_tool_turn(bus, session_manager, mock_agent_
     assistant = messages[1]
     assert assistant["info"]["id"] == "msg_session-1_1"
     parts = assistant["parts"]
-    assert any(p.get("type") == "tool" for p in parts)
-    assert any(p.get("type") == "text" and "didn't receive" in p.get("text", "") for p in parts)
+    assert parts[0]["type"] == "tool"
+    assert parts[-1]["type"] == "text"
+    assert "didn't receive" in parts[-1]["text"]
 
 
 async def test_sse_write_drops_client_on_closing_transport(
@@ -569,6 +739,72 @@ async def test_sse_write_drops_client_on_closing_transport(
     ok = await channel._sse_write(client, "server.heartbeat", {})
     assert ok is False
     assert client not in channel._sse_clients
+
+
+async def test_broadcast_sse_timeout_does_not_block_healthy_client(
+    bus, session_manager, mock_agent_loop, agent_config
+):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=agent_config,
+    )
+    channel._sse_write_timeout_s = 0.01
+
+    class SlowStream:
+        async def write(self, _: bytes) -> None:
+            await asyncio.sleep(0.5)
+
+    class FastStream:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        async def write(self, data: bytes) -> None:
+            self.writes.append(data)
+
+    slow = cast(web.StreamResponse, SlowStream())
+    fast_impl = FastStream()
+    fast = cast(web.StreamResponse, fast_impl)
+    channel._sse_clients.extend([slow, fast])
+
+    await channel._broadcast_sse("server.heartbeat", {})
+
+    assert fast_impl.writes
+    assert slow not in channel._sse_clients
+
+
+async def test_permission_callback_uses_task_local_session_context(
+    bus, session_manager, mock_agent_loop, agent_config
+):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=agent_config,
+    )
+
+    token1 = channel._permission_session_id.set("session-a")
+    task1 = asyncio.create_task(channel._permission_callback("exec", "call-a", {"command": "ls"}))
+    channel._permission_session_id.reset(token1)
+
+    token2 = channel._permission_session_id.set("session-b")
+    task2 = asyncio.create_task(channel._permission_callback("exec", "call-b", {"command": "pwd"}))
+    channel._permission_session_id.reset(token2)
+
+    await asyncio.sleep(0)
+    pending_infos = list(channel._pending_permission_info.values())
+    session_ids = {info["sessionID"] for info in pending_infos}
+    assert session_ids == {"session-a", "session-b"}
+
+    for fut in list(channel._pending_permissions.values()):
+        if not fut.done():
+            fut.set_result("reject")
+
+    results = await asyncio.gather(task1, task2)
+    assert results == ["reject", "reject"]
 
 
 # ------------------------------------------------------------------
