@@ -13,3 +13,4 @@ This file documents non-obvious constraints and usage patterns.
 ## cron — Scheduled Reminders
 
 - Please refer to cron skill for usage.
+- `cron(action="add")` supports optional `channel` and `to` overrides for cross-channel delivery.

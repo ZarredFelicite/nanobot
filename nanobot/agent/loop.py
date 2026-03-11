@@ -132,7 +132,26 @@ class AgentLoop:
         self._permission_callback: Callable[..., Awaitable[str]] | None = None
         self._require_approval: list[str] = []  # Tool names that need user approval
         self._session_auto_approve: dict[str, set[str]] = {}  # session_key -> auto-approved tools
+        self._owner_message_target = self._resolve_owner_message_target(channels_config)
         self._register_default_tools()
+
+    @staticmethod
+    def _resolve_owner_message_target(
+        channels_config: ChannelsConfig | None,
+    ) -> tuple[str, str] | None:
+        """Resolve fixed owner routing target from channel config."""
+        if not channels_config:
+            return None
+
+        allow_from = channels_config.telegram.allow_from
+        for raw in allow_from:
+            value = raw.strip()
+            if not value or value == "*":
+                continue
+            owner_id = value.split("|", 1)[0].strip()
+            if owner_id:
+                return ("telegram", owner_id)
+        return None
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -149,10 +168,27 @@ class AgentLoop:
         )
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
-        self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        owner_channel = ""
+        owner_chat_id = ""
+        if self._owner_message_target:
+            owner_channel, owner_chat_id = self._owner_message_target
+
+        self.tools.register(
+            MessageTool(
+                send_callback=self.bus.publish_outbound,
+                owner_channel=owner_channel,
+                owner_chat_id=owner_chat_id,
+            )
+        )
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
-            self.tools.register(CronTool(self.cron_service))
+            self.tools.register(
+                CronTool(
+                    self.cron_service,
+                    owner_channel=owner_channel,
+                    owner_chat_id=owner_chat_id,
+                )
+            )
         if self._subconscious:
             from nanobot.agent.tools.memory_recall import MemoryRecallTool
 
@@ -441,16 +477,20 @@ class AgentLoop:
                     needs_approval = (
                         require_approval
                         and tool_call.name in require_approval
-                        and tool_call.name not in self._session_auto_approve.get(session_key or "", set())
+                        and tool_call.name
+                        not in self._session_auto_approve.get(session_key or "", set())
                     )
                     if needs_approval and self._permission_callback:
                         if on_progress:
-                            await on_progress("", tool_event={
-                                "type": "permission_asked",
-                                "call_id": tool_call.id,
-                                "name": tool_call.name,
-                                "input": tool_call.arguments,
-                            })
+                            await on_progress(
+                                "",
+                                tool_event={
+                                    "type": "permission_asked",
+                                    "call_id": tool_call.id,
+                                    "name": tool_call.name,
+                                    "input": tool_call.arguments,
+                                },
+                            )
                         try:
                             reply = await asyncio.wait_for(
                                 self._permission_callback(
@@ -462,19 +502,24 @@ class AgentLoop:
                             reply = "reject"
 
                         if on_progress:
-                            await on_progress("", tool_event={
-                                "type": "permission_replied",
-                                "call_id": tool_call.id,
-                                "name": tool_call.name,
-                                "reply": reply,
-                            })
+                            await on_progress(
+                                "",
+                                tool_event={
+                                    "type": "permission_replied",
+                                    "call_id": tool_call.id,
+                                    "name": tool_call.name,
+                                    "reply": reply,
+                                },
+                            )
 
                         if reply == "always" and session_key:
                             self._session_auto_approve.setdefault(session_key, set()).add(
                                 tool_call.name
                             )
                         if reply == "reject":
-                            result = f"Error: Permission denied by user for tool '{tool_call.name}'."
+                            result = (
+                                f"Error: Permission denied by user for tool '{tool_call.name}'."
+                            )
                             messages = self.context.add_tool_result(
                                 messages, tool_call.id, tool_call.name, result
                             )
@@ -482,12 +527,15 @@ class AgentLoop:
 
                     # Emit tool-start event
                     if on_progress:
-                        await on_progress("", tool_event={
-                            "type": "tool_start",
-                            "call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "input": tool_call.arguments,
-                        })
+                        await on_progress(
+                            "",
+                            tool_event={
+                                "type": "tool_start",
+                                "call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "input": tool_call.arguments,
+                            },
+                        )
 
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
 
@@ -693,11 +741,17 @@ class AgentLoop:
                 session_key=key,
             )
 
+        key = session_key or msg.session_key
         compact_in = msg.content.replace("\n", "\\n").replace("\t", "\\t")
         preview = compact_in[:80] + "..." if len(compact_in) > 80 else compact_in
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info(
+            "Processing message session={} from {}:{}: {}",
+            key,
+            msg.channel,
+            msg.sender_id,
+            preview,
+        )
 
-        key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
         active_model = model or self.model
 
@@ -782,7 +836,11 @@ class AgentLoop:
         relevant_memories: str | None = None
         if not is_heartbeat:
             prev_assistant = next(
-                (m.get("content") for m in reversed(history) if m.get("role") == "assistant" and isinstance(m.get("content"), str)),
+                (
+                    m.get("content")
+                    for m in reversed(history)
+                    if m.get("role") == "assistant" and isinstance(m.get("content"), str)
+                ),
                 None,
             )
             relevant_memories = await self._recall_memories(msg.content, prev_assistant)
@@ -931,7 +989,7 @@ class AgentLoop:
 
         compact_out = final_content.replace("\n", "\\n").replace("\t", "\\t")
         preview = compact_out[:120] + "..." if len(compact_out) > 120 else compact_out
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info("Response session={} to {}:{}: {}", key, msg.channel, msg.sender_id, preview)
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,

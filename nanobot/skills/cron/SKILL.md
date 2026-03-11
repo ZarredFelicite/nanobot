@@ -7,6 +7,8 @@ description: Schedule reminders and recurring tasks.
 
 Use the `cron` tool to schedule reminders or recurring tasks.
 
+For simple reminder requests, call `cron` directly; do not stop after reading this file.
+
 ## Three Modes
 
 1. **Reminder** - message is sent directly to user
@@ -28,6 +30,11 @@ cron(action="add", message="Check HKUDS/nanobot GitHub stars and report", every_
 One-time scheduled task (compute ISO datetime from current time):
 ```
 cron(action="add", message="Remind me about the meeting", at="<ISO datetime>")
+```
+
+Target a specific channel/chat explicitly:
+```
+cron(action="add", message="Take a break", at="<ISO datetime>", channel="telegram", to="<chat_id>")
 ```
 
 Timezone-aware cron:
@@ -55,3 +62,9 @@ cron(action="remove", job_id="abc123")
 ## Timezone
 
 Use `tz` with `cron_expr` to schedule in a specific IANA timezone. Without `tz`, the server's local timezone is used.
+
+## Cross-Channel Delivery
+
+- By default, reminders are delivered to the current session's `channel` and `chat_id`.
+- Use `channel` + `to` together to override delivery target.
+- If the user requests another channel but no target ID is available, ask for the target chat/user ID.

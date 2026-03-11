@@ -55,6 +55,13 @@ class LiteLLMProvider(LLMProvider):
         if api_base:
             litellm.api_base = api_base
 
+        # Models that have returned 400 on tool-message history.  When a
+        # collapse-retry succeeds we remember the model so subsequent calls
+        # proactively collapse *before* the first attempt, avoiding the
+        # degrade-on-retry problem (model sees collapsed context and loses
+        # tool-calling continuity).
+        self._needs_tool_collapse: set[str] = set()
+
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
 
@@ -259,6 +266,10 @@ class LiteLLMProvider(LLMProvider):
         # LiteLLM to reject the request with "max_tokens must be at least 1".
         max_tokens = max(1, max_tokens)
 
+        # Proactively collapse tool messages for models known to reject them.
+        if model in self._needs_tool_collapse:
+            messages = self._collapse_tool_messages(messages)
+
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys),
@@ -304,6 +315,8 @@ class LiteLLMProvider(LLMProvider):
                     kwargs["messages"] = collapsed
                     try:
                         response = await acompletion(**kwargs)
+                        # Remember this model needs preemptive collapse
+                        self._needs_tool_collapse.add(model)
                         return self._parse_response(response)
                     except Exception:
                         pass  # fall through to original error

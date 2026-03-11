@@ -96,8 +96,10 @@ def _build_tool_metadata(tool_name: str, tool_event: dict, tool_output: str = ""
         after_lines = after.splitlines(keepends=True)
         unified = "".join(
             difflib.unified_diff(
-                before_lines, after_lines,
-                fromfile=file_path, tofile=file_path,
+                before_lines,
+                after_lines,
+                fromfile=file_path,
+                tofile=file_path,
             )
         )
         additions = sum(1 for ln in after_lines if ln not in before_lines)
@@ -397,9 +399,7 @@ class OpenCodeChannel(BaseChannel):
         # Messages
         app.router.add_get("/session/{id}/message", self._handle_session_messages)
         app.router.add_post("/session/{id}/message", self._handle_session_send)
-        app.router.add_delete(
-            "/session/{id}/message/{messageId}", self._handle_message_revert
-        )
+        app.router.add_delete("/session/{id}/message/{messageId}", self._handle_message_revert)
         app.router.add_post(
             "/session/{id}/message/{messageId}/unrevert", self._handle_message_unrevert
         )
@@ -513,11 +513,13 @@ class OpenCodeChannel(BaseChannel):
         self._sse_clients.append(resp)
 
         # Send initial connected event
-        await self._sse_write(resp, "server.connected", {})
+        if not await self._sse_write(resp, "server.connected", {}):
+            return resp
 
         try:
             while resp.task is not None and not resp.task.done():
-                await self._sse_write(resp, "server.heartbeat", {})
+                if not await self._sse_write(resp, "server.heartbeat", {}):
+                    break
                 await asyncio.sleep(10)
         except (asyncio.CancelledError, ConnectionResetError):
             pass
@@ -531,13 +533,16 @@ class OpenCodeChannel(BaseChannel):
         # Reuse the same handler — the TUI just needs a stream
         return await self._handle_sse(request)
 
-    async def _sse_write(self, resp: web.StreamResponse, event_type: str, properties: dict) -> None:
+    async def _sse_write(self, resp: web.StreamResponse, event_type: str, properties: dict) -> bool:
         payload = json.dumps({"type": event_type, "properties": properties})
         try:
             await resp.write(f"data: {payload}\n\n".encode())
-        except (ConnectionResetError, ConnectionAbortedError, RuntimeError):
+            return True
+        except (ConnectionResetError, ConnectionAbortedError, RuntimeError) as exc:
+            logger.debug("OpenCode SSE write failed for {}: {}", event_type, exc)
             if resp in self._sse_clients:
                 self._sse_clients.remove(resp)
+            return False
 
     async def _broadcast_sse(self, event_type: str, properties: dict) -> None:
         for client in list(self._sse_clients):
@@ -744,7 +749,7 @@ class OpenCodeChannel(BaseChannel):
         # Use deterministic IDs aligned with persisted session index mapping.
         # This avoids TUI reordering/duplication when it reconciles live SSE events
         # with /session/{id}/message history.
-        base_index = len(session.messages)
+        base_index = len(self._messages_to_opencode(session, session_id))
         user_msg_id = f"msg_{session_id}_{base_index}"
         user_part_id = f"part_{session_id}_{base_index}"
 
@@ -752,7 +757,7 @@ class OpenCodeChannel(BaseChannel):
             "id": user_msg_id,
             "sessionID": session_id,
             "role": "user",
-            "time": {"created": now_ms},
+            "time": {"created": now_ms, "completed": now_ms},
             "agent": "default",
             "model": {"providerID": provider_name, "modelID": model_id},
         }
@@ -822,9 +827,11 @@ class OpenCodeChannel(BaseChannel):
                 call_id = tool_event.get("call_id", "")
                 tool_name = tool_event.get("name", "")
                 tool_input = tool_event.get("input", {})
+                if not isinstance(tool_name, str):
+                    tool_name = "unknown"
 
                 # Map nanobot tool names to OpenCode tool names for renderer matching
-                oc_tool_name = _TOOL_NAME_MAP.get(tool_name, tool_name)
+                oc_tool_name: str = str(_TOOL_NAME_MAP.get(tool_name) or tool_name)
 
                 if evt_type == "tool_start":
                     has_seen_tools = True
@@ -996,11 +1003,6 @@ class OpenCodeChannel(BaseChannel):
         session_info = self._session_to_info(session, session_id)
         await self._broadcast_sse("session.updated", {"info": session_info})
 
-        # Re-emit user turn once at completion to reduce first-turn race misses
-        # when a brand-new session is created and prompted immediately.
-        await self._broadcast_sse("message.updated", {"info": user_msg})
-        await self._broadcast_sse("message.part.updated", {"part": user_part})
-
         return web.json_response(
             {
                 "info": asst_msg,
@@ -1093,8 +1095,10 @@ class OpenCodeChannel(BaseChannel):
     async def _handle_permission_list(self, request: web.Request) -> web.Response:
         """List pending permission requests."""
         pending = [
-            info for perm_id, info in self._pending_permission_info.items()
-            if perm_id in self._pending_permissions and not self._pending_permissions[perm_id].done()
+            info
+            for perm_id, info in self._pending_permission_info.items()
+            if perm_id in self._pending_permissions
+            and not self._pending_permissions[perm_id].done()
         ]
         return web.json_response(pending)
 
@@ -1132,9 +1136,7 @@ class OpenCodeChannel(BaseChannel):
         )
         return web.json_response(True)
 
-    async def _permission_callback(
-        self, tool_name: str, call_id: str, args: dict
-    ) -> str:
+    async def _permission_callback(self, tool_name: str, call_id: str, args: dict) -> str:
         """Async callback invoked by AgentLoop when a tool needs permission.
 
         Emits a permission.asked SSE event and waits for the user to reply
@@ -1408,10 +1410,12 @@ class OpenCodeChannel(BaseChannel):
             {"sessionID": session_id, "status": {"type": "idle"}},
         )
 
-        return web.json_response({
-            "info": asst_msg,
-            "parts": [asst_part],
-        })
+        return web.json_response(
+            {
+                "info": asst_msg,
+                "parts": [asst_part],
+            }
+        )
 
     # ------------------------------------------------------------------
     # Stub endpoints
@@ -1516,24 +1520,83 @@ class OpenCodeChannel(BaseChannel):
         prev_user_id = None
         prev_user_created_ms: int | None = None
 
-        # Pre-index tool results by tool_call_id for pairing with assistant tool_calls
-        tool_results: dict[str, dict[str, Any]] = {}
-        for m in messages:
-            if m.get("role") == "tool" and m.get("tool_call_id"):
-                tool_results[m["tool_call_id"]] = m
-
-        for i, m in enumerate(messages):
-            role = m.get("role", "")
-            content = m.get("content", "")
-            ts = m.get("timestamp", "")
+        def _created_ms(entry: dict[str, Any]) -> int:
+            ts = entry.get("timestamp", "")
             try:
-                created = (
+                return (
                     self._epoch_ms(datetime.fromisoformat(ts).timestamp())
                     if ts
                     else self._epoch_ms(time.time())
                 )
             except (ValueError, TypeError):
-                created = self._epoch_ms(time.time())
+                return self._epoch_ms(time.time())
+
+        # Pre-index tool results by tool_call_id for pairing with assistant tool_calls.
+        tool_results: dict[str, dict[str, Any]] = {}
+        for m in messages:
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                tool_results[m["tool_call_id"]] = m
+
+        # Normalize raw history into display messages so tool-call turns map to
+        # one assistant message (tools + final text), matching live SSE behavior.
+        display_messages: list[dict[str, Any]] = []
+        i = 0
+        while i < len(messages):
+            entry = messages[i]
+            role = entry.get("role", "")
+
+            if role == "user":
+                display_messages.append(entry)
+                i += 1
+                continue
+
+            if role != "assistant":
+                i += 1
+                continue
+
+            tool_calls = entry.get("tool_calls", [])
+            content = entry.get("content", "")
+
+            if tool_calls:
+                merged = dict(entry)
+                text_parts: list[str] = []
+                if isinstance(content, str) and content.strip():
+                    text_parts.append(content.strip())
+
+                usage_source: dict[str, Any] = entry
+                j = i + 1
+                while j < len(messages) and messages[j].get("role") != "user":
+                    candidate = messages[j]
+                    if candidate.get("role") == "assistant" and not candidate.get("tool_calls"):
+                        c = candidate.get("content", "")
+                        if isinstance(c, str) and c.strip():
+                            text_parts.append(c.strip())
+                            usage_source = candidate
+                    j += 1
+
+                merged["content"] = "\n\n".join(text_parts)
+                if usage_source is not entry:
+                    if usage_source.get("usage") is not None:
+                        merged["usage"] = usage_source.get("usage")
+                    if usage_source.get("model") is not None:
+                        merged["model"] = usage_source.get("model")
+                    if usage_source.get("timestamp"):
+                        merged["timestamp"] = usage_source.get("timestamp")
+
+                display_messages.append(merged)
+                i = j
+                continue
+
+            # Plain assistant response.
+            if isinstance(content, str) and content.strip():
+                display_messages.append(entry)
+
+            i += 1
+
+        for i, m in enumerate(display_messages):
+            role = m.get("role", "")
+            content = m.get("content", "")
+            created = _created_ms(m)
 
             msg_id = f"msg_{session_id}_{i}"
             part_id = f"part_{session_id}_{i}"
@@ -1545,7 +1608,7 @@ class OpenCodeChannel(BaseChannel):
                         "id": msg_id,
                         "sessionID": session_id,
                         "role": "user",
-                        "time": {"created": created},
+                        "time": {"created": created, "completed": created},
                         "agent": "default",
                         "model": {"providerID": provider_name, "modelID": model_id},
                     },
@@ -1563,90 +1626,94 @@ class OpenCodeChannel(BaseChannel):
                 result.append(msg)
                 prev_user_id = msg_id
                 prev_user_created_ms = created
+                continue
 
-            elif role == "assistant":
-                text = content if isinstance(content, str) else ""
-                tool_calls = m.get("tool_calls", [])
+            if role != "assistant":
+                continue
 
-                # Skip assistant messages with no text and no tool calls
-                if not text and not tool_calls:
-                    continue
+            text = content if isinstance(content, str) else ""
+            tool_calls = m.get("tool_calls", [])
+            if not text and not tool_calls:
+                continue
 
-                created_assistant = created
-                if prev_user_created_ms is not None and created_assistant <= prev_user_created_ms:
-                    created_assistant = prev_user_created_ms + 1
+            created_assistant = created
+            if prev_user_created_ms is not None and created_assistant <= prev_user_created_ms:
+                created_assistant = prev_user_created_ms + 1
 
-                parts: list[dict[str, Any]] = []
-                part_idx = 0
+            parts: list[dict[str, Any]] = []
+            part_idx = 0
 
-                # Text part (if any)
-                if text:
-                    parts.append({
+            if text:
+                parts.append(
+                    {
                         "id": f"{part_id}_{part_idx}",
                         "sessionID": session_id,
                         "messageID": msg_id,
                         "type": "text",
                         "text": text,
                         "time": {"start": created_assistant, "end": created_assistant},
-                    })
-                    part_idx += 1
+                    }
+                )
+                part_idx += 1
 
-                # Tool parts from tool_calls
-                for tc in tool_calls:
-                    tc_id = tc.get("id", "")
-                    tc_func = tc.get("function", {})
-                    tc_name = tc_func.get("name", "unknown")
-                    oc_name = _TOOL_NAME_MAP.get(tc_name, tc_name)
-                    tc_args_raw = tc_func.get("arguments", "{}")
-                    try:
-                        tc_input = json.loads(tc_args_raw) if isinstance(tc_args_raw, str) else tc_args_raw
-                    except (json.JSONDecodeError, TypeError):
-                        tc_input = tc_args_raw
+            for tc in tool_calls:
+                tc_id = tc.get("id", "")
+                tc_func = tc.get("function", {})
+                tc_name = tc_func.get("name", "unknown")
+                if not isinstance(tc_name, str):
+                    tc_name = "unknown"
+                oc_name: str = str(_TOOL_NAME_MAP.get(tc_name) or tc_name)
+                tc_args_raw = tc_func.get("arguments", "{}")
+                try:
+                    tc_input = (
+                        json.loads(tc_args_raw) if isinstance(tc_args_raw, str) else tc_args_raw
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    tc_input = tc_args_raw
 
-                    # Find matching tool result
-                    tr = tool_results.get(tc_id)
-                    tc_output = ""
-                    tc_status = "completed"
-                    if tr:
-                        tc_output = tr.get("content", "")
-                        if isinstance(tc_output, str) and tc_output.startswith("Error"):
-                            tc_status = "error"
-                    else:
-                        tc_status = "pending"
+                tr = tool_results.get(tc_id)
+                tc_output = ""
+                tc_status = "completed"
+                if tr:
+                    tc_output = tr.get("content", "")
+                    if isinstance(tc_output, str) and tc_output.startswith("Error"):
+                        tc_status = "error"
+                else:
+                    tc_status = "pending"
 
-                    oc_input = _map_tool_input(tc_name, tc_input)
-                    tool_title = _tool_title(oc_name, oc_input)
+                oc_input = _map_tool_input(tc_name, tc_input)
+                tool_title = _tool_title(oc_name, oc_input)
 
-                    # Build metadata matching what each tool renderer expects
-                    tc_metadata: dict[str, Any] = {}
-                    if tc_name == "exec" and tc_output:
-                        tc_metadata = {"output": tc_output}
+                tc_metadata: dict[str, Any] = {}
+                if tc_name == "exec" and tc_output:
+                    tc_metadata = {"output": tc_output}
 
-                    if tc_status == "error":
-                        tc_state: dict[str, Any] = {
-                            "status": "error",
-                            "input": oc_input,
-                            "error": tc_output,
-                            "metadata": tc_metadata,
-                            "time": {"start": created_assistant, "end": created_assistant},
-                        }
-                    elif tc_status == "completed":
-                        tc_state = {
-                            "status": "completed",
-                            "input": oc_input,
-                            "output": tc_output,
-                            "title": tool_title,
-                            "metadata": tc_metadata,
-                            "time": {"start": created_assistant, "end": created_assistant},
-                        }
-                    else:
-                        tc_state = {
-                            "status": "pending",
-                            "input": oc_input,
-                            "raw": "",
-                        }
+                if tc_status == "error":
+                    tc_state: dict[str, Any] = {
+                        "status": "error",
+                        "input": oc_input,
+                        "error": tc_output,
+                        "metadata": tc_metadata,
+                        "time": {"start": created_assistant, "end": created_assistant},
+                    }
+                elif tc_status == "completed":
+                    tc_state = {
+                        "status": "completed",
+                        "input": oc_input,
+                        "output": tc_output,
+                        "title": tool_title,
+                        "metadata": tc_metadata,
+                        "time": {"start": created_assistant, "end": created_assistant},
+                    }
+                else:
+                    tc_state = {
+                        "status": "pending",
+                        "input": oc_input,
+                        "raw": "",
+                    }
 
-                    parts.append({
+                parts.append(
+                    {
                         "id": f"{part_id}_{part_idx}",
                         "sessionID": session_id,
                         "messageID": msg_id,
@@ -1654,53 +1721,53 @@ class OpenCodeChannel(BaseChannel):
                         "callID": tc_id,
                         "tool": oc_name,
                         "state": tc_state,
-                    })
-                    part_idx += 1
+                    }
+                )
+                part_idx += 1
 
-                # Fall back to single text part if no parts were generated
-                if not parts:
-                    parts.append({
+            if not parts:
+                parts.append(
+                    {
                         "id": part_id,
                         "sessionID": session_id,
                         "messageID": msg_id,
                         "type": "text",
                         "text": "",
                         "time": {"start": created_assistant, "end": created_assistant},
-                    })
+                    }
+                )
 
-                usage = m.get("usage", {})
-                tokens = {
-                    "input": usage.get("prompt_tokens", 0),
-                    "output": usage.get("completion_tokens", 0),
-                    "reasoning": 0,
-                    "cache": {"read": 0, "write": 0},
-                }
-                details = usage.get("completion_tokens_details")
-                if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
-                    tokens["reasoning"] = details["reasoning_tokens"]
+            usage = m.get("usage", {})
+            tokens = {
+                "input": usage.get("prompt_tokens", 0),
+                "output": usage.get("completion_tokens", 0),
+                "reasoning": 0,
+                "cache": {"read": 0, "write": 0},
+            }
+            details = usage.get("completion_tokens_details")
+            if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
+                tokens["reasoning"] = details["reasoning_tokens"]
 
-                msg = {
-                    "info": {
-                        "id": msg_id,
-                        "sessionID": session_id,
-                        "role": "assistant",
-                        "time": {"created": created_assistant, "completed": created_assistant},
-                        "parentID": prev_user_id or "",
-                        "modelID": model_id,
-                        "providerID": provider_name,
-                        "mode": "default",
-                        "agent": "default",
-                        "path": {
-                            "cwd": str(self.agent_loop.workspace) if self.agent_loop else "",
-                            "root": "",
-                        },
-                        "cost": float(usage.get("cost", 0)) if usage else 0,
-                        "tokens": tokens,
+            msg = {
+                "info": {
+                    "id": msg_id,
+                    "sessionID": session_id,
+                    "role": "assistant",
+                    "time": {"created": created_assistant, "completed": created_assistant},
+                    "parentID": prev_user_id or "",
+                    "modelID": model_id,
+                    "providerID": provider_name,
+                    "mode": "default",
+                    "agent": "default",
+                    "path": {
+                        "cwd": str(self.agent_loop.workspace) if self.agent_loop else "",
+                        "root": "",
                     },
-                    "parts": parts,
-                }
-                result.append(msg)
-
-            # role == "tool" messages are consumed via tool_results dict above
+                    "cost": float(usage.get("cost", 0)) if usage else 0,
+                    "tokens": tokens,
+                },
+                "parts": parts,
+            }
+            result.append(msg)
 
         return result

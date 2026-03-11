@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -252,6 +253,43 @@ async def test_send_message(client, mock_agent_loop):
     mock_agent_loop.process_direct.assert_awaited_once()
 
 
+async def test_send_message_passes_resolved_session_key_to_model_input(
+    bus, session_manager, mock_agent_loop
+):
+    shared_key = "telegram:8281248569"
+    session_manager.save(Session(key=shared_key))
+
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        resp = await client.post(
+            "/session/8281248569/message",
+            json={"parts": [{"type": "text", "text": "remind me via telegram"}]},
+        )
+        assert resp.status == 200
+
+        kwargs = mock_agent_loop.process_direct.await_args.kwargs
+        assert kwargs["content"] == "remind me via telegram"
+        assert kwargs["session_key"] == shared_key
+        assert kwargs["channel"] == "opencode"
+        assert kwargs["chat_id"] == "8281248569"
+    finally:
+        await client.close()
+
+
 async def test_send_message_uses_requested_model(bus, session_manager, mock_agent_loop):
     channel = OpenCodeChannel(
         config=OpenCodeConfig(enabled=True, port=0),
@@ -448,6 +486,89 @@ async def test_send_empty_message(client):
         },
     )
     assert resp.status == 400
+
+
+def test_messages_to_opencode_merges_tool_turn(bus, session_manager, mock_agent_loop):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+    )
+
+    session = Session(key="session-1")
+    session.messages = [
+        {
+            "role": "user",
+            "content": "check inbox",
+            "timestamp": "2026-03-10T23:58:10",
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": '{"command": "himalaya envelope list --output json"}',
+                    },
+                }
+            ],
+            "timestamp": "2026-03-10T23:58:11",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "exec",
+            "content": "[]",
+            "timestamp": "2026-03-10T23:58:12",
+        },
+        {
+            "role": "assistant",
+            "content": "You didn't receive any emails today.",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            "timestamp": "2026-03-10T23:58:13",
+        },
+    ]
+
+    messages = channel._messages_to_opencode(session, "session-1")
+    assert len(messages) == 2
+    assert messages[0]["info"]["id"] == "msg_session-1_0"
+    assert messages[0]["info"]["time"]["completed"] == messages[0]["info"]["time"]["created"]
+
+    assistant = messages[1]
+    assert assistant["info"]["id"] == "msg_session-1_1"
+    parts = assistant["parts"]
+    assert any(p.get("type") == "tool" for p in parts)
+    assert any(p.get("type") == "text" and "didn't receive" in p.get("text", "") for p in parts)
+
+
+async def test_sse_write_drops_client_on_closing_transport(
+    bus, session_manager, mock_agent_loop, agent_config
+):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=agent_config,
+    )
+
+    class ClosingStream:
+        async def write(self, _: bytes) -> None:
+            raise RuntimeError("Cannot write to closing transport")
+
+    client = cast(web.StreamResponse, ClosingStream())
+    channel._sse_clients.append(client)
+
+    ok = await channel._sse_write(client, "server.heartbeat", {})
+    assert ok is False
+    assert client not in channel._sse_clients
 
 
 # ------------------------------------------------------------------
