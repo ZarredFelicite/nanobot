@@ -879,3 +879,57 @@ async def test_abort(client):
 
     resp = await client.post(f"/session/{sid}/abort")
     assert resp.status == 200
+
+
+async def test_abort_cancels_inflight_session_message(bus, session_manager):
+    started = asyncio.Event()
+
+    async def _slow_process(**kwargs):
+        started.set()
+        await asyncio.sleep(5)
+        return "done"
+
+    mock_loop = MagicMock()
+    mock_loop.workspace = session_manager.workspace
+    mock_loop.process_direct = AsyncMock(side_effect=_slow_process)
+    mock_loop.get_last_context_stats = MagicMock(return_value={})
+    mock_loop.get_last_llm_usage = MagicMock(return_value={})
+
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_loop,
+        agent_config=AgentDefaults(model="openrouter/minimax/minimax-m2.5", provider="auto"),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        create_resp = await client.post("/session")
+        session = await create_resp.json()
+        sid = session["id"]
+
+        send_task = asyncio.create_task(
+            client.post(
+                f"/session/{sid}/message",
+                json={"parts": [{"type": "text", "text": "please keep running"}]},
+            )
+        )
+
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        abort_resp = await client.post(f"/session/{sid}/abort")
+        assert abort_resp.status == 200
+        abort_data = await abort_resp.json()
+        assert abort_data["cancelled"] >= 1
+
+        send_resp = await asyncio.wait_for(send_task, timeout=1.0)
+        assert send_resp.status == 200
+        send_data = await send_resp.json()
+        assert send_data["parts"][0]["text"] == "Task cancelled."
+    finally:
+        await client.close()
