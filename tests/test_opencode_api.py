@@ -495,7 +495,7 @@ async def test_session_summarize_calls_compaction(bus, session_manager):
         await client.close()
 
 
-async def test_session_summarize_id_matches_projected_history(bus, session_manager):
+async def test_session_summarize_uses_unique_live_message_id(bus, session_manager):
     mock_loop = MagicMock()
     mock_loop.workspace = session_manager.workspace
     mock_loop.process_direct = AsyncMock(return_value="ok")
@@ -568,12 +568,15 @@ async def test_session_summarize_id_matches_projected_history(bus, session_manag
         history_resp = await client.get(f"/session/{sid}/message")
         history = await history_resp.json()
 
-        assert summary["info"]["id"] == history[-1]["info"]["id"]
+        assert summary["info"]["id"].startswith(f"msg_{sid}_")
+        assert summary["parts"][0]["id"].startswith(f"part_{sid}_")
+        assert summary["parts"][0]["messageID"] == summary["info"]["id"]
+        assert summary["info"]["id"] != history[-1]["info"]["id"]
     finally:
         await client.close()
 
 
-async def test_session_command_id_matches_projected_history(bus, session_manager):
+async def test_session_command_uses_unique_live_message_id(bus, session_manager):
     async def fake_process_direct(*, content, session_key, **kwargs):
         session = session_manager.get_or_create(session_key)
         session.add_message("user", content)
@@ -638,7 +641,10 @@ async def test_session_command_id_matches_projected_history(bus, session_manager
 
         history_resp = await client.get(f"/session/{sid}/message")
         history = await history_resp.json()
-        assert cmd_data["info"]["id"] == history[-1]["info"]["id"]
+        assert cmd_data["info"]["id"].startswith(f"msg_{sid}_")
+        assert cmd_data["parts"][0]["id"].startswith(f"part_{sid}_")
+        assert cmd_data["parts"][0]["messageID"] == cmd_data["info"]["id"]
+        assert cmd_data["info"]["id"] != history[-1]["info"]["id"]
     finally:
         await client.close()
 
