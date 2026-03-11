@@ -27,6 +27,8 @@ class ReadFileTool(Tool):
     """Tool to read file contents."""
 
     _MAX_CHARS = 128_000  # ~128 KB — prevents OOM from reading huge files into LLM context
+    _WARN_TOKENS = 10_000  # ~40KB — warn model to use line ranges for large files
+    _CHARS_PER_TOKEN = 4  # rough estimate
 
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
@@ -38,17 +40,32 @@ class ReadFileTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Read the contents of a file at the given path."
+        return (
+            "Read the contents of a file at the given path. "
+            "Optionally specify start_line and end_line (1-based) to read a range."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "The file path to read"}},
+            "properties": {
+                "path": {"type": "string", "description": "The file path to read"},
+                "start_line": {
+                    "type": "integer",
+                    "description": "First line to read (1-based, inclusive). Omit to start from beginning.",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Last line to read (1-based, inclusive). Omit to read to end.",
+                },
+            },
             "required": ["path"],
         }
 
     async def execute(self, path: str, **kwargs: Any) -> str:
+        start_line: int | None = kwargs.get("start_line")
+        end_line: int | None = kwargs.get("end_line")
         try:
             file_path = _resolve_path(path, self._workspace, self._allowed_dir)
             if not file_path.exists():
@@ -57,15 +74,43 @@ class ReadFileTool(Tool):
                 return f"Error: Not a file: {path}"
 
             size = file_path.stat().st_size
-            if size > self._MAX_CHARS * 4:  # rough upper bound (UTF-8 chars ≤ 4 bytes)
+            if size > self._MAX_CHARS * 4 and not (start_line or end_line):
+                total_lines = file_path.read_text(encoding="utf-8").count("\n")
                 return (
-                    f"Error: File too large ({size:,} bytes). "
-                    f"Use exec tool with head/tail/grep to read portions."
+                    f"Error: File too large ({size:,} bytes, ~{total_lines:,} lines). "
+                    f"Use start_line/end_line to read a portion."
                 )
 
             content = file_path.read_text(encoding="utf-8")
+
+            if start_line is not None or end_line is not None:
+                lines = content.splitlines(keepends=True)
+                total = len(lines)
+                s = max(1, start_line or 1) - 1  # 0-based
+                e = min(total, end_line or total)
+                selected = lines[s:e]
+                # Prefix with line numbers for context
+                numbered = [f"{s + i + 1:>6}\t{line}" for i, line in enumerate(selected)]
+                header = f"Lines {s + 1}-{e} of {total} in {file_path}\n"
+                return header + "".join(numbered)
+
             if len(content) > self._MAX_CHARS:
-                return content[: self._MAX_CHARS] + f"\n\n... (truncated — file is {len(content):,} chars, limit {self._MAX_CHARS:,})"
+                total_lines = content.count("\n")
+                return (
+                    content[: self._MAX_CHARS]
+                    + f"\n\n... (truncated — file is {len(content):,} chars / ~{total_lines:,} lines. "
+                    f"Use start_line/end_line to read specific portions.)"
+                )
+
+            est_tokens = len(content) // self._CHARS_PER_TOKEN
+            if est_tokens > self._WARN_TOKENS:
+                total_lines = content.count("\n") + 1
+                warning = (
+                    f"\n\n⚠ Warning: This file is ~{est_tokens:,} tokens ({total_lines:,} lines). "
+                    f"Next time, use start_line/end_line to read only the section you need."
+                )
+                return content + warning
+
             return content
         except PermissionError as e:
             return f"Error: {e}"
