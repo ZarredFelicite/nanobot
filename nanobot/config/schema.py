@@ -320,6 +320,7 @@ class HeartbeatConfig(Base):
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
     model: str | None = None  # Override model for heartbeat execution (must support tool use)
+    decide_model: str | None = None  # Cheap model for skip/run decision (defaults to agent model)
 
 
 class GatewayConfig(Base):

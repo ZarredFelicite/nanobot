@@ -14,6 +14,7 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.subagent import SubagentTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -193,6 +194,7 @@ class AgentLoop:
             from nanobot.agent.tools.memory_recall import MemoryRecallTool
 
             self.tools.register(MemoryRecallTool(self._subconscious))
+        self.tools.register(SubagentTool(workspace=self.workspace))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""

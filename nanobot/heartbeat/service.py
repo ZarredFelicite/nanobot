@@ -25,10 +25,6 @@ _HEARTBEAT_TOOL = [
                         "enum": ["skip", "run"],
                         "description": "skip = nothing to do, run = has active tasks",
                     },
-                    "tasks": {
-                        "type": "string",
-                        "description": "Natural-language summary of active tasks (required for run)",
-                    },
                 },
                 "required": ["action"],
             },
@@ -59,10 +55,12 @@ class HeartbeatService:
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
+        decide_model: str | None = None,
     ):
         self.workspace = workspace
         self.provider = provider
         self.model = model
+        self.decide_model = decide_model or model
         self.on_execute = on_execute
         self.on_notify = on_notify
         self.interval_s = interval_s
@@ -82,11 +80,8 @@ class HeartbeatService:
                 return None
         return None
 
-    async def _decide(self, content: str) -> tuple[str, str]:
-        """Phase 1: ask LLM to decide skip/run via virtual tool call.
-
-        Returns (action, tasks) where action is 'skip' or 'run'.
-        """
+    async def _decide(self, content: str) -> bool:
+        """Phase 1: ask LLM to decide skip/run via virtual tool call."""
         response = await self.provider.chat(
             messages=[
                 {"role": "system", "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."},
@@ -96,14 +91,14 @@ class HeartbeatService:
                 )},
             ],
             tools=_HEARTBEAT_TOOL,
-            model=self.model,
+            model=self.decide_model,
         )
 
         if not response.has_tool_calls:
-            return "skip", ""
+            return False
 
         args = response.tool_calls[0].arguments
-        return args.get("action", "skip"), args.get("tasks", "")
+        return args.get("action", "skip") == "run"
 
     async def start(self) -> None:
         """Start the heartbeat service."""
@@ -147,15 +142,15 @@ class HeartbeatService:
         logger.info("Heartbeat: checking for tasks...")
 
         try:
-            action, tasks = await self._decide(content)
+            should_run = await self._decide(content)
 
-            if action != "run":
+            if not should_run:
                 logger.info("Heartbeat: OK (nothing to report)")
                 return
 
             logger.info("Heartbeat: tasks found, executing...")
             if self.on_execute:
-                response = await self.on_execute(tasks)
+                response = await self.on_execute(content)
                 if response and self.on_notify:
                     logger.info("Heartbeat: completed, delivering response")
                     await self.on_notify(response)
@@ -167,7 +162,7 @@ class HeartbeatService:
         content = self._read_heartbeat_file()
         if not content:
             return None
-        action, tasks = await self._decide(content)
-        if action != "run" or not self.on_execute:
+        should_run = await self._decide(content)
+        if not should_run or not self.on_execute:
             return None
-        return await self.on_execute(tasks)
+        return await self.on_execute(content)

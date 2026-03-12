@@ -407,6 +407,7 @@ def gateway(
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
+        decide_model=hb_cfg.decide_model,
     )
 
     if channels.enabled_channels:

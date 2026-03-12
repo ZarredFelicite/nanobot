@@ -204,15 +204,29 @@ class SubconsciousService:
         existing = self._list_existing_notes()
         conversation = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
 
-        prompt = f"""Extract memorable facts from this conversation. Focus on:
-- **Entities**: People, machines, programs, or other named things. Use the `path` field to place them in the right directory (see existing structure below).
-- **Notes**: Preferences, decisions, or any other facts worth remembering. Use the `path` field to place them in the right directory.
+        prompt = f"""Extract ONLY genuinely important, persistent facts from this conversation. Be extremely selective.
+
+**DO extract** (entities or notes):
+- People the user has a relationship with (colleagues, friends, contacts) and new facts about them
+- User preferences, decisions, or opinions they explicitly stated
+- Projects or tools the user is actively building or maintaining
+- Key technical decisions or architectural choices made
+- Corrections to previously stored information
+
+**DO NOT extract**:
+- Things merely mentioned in passing (news sources read from a config, model names from a list, URLs scraped from a page)
+- Generic/well-known entities (programming languages, popular websites, common tools) unless the user expressed a specific preference or opinion about them
+- Transient operational details (files read, commands run, errors encountered during debugging)
+- Information that only matters for the current task and has no long-term value
+- Lists of items being processed — only extract if the user explicitly cares about remembering them
+
+The bar is HIGH. When in doubt, do NOT create a note. Most conversations should produce 0-3 notes, not 10-20. If the conversation is just task execution (debugging, coding, searching), it likely produces zero entity notes.
 
 Use [[Name]] wikilinks to cross-reference entities in your content.
 
-If a note already exists (listed below), use action="update" and write the COMPLETE updated content (not just the delta). If the new information contradicts old information, replace the outdated facts. Create new subdirectories as needed if nothing existing fits.
+If a note already exists (listed below), use action="update" and write the COMPLETE updated content (not just the delta). If the new information contradicts old information, replace the outdated facts.
 
-If nothing noteworthy was discussed (e.g. casual greetings, simple questions), call save_memories with empty arrays. Only extract genuinely persistent facts.
+If nothing noteworthy was discussed, call save_memories with empty arrays.
 
 ## Existing Notes
 {existing or "(none yet)"}
@@ -225,7 +239,7 @@ If nothing noteworthy was discussed (e.g. casual greetings, simple questions), c
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a memory extraction agent. Analyze conversations and extract structured memories by calling the save_memories tool. Be selective — only extract genuinely useful information.",
+                        "content": "You are a memory extraction agent. Analyze conversations and extract structured memories by calling the save_memories tool. Be EXTREMELY selective — most conversations produce 0-2 notes. Only extract facts that would be useful weeks or months from now. Do NOT create notes for things merely mentioned in passing, items from lists/configs, or well-known entities.",
                     },
                     {"role": "user", "content": prompt},
                 ],

@@ -47,9 +47,8 @@ async def test_decide_returns_skip_when_no_tool_call(tmp_path) -> None:
         model="openai/gpt-4o-mini",
     )
 
-    action, tasks = await service._decide("heartbeat content")
-    assert action == "skip"
-    assert tasks == ""
+    result = await service._decide("heartbeat content")
+    assert result is False
 
 
 @pytest.mark.asyncio
@@ -63,7 +62,7 @@ async def test_trigger_now_executes_when_decision_is_run(tmp_path) -> None:
                 ToolCallRequest(
                     id="hb_1",
                     name="heartbeat",
-                    arguments={"action": "run", "tasks": "check open tasks"},
+                    arguments={"action": "run"},
                 )
             ],
         )
@@ -84,7 +83,7 @@ async def test_trigger_now_executes_when_decision_is_run(tmp_path) -> None:
 
     result = await service.trigger_now()
     assert result == "done"
-    assert called_with == ["check open tasks"]
+    assert called_with == ["- [ ] do thing"]
 
 
 @pytest.mark.asyncio
