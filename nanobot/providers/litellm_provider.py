@@ -13,9 +13,12 @@ from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
 
 # Standard chat-completion message keys.
-_ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
+_ALLOWED_MSG_KEYS = frozenset(
+    {"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"}
+)
 _ANTHROPIC_EXTRA_KEYS = frozenset({"thinking_blocks"})
 _ALNUM = string.ascii_letters + string.digits
+
 
 def _short_tool_id() -> str:
     """Generate a 9-char alphanumeric ID compatible with all providers (incl. Mistral)."""
@@ -25,7 +28,7 @@ def _short_tool_id() -> str:
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
-    
+
     Supports OpenRouter, Anthropic, OpenAI, Gemini, MiniMax, and many other providers through
     a unified interface.  Provider-specific logic is driven by the registry
     (see providers/registry.py) — no if-elif chains needed here.
@@ -54,13 +57,6 @@ class LiteLLMProvider(LLMProvider):
 
         if api_base:
             litellm.api_base = api_base
-
-        # Models that have returned 400 on tool-message history.  When a
-        # collapse-retry succeeds we remember the model so subsequent calls
-        # proactively collapse *before* the first attempt, avoiding the
-        # degrade-on-retry problem (model sees collapsed context and loses
-        # tool-calling continuity).
-        self._needs_tool_collapse: set[str] = set()
 
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
@@ -137,7 +133,9 @@ class LiteLLMProvider(LLMProvider):
             if msg.get("role") == "system":
                 content = msg["content"]
                 if isinstance(content, str):
-                    new_content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+                    new_content = [
+                        {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                    ]
                 else:
                     new_content = list(content)
                     new_content[-1] = {**new_content[-1], "cache_control": {"type": "ephemeral"}}
@@ -166,12 +164,18 @@ class LiteLLMProvider(LLMProvider):
     def _extra_msg_keys(original_model: str, resolved_model: str) -> frozenset[str]:
         """Return provider-specific extra keys to preserve in request messages."""
         spec = find_by_model(original_model) or find_by_model(resolved_model)
-        if (spec and spec.name == "anthropic") or "claude" in original_model.lower() or resolved_model.startswith("anthropic/"):
+        if (
+            (spec and spec.name == "anthropic")
+            or "claude" in original_model.lower()
+            or resolved_model.startswith("anthropic/")
+        ):
             return _ANTHROPIC_EXTRA_KEYS
         return frozenset()
 
     @staticmethod
-    def _sanitize_messages(messages: list[dict[str, Any]], extra_keys: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
+    def _sanitize_messages(
+        messages: list[dict[str, Any]], extra_keys: frozenset[str] = frozenset()
+    ) -> list[dict[str, Any]]:
         """Strip non-standard keys and ensure assistant messages have a content key."""
         allowed = _ALLOWED_MSG_KEYS | extra_keys
         sanitized = []
@@ -184,54 +188,28 @@ class LiteLLMProvider(LLMProvider):
         return sanitized
 
     @staticmethod
-    def _collapse_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Collapse tool call sequences into plain text for providers that reject them.
+    def _normalize_stepfun_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Normalize assistant tool-call turns for stricter StepFun parsers.
 
-        Converts:
-          assistant (tool_calls=[...]) → assistant (content="[Used tool: name(args)]")
-          tool (content="result")      → dropped (folded into the assistant text)
+        StepFun can reject assistant messages that include both non-null content
+        and tool_calls. Force content to null for those turns.
         """
-        import json as _json
+        normalized: list[dict[str, Any]] = []
+        for msg in messages:
+            clean = dict(msg)
+            # Provider appears strict about non-standard assistant metadata.
+            clean.pop("reasoning_content", None)
+            clean.pop("thinking_blocks", None)
 
-        # Check if there are any tool messages to collapse
-        has_tools = any(
-            m.get("role") == "tool" or m.get("tool_calls")
-            for m in messages
-        )
-        if not has_tools:
-            return messages  # return same object — caller checks identity
-
-        result: list[dict[str, Any]] = []
-        # Index tool results by tool_call_id
-        tool_outputs: dict[str, str] = {}
-        for m in messages:
-            if m.get("role") == "tool" and m.get("tool_call_id"):
-                tool_outputs[m["tool_call_id"]] = m.get("content", "") or ""
-
-        for m in messages:
-            if m.get("role") == "tool":
-                continue  # consumed above
-
-            if m.get("role") == "assistant" and m.get("tool_calls"):
-                # Collapse tool calls into text
-                parts = []
-                text = m.get("content")
-                if text:
-                    parts.append(text)
-                for tc in m["tool_calls"]:
-                    tc_id = tc.get("id", "")
-                    func = tc.get("function", {})
-                    name = func.get("name", "unknown")
-                    args = func.get("arguments", "")
-                    output = tool_outputs.get(tc_id, "")
-                    parts.append(f"[Used tool: {name}({args}) → {output[:200]}]")
-                result.append({"role": "assistant", "content": "\n".join(parts)})
-            else:
-                # Strip tool_calls key from any message just in case
-                clean = {k: v for k, v in m.items() if k != "tool_calls"}
-                result.append(clean)
-
-        return result
+            if clean.get("role") == "assistant" and clean.get("tool_calls"):
+                # StepFun docs/examples use empty string for assistant tool-call
+                # turns; null can be rejected by stricter parsers.
+                clean["content"] = ""
+            if clean.get("role") == "tool":
+                # OpenRouter docs mark name optional; keep the minimal shape.
+                clean.pop("name", None)
+            normalized.append(clean)
+        return normalized
 
     async def chat(
         self,
@@ -259,6 +237,7 @@ class LiteLLMProvider(LLMProvider):
         model = self._resolve_model(original_model)
         extra_msg_keys = self._extra_msg_keys(original_model, model)
 
+        is_stepfun = "stepfun/" in original_model.lower() or "stepfun/" in model.lower()
         if self._supports_cache_control(original_model):
             messages, tools = self._apply_cache_control(messages, tools)
 
@@ -266,13 +245,16 @@ class LiteLLMProvider(LLMProvider):
         # LiteLLM to reject the request with "max_tokens must be at least 1".
         max_tokens = max(1, max_tokens)
 
-        # Proactively collapse tool messages for models known to reject them.
-        if model in self._needs_tool_collapse:
-            messages = self._collapse_tool_messages(messages)
+        request_messages = self._sanitize_messages(
+            self._sanitize_empty_content(messages), extra_keys=extra_msg_keys
+        )
+
+        if model.startswith("openrouter/stepfun/"):
+            request_messages = self._normalize_stepfun_tool_messages(request_messages)
 
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys),
+            "messages": request_messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
@@ -291,11 +273,11 @@ class LiteLLMProvider(LLMProvider):
         # Pass extra headers (e.g. APP-Code for AiHubMix)
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
-        
+
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
             kwargs["drop_params"] = True
-        
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
@@ -304,24 +286,8 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            err_str = str(e)
-            # Some providers (e.g. StepFun via OpenRouter) reject tool message
-            # history in the conversation.  Retry with tool turns collapsed to
-            # plain text so the context is preserved without the unsupported
-            # message format.
-            if "400" in err_str and kwargs.get("messages"):
-                collapsed = self._collapse_tool_messages(kwargs["messages"])
-                if collapsed is not kwargs["messages"]:
-                    kwargs["messages"] = collapsed
-                    try:
-                        response = await acompletion(**kwargs)
-                        # Remember this model needs preemptive collapse
-                        self._needs_tool_collapse.add(model)
-                        return self._parse_response(response)
-                    except Exception:
-                        pass  # fall through to original error
             return LLMResponse(
-                content=f"Error calling LLM: {err_str}",
+                content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
 
@@ -337,12 +303,19 @@ class LiteLLMProvider(LLMProvider):
                 args = tc.function.arguments
                 if isinstance(args, str):
                     args = json_repair.loads(args)
+                parsed_args: dict[str, Any]
+                if isinstance(args, dict):
+                    parsed_args = args
+                else:
+                    parsed_args = {}
 
-                tool_calls.append(ToolCallRequest(
-                    id=_short_tool_id(),
-                    name=tc.function.name,
-                    arguments=args,
-                ))
+                tool_calls.append(
+                    ToolCallRequest(
+                        id=_short_tool_id(),
+                        name=tc.function.name,
+                        arguments=parsed_args,
+                    )
+                )
 
         usage = {}
         if hasattr(response, "usage") and response.usage:
@@ -354,7 +327,7 @@ class LiteLLMProvider(LLMProvider):
 
         reasoning_content = getattr(message, "reasoning_content", None) or None
         thinking_blocks = getattr(message, "thinking_blocks", None) or None
-        
+
         return LLMResponse(
             content=message.content,
             tool_calls=tool_calls,
