@@ -24,7 +24,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, ToolCallRequest
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
@@ -248,6 +248,38 @@ class AgentLoop:
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
     @staticmethod
+    def _extract_markup_tool_calls(content: str | None, iteration: int) -> list[ToolCallRequest]:
+        """Extract pseudo-XML tool calls emitted as plain text.
+
+        Some providers/models occasionally return tool calls formatted like:
+        <tool_call><function=message>...<parameter=foo>bar</parameter>...</function></tool_call>
+        instead of structured tool_calls. Parse those blocks so the agent can
+        execute tools instead of treating them as final text.
+        """
+        if not content or "<tool_call>" not in content:
+            return []
+
+        calls: list[ToolCallRequest] = []
+        blocks = re.findall(r"<tool_call>([\s\S]*?)</tool_call>", content)
+        for i, block in enumerate(blocks):
+            fn_match = re.search(r"<function=([a-zA-Z0-9_-]+)>", block)
+            if not fn_match:
+                continue
+            name = fn_match.group(1)
+
+            args: dict[str, Any] = {}
+            for param_match in re.finditer(
+                r"<parameter=([a-zA-Z0-9_-]+)>\s*([\s\S]*?)\s*</parameter>", block
+            ):
+                key = param_match.group(1)
+                value = param_match.group(2).strip()
+                args[key] = value
+
+            calls.append(ToolCallRequest(id=f"markup_{iteration}_{i}", name=name, arguments=args))
+
+        return calls
+
+    @staticmethod
     def _fallback_token_count(messages: list[dict[str, Any]]) -> int:
         """Fallback token estimator when model tokenizer is unavailable."""
         chars = 0
@@ -421,6 +453,8 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
         latest_usage: dict[str, Any] = {}
+        last_tool_batch_signature: str | None = None
+        repeated_tool_batch_count = 0
         active_model = model or self.model
         active_provider = self.provider
         if active_model.startswith(("openai-codex/", "openai_codex/")):
@@ -444,12 +478,50 @@ class AgentLoop:
             if isinstance(response.usage, dict):
                 latest_usage = response.usage
 
-            if response.has_tool_calls:
+            parsed_markup_calls: list[ToolCallRequest] = []
+            if not response.has_tool_calls:
+                parsed_markup_calls = self._extract_markup_tool_calls(response.content, iteration)
+                if parsed_markup_calls:
+                    logger.warning(
+                        "Provider returned pseudo-markup tool call(s); executing parsed calls: {}",
+                        ", ".join(tc.name for tc in parsed_markup_calls),
+                    )
+
+            effective_tool_calls = response.tool_calls or parsed_markup_calls
+
+            if effective_tool_calls:
+                # Heartbeat safety: if the model emits the exact same tool-call
+                # batch repeatedly, stop early to avoid spinning forever.
+                if session_key == "heartbeat":
+                    batch_signature = json.dumps(
+                        [
+                            {"name": tc.name, "arguments": tc.arguments}
+                            for tc in effective_tool_calls
+                        ],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    if batch_signature == last_tool_batch_signature:
+                        repeated_tool_batch_count += 1
+                    else:
+                        repeated_tool_batch_count = 1
+                        last_tool_batch_signature = batch_signature
+
+                    if repeated_tool_batch_count >= 3:
+                        logger.warning(
+                            "Stopping heartbeat tool loop after {} repeated identical tool-call batches",
+                            repeated_tool_batch_count,
+                        )
+                        final_content = "HEARTBEAT_OK (stopped repeated identical tool call loop)"
+                        break
+
                 if on_progress:
                     clean = self._strip_think(response.content)
+                    if parsed_markup_calls:
+                        clean = None
                     if clean:
                         await on_progress(clean)
-                    await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                    await on_progress(self._tool_hint(effective_tool_calls), tool_hint=True)
 
                 tool_call_dicts = [
                     {
@@ -460,7 +532,7 @@ class AgentLoop:
                             "arguments": json.dumps(tc.arguments, ensure_ascii=False),
                         },
                     }
-                    for tc in response.tool_calls
+                    for tc in effective_tool_calls
                 ]
                 messages = self.context.add_assistant_message(
                     messages,
@@ -470,7 +542,7 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                for tool_call in response.tool_calls:
+                for tool_call in effective_tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])

@@ -78,6 +78,14 @@ class SubagentTool(Tool):
                     "type": "string",
                     "description": "Optional extra context to append to the subagent's system prompt",
                 },
+                "provider": {
+                    "type": "string",
+                    "description": "LLM provider (e.g. openrouter, openai-codex)",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Model ID (e.g. stepfun/step-3.5-flash, minimax/minimax-m2.5, moonshotai/kimi-k2.5, gpt-5.4-codex)",
+                },
             },
             "required": ["task", "session"],
         }
@@ -104,6 +112,8 @@ class SubagentTool(Tool):
         session: str = "default",
         working_dir: str | None = None,
         context: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
         **kwargs: Any,
     ) -> str:
         if not shutil.which("pi"):
@@ -115,7 +125,11 @@ class SubagentTool(Tool):
 
         cmd = ["pi", "--mode", "rpc", "--session", str(session_file)]
 
-        if self._model:
+        if provider:
+            cmd.extend(["--provider", provider])
+        if model:
+            cmd.extend(["--model", model])
+        elif self._model:
             cmd.extend(["--model", self._model])
 
         if system_prompt:
@@ -128,6 +142,7 @@ class SubagentTool(Tool):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                limit=1024 * 1024,  # 1MB line buffer — Pi JSONL events can be large
             )
         except Exception as e:
             return f"Error: Failed to start subagent: {e}"

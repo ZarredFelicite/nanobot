@@ -166,6 +166,40 @@ Config:
 
 ---
 
+## 6. Pi Subagent Integration
+
+**Files**: `nanobot/agent/tools/subagent.py`, `nanobot/agent/loop.py`
+
+Delegates complex tasks to a Pi coding agent subprocess via RPC (JSONL over stdin/stdout). Pi has its own tools, session, and context window.
+
+### Architecture
+- **SubagentTool**: Spawns `pi --mode rpc --session <path>` as a subprocess
+- **Sessions**: Persisted at `~/.nanobot/workspace/sessions/pi/<name>.jsonl`
+- **Context injection**: Auto-injects `TOOLS.md`, `USER.md`, `PI-AGENTS.md` via `--append-system-prompt`
+- **Model/provider**: Passed through to Pi via `--provider` and `--model` CLI flags
+
+### When to spawn (proactively)
+- Tasks involving 3+ files or unfamiliar codebases
+- Deep debugging or root-cause analysis
+- Research across many files/logs/directories
+- Implementation work needing iterative tool use
+
+### Model tiers
+| Tier | Provider | Model | Use for |
+|------|----------|-------|---------|
+| Light | openrouter | stepfun/step-3.5-flash | Simple searches, reads, small edits |
+| Medium-light | openrouter | minimax/minimax-m2.5 | Multi-file edits, moderate debugging |
+| Medium | openrouter | moonshotai/kimi-k2.5 | Complex refactoring, feature implementation |
+| Heavy | openai-codex | gpt-5.4-codex | Architectural changes, large implementations |
+
+### Key details
+- 1MB stdout buffer (Pi events can be large)
+- 10-minute default timeout
+- Output truncated at 15KB
+- Codex OAuth tokens: `~/.pi/agent/auth.json` (synced from openclaw)
+
+---
+
 ## Tests
 
 | File | Coverage |
