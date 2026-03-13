@@ -184,7 +184,7 @@ class OpenCodeChannel(BaseChannel):
         self.port = config.port
 
         self._sse_clients: list[web.StreamResponse] = []
-        self._id_counter = 0
+        self._id_counter = 0  # Only used by _next_id (kept for potential future use)
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._pending_permissions: dict[str, asyncio.Future] = {}
         self._pending_permission_info: dict[str, dict[str, Any]] = {}  # perm_id -> metadata
@@ -826,7 +826,12 @@ class OpenCodeChannel(BaseChannel):
             now_s = time.time()
             now_ms = self._epoch_ms(now_s)
             provider_name, model_id = self._split_model(active_model)
-            user_msg_id, user_part_id = self._new_live_ids(session_id)
+            # Use deterministic index-based IDs so SSE messages match the
+            # GET /session/{id}/message response.  The TUI stores messages in
+            # a DB keyed by ID and sorted by time_created; mismatched IDs
+            # between SSE and GET cause duplicates and ordering glitches.
+            display_idx = self._display_count(session, session_id)
+            user_msg_id, user_part_id = self._ids_for_index(session_id, display_idx)
 
             user_msg = {
                 "id": user_msg_id,
@@ -848,7 +853,7 @@ class OpenCodeChannel(BaseChannel):
             await self._broadcast_sse("message.updated", {"info": user_msg})
             await self._broadcast_sse("message.part.updated", {"part": user_part})
 
-            asst_msg_id, asst_part_id = self._new_live_ids(session_id)
+            asst_msg_id, asst_part_id = self._ids_for_index(session_id, display_idx + 1)
             asst_msg = {
                 "id": asst_msg_id,
                 "sessionID": session_id,
@@ -1052,6 +1057,11 @@ class OpenCodeChannel(BaseChannel):
 
             asst_msg["time"]["completed"] = self._epoch_ms(time.time())
             await self._broadcast_sse("message.updated", {"info": asst_msg})
+
+            # Re-broadcast user message after turn completes to ensure the TUI
+            # has it — the initial broadcast may race with optimistic updates.
+            await self._broadcast_sse("message.updated", {"info": user_msg})
+            await self._broadcast_sse("message.part.updated", {"part": user_part})
 
             context_stats = self.agent_loop.get_last_context_stats(key) if self.agent_loop else None
             if isinstance(context_stats, dict):
@@ -1333,7 +1343,8 @@ class OpenCodeChannel(BaseChannel):
         now_ms = self._epoch_ms(time.time())
         model_name = self._session_model(session, None)
         provider_name, model_id = self._split_model(model_name)
-        note_msg_id, note_part_id = self._new_live_ids(session_id)
+        note_display_idx = self._display_count(session, session_id)
+        note_msg_id, note_part_id = self._ids_for_index(session_id, note_display_idx)
         note_msg = {
             "id": note_msg_id,
             "sessionID": session_id,
@@ -1465,7 +1476,10 @@ class OpenCodeChannel(BaseChannel):
 
         now_ms = self._epoch_ms(time.time())
         provider_name, model_id = self._split_model(active_model)
-        msg_id, part_id = self._new_live_ids(session_id)
+        # process_direct added messages to session; compute display index
+        # for the last assistant message so SSE ID matches GET.
+        cmd_display_idx = max(0, self._display_count(session, session_id) - 1)
+        msg_id, part_id = self._ids_for_index(session_id, cmd_display_idx)
 
         asst_msg = {
             "id": msg_id,
