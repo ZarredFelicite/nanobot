@@ -1,8 +1,8 @@
-import { Container, SelectList } from "@mariozechner/pi-tui";
+import { Container, SelectList, type Component } from "@mariozechner/pi-tui";
 import { selectListTheme } from "../theme.js";
 import type { SessionInfo } from "../../api/types.js";
 
-export class SessionSelectorComponent {
+export class SessionSelectorComponent implements Component {
   readonly container: Container;
   private selectList: SelectList;
   onSelect?: (session: SessionInfo) => void;
@@ -33,5 +33,13 @@ export class SessionSelectorComponent {
 
   handleInput(data: string): void {
     this.selectList.handleInput(data);
+  }
+
+  render(width: number): string[] {
+    return this.container.render(width);
+  }
+
+  invalidate(): void {
+    this.container.invalidate();
   }
 }
