@@ -1,8 +1,8 @@
-import { Container, Text, SelectList } from "@mariozechner/pi-tui";
+import { Container, Text, SelectList, type Component } from "@mariozechner/pi-tui";
 import { colors, selectListTheme } from "../theme.js";
 import type { PermissionRequest, PermissionReply } from "../../api/types.js";
 
-export class PermissionDialogComponent {
+export class PermissionDialogComponent implements Component {
   readonly container: Container;
   private selectList: SelectList;
   onReply?: (requestId: string, reply: PermissionReply) => void;
@@ -39,5 +39,13 @@ export class PermissionDialogComponent {
 
   handleInput(data: string): void {
     this.selectList.handleInput(data);
+  }
+
+  render(width: number): string[] {
+    return this.container.render(width);
+  }
+
+  invalidate(): void {
+    this.container.invalidate();
   }
 }
