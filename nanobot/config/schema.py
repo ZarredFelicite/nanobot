@@ -321,6 +321,9 @@ class HeartbeatConfig(Base):
     interval_s: int = 30 * 60  # 30 minutes
     model: str | None = None  # Override model for heartbeat execution (must support tool use)
     decide_model: str | None = None  # Cheap model for skip/run decision (defaults to agent model)
+    duplicate_to_telegram_after_inactive_s: int = (
+        30 * 60
+    )  # Also send heartbeat to Telegram if no user messages for this long
 
 
 class GatewayConfig(Base):
@@ -371,9 +374,7 @@ class SubconsciousConfig(Base):
 class PermissionConfig(Base):
     """Tool permission configuration for ACP compliance."""
 
-    require_approval: list[str] = Field(
-        default_factory=lambda: ["exec", "write_file", "edit_file"]
-    )
+    require_approval: list[str] = Field(default_factory=lambda: ["exec", "write_file", "edit_file"])
     auto_approve: list[str] = Field(default_factory=list)
 
 

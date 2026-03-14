@@ -6,6 +6,7 @@ import os
 import select
 import signal
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -354,6 +355,102 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus, session_manager=session_manager, agent_loop=agent)
 
+    def _parse_iso_datetime(raw: str | None) -> datetime | None:
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _resolve_main_session_key() -> str:
+        """Resolve heartbeat delivery session (shared default preferred)."""
+        default_session = (config.agents.defaults.session or "").strip()
+        if default_session:
+            return default_session
+
+        for item in session_manager.list_sessions():
+            key = item.get("key") or ""
+            if not key or key in {"heartbeat"}:
+                continue
+            if key.startswith(("system:", "cron:")):
+                continue
+            return key
+
+        return "cli:direct"
+
+    def _pick_heartbeat_target_for_session(session_key: str) -> tuple[str, str]:
+        """Pick the best routable channel/chat target for a session key."""
+        enabled = set(channels.enabled_channels)
+        if ":" in session_key:
+            channel, chat_id = session_key.split(":", 1)
+            if channel not in {"cli", "system"} and channel in enabled and chat_id:
+                return channel, chat_id
+        return _pick_heartbeat_target()
+
+    def _append_heartbeat_to_main_session(session_key: str, response: str) -> None:
+        """Persist heartbeat output into main session as assistant text."""
+        session = session_manager.get_or_create(session_key)
+        session.messages.append(
+            {
+                "role": "assistant",
+                "content": response,
+                "timestamp": datetime.now().isoformat(),
+                "source": "heartbeat",
+            }
+        )
+        session.updated_at = datetime.now()
+        session_manager.save(session)
+
+    def _last_user_message_at() -> datetime | None:
+        """Get timestamp of the latest user-authored message across sessions."""
+        latest: datetime | None = None
+        for item in session_manager.list_sessions():
+            key = item.get("key") or ""
+            if not key or key == "heartbeat" or key.startswith(("system:", "cron:")):
+                continue
+
+            session = session_manager.get_or_create(key)
+            for entry in reversed(session.messages):
+                if entry.get("role") != "user":
+                    continue
+                ts = _parse_iso_datetime(entry.get("timestamp"))
+                if ts and (latest is None or ts > latest):
+                    latest = ts
+                break
+
+        return latest
+
+    def _is_inactive_for(seconds: int) -> bool:
+        """Return true when there have been no user messages recently."""
+        if seconds <= 0:
+            return False
+        last_user_at = _last_user_message_at()
+        if last_user_at is None:
+            return True
+        return (datetime.now() - last_user_at).total_seconds() >= seconds
+
+    def _resolve_telegram_owner_chat_id(session_key: str) -> str | None:
+        """Resolve Telegram owner chat_id for optional heartbeat duplication."""
+        telegram_channel = channels.get_channel("telegram")
+        if telegram_channel is None:
+            return None
+
+        session_map = getattr(telegram_channel, "_session_chat_ids", None)
+        if isinstance(session_map, dict):
+            chat_id = session_map.get(session_key)
+            if isinstance(chat_id, str) and chat_id:
+                return chat_id
+
+        allow_from = config.channels.telegram.allow_from
+        if allow_from:
+            owner = allow_from[0].strip()
+            if owner and owner != "*":
+                owner_id = owner.split("|", 1)[0].strip()
+                if owner_id:
+                    return owner_id
+        return None
+
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
@@ -373,7 +470,8 @@ def gateway(
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
-        channel, chat_id = _pick_heartbeat_target()
+        main_session = _resolve_main_session_key()
+        channel, chat_id = _pick_heartbeat_target_for_session(main_session)
 
         async def _silent(*_args, **_kwargs):
             pass
@@ -388,15 +486,38 @@ def gateway(
         )
 
     async def on_heartbeat_notify(response: str) -> None:
-        """Deliver a heartbeat response to the user's channel."""
+        """Save heartbeat output into main session and deliver to channels."""
         from nanobot.bus.events import OutboundMessage
 
-        channel, chat_id = _pick_heartbeat_target()
-        if channel == "cli":
-            return  # No external channel available to deliver to
+        main_session = _resolve_main_session_key()
+        _append_heartbeat_to_main_session(main_session, response)
+
+        channel, chat_id = _pick_heartbeat_target_for_session(main_session)
         await bus.publish_outbound(
-            OutboundMessage(channel=channel, chat_id=chat_id, content=response)
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=response,
+                session_key=main_session,
+                metadata={"source": "heartbeat"},
+            )
         )
+
+        inactive_window = hb_cfg.duplicate_to_telegram_after_inactive_s
+        telegram_chat_id = _resolve_telegram_owner_chat_id(main_session)
+        if (
+            telegram_chat_id
+            and _is_inactive_for(inactive_window)
+            and not (channel == "telegram" and chat_id == telegram_chat_id)
+        ):
+            await bus.publish_outbound(
+                OutboundMessage(
+                    channel="telegram",
+                    chat_id=telegram_chat_id,
+                    content=response,
+                    metadata={"source": "heartbeat", "duplicate": "inactive"},
+                )
+            )
 
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
