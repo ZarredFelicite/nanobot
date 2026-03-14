@@ -247,6 +247,28 @@ def _make_provider(config: Config):
     )
 
 
+def _load_runtime_config(
+    config_path: Path | None = None, workspace: str | None = None, *, announce: bool = False
+) -> Config:
+    """Load config and optionally override the active workspace."""
+    from nanobot.config.loader import load_config, set_config_path
+
+    resolved_config = None
+    if config_path is not None:
+        resolved_config = config_path.expanduser()
+        if not resolved_config.exists():
+            console.print(f"[red]Error: Config file not found: {resolved_config}[/red]")
+            raise typer.Exit(1)
+        set_config_path(resolved_config)
+        if announce:
+            console.print(f"[dim]Using config: {resolved_config}[/dim]")
+
+    config = load_config(resolved_config)
+    if workspace:
+        config.agents.defaults.workspace = workspace
+    return config
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -255,13 +277,14 @@ def _make_provider(config: Config):
 @app.command()
 def gateway(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
-    from nanobot.config.loader import get_data_dir, load_config
+    from nanobot.config.loader import get_data_dir, load_config, set_config_path
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
@@ -272,9 +295,16 @@ def gateway(
 
         logging.basicConfig(level=logging.DEBUG)
 
+    if config_path is not None:
+        config_path = config_path.expanduser()
+        if not config_path.exists():
+            console.print(f"[red]Error: Config file not found: {config_path}[/red]")
+            raise typer.Exit(1)
+        set_config_path(config_path)
+
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
 
-    config = load_config()
+    config = load_config(config_path)
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
@@ -762,6 +792,8 @@ def _run_as_client_interactive(
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(
         True, "--markdown/--no-markdown", help="Render assistant output as Markdown"
     ),
@@ -774,10 +806,10 @@ def agent(
 
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
-    from nanobot.config.loader import get_data_dir, load_config
+    from nanobot.config.loader import get_data_dir
     from nanobot.cron.service import CronService
 
-    config = load_config()
+    config = _load_runtime_config(config_path, workspace, announce=True)
     sync_workspace_templates(config.workspace_path)
 
     # --- Gateway client mode: connect to running gateway if available ---

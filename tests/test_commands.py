@@ -6,6 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.cli.commands import app
+from nanobot.cli.commands import _load_runtime_config
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
@@ -239,3 +240,21 @@ def test_context_command_prefers_persisted_assistant_usage(tmp_path):
     assert int(totals.get("llm_prompt_tokens", 0)) == 1234
     assert int(totals.get("llm_completion_tokens", 0)) == 777
     assert int(totals.get("llm_total_tokens", 0)) == 2011
+
+
+def test_agent_help_lists_config_and_workspace_flags():
+    result = runner.invoke(app, ["agent", "--help"])
+
+    assert result.exit_code == 0
+    assert "--config" in result.stdout
+    assert "--workspace" in result.stdout
+
+
+def test_load_runtime_config_overrides_workspace(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    workspace = tmp_path / "alt-workspace"
+
+    config = _load_runtime_config(config_path, str(workspace))
+
+    assert config.agents.defaults.workspace == str(workspace)

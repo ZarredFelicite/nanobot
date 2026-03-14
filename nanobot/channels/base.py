@@ -67,10 +67,7 @@ class BaseChannel(ABC):
             return False
         if "*" in allow_list:
             return True
-        sender_str = str(sender_id)
-        return sender_str in allow_list or any(
-            p in allow_list for p in sender_str.split("|") if p
-        )
+        return str(sender_id) in allow_list
 
     async def _handle_message(
         self,
@@ -98,7 +95,8 @@ class BaseChannel(ABC):
             logger.warning(
                 "Access denied for sender {} on channel {}. "
                 "Add them to allowFrom list in config to grant access.",
-                sender_id, self.name,
+                sender_id,
+                self.name,
             )
             return
 

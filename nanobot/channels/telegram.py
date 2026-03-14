@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import Any
 
 from loguru import logger
 from telegram import BotCommand, ReplyParameters, Update
@@ -151,6 +152,36 @@ class TelegramChannel(BaseChannel):
     _MIRROR_MAX_LINES = 30  # Trim oldest lines when exceeded
     _MIRROR_MAX_LEN = 4000  # Telegram message length limit
 
+    @staticmethod
+    def _matches_allow_entry(sender_id: str, allow_entry: str) -> bool:
+        """Support Telegram's legacy id|username allowlist matching."""
+        if allow_entry == "*":
+            return True
+
+        sender_str = str(sender_id)
+        if sender_str == allow_entry:
+            return True
+
+        if sender_str.count("|") != 1:
+            return False
+
+        sid, username = sender_str.split("|", 1)
+        if not sid.isdigit() or not username:
+            return False
+
+        return allow_entry in {sid, username}
+
+    def is_allowed(self, sender_id: str) -> bool:
+        """Preserve Telegram's legacy id|username allowlist matching."""
+        if super().is_allowed(sender_id):
+            return True
+
+        allow_list = getattr(self.config, "allow_from", [])
+        if not allow_list or "*" in allow_list:
+            return False
+
+        return any(self._matches_allow_entry(sender_id, entry) for entry in allow_list)
+
     def _on_inbound(self, msg: InboundMessage) -> None:
         """Echo inbound messages from other channels to the Telegram owner."""
         if msg.channel == self.name or not self._app:
@@ -242,19 +273,22 @@ class TelegramChannel(BaseChannel):
 
         # Build the application with larger connection pool to avoid pool-timeout on long runs
         req = HTTPXRequest(
-            connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0
+            connection_pool_size=16,
+            pool_timeout=5.0,
+            connect_timeout=30.0,
+            read_timeout=30.0,
+            proxy=self.config.proxy if self.config.proxy else None,
         )
         builder = (
             Application.builder().token(self.config.token).request(req).get_updates_request(req)
         )
-        if self.config.proxy:
-            builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
+        self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
 
         # Add message handler for text, photos, voice, documents
@@ -430,14 +464,39 @@ class TelegramChannel(BaseChannel):
         sid = str(user.id)
         return f"{sid}|{user.username}" if user.username else sid
 
+    @staticmethod
+    def _derive_topic_session_key(message) -> str | None:
+        """Derive a topic-scoped session key for Telegram forum topics."""
+        message_thread_id = getattr(message, "message_thread_id", None)
+        if getattr(message.chat, "type", None) == "private" or message_thread_id is None:
+            return None
+        return f"telegram:{message.chat_id}:topic:{message_thread_id}"
+
+    @staticmethod
+    def _build_message_metadata(message, user) -> dict[str, Any]:
+        """Build common Telegram metadata for routing and replies."""
+        return {
+            "message_id": message.message_id,
+            "user_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "is_group": message.chat.type != "private",
+            "message_thread_id": getattr(message, "message_thread_id", None),
+            "is_forum": bool(getattr(message.chat, "is_forum", False)),
+        }
+
     async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
             return
+        message = update.message
+        user = update.effective_user
         await self._handle_message(
-            sender_id=self._sender_id(update.effective_user),
-            chat_id=str(update.message.chat_id),
-            content=update.message.text,
+            sender_id=self._sender_id(user),
+            chat_id=str(message.chat_id),
+            content=str(message.text or ""),
+            metadata=self._build_message_metadata(message, user),
+            session_key=self._derive_topic_session_key(message),
         )
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -484,7 +543,9 @@ class TelegramChannel(BaseChannel):
         if media_file and self._app:
             try:
                 file = await self._app.bot.get_file(media_file.file_id)
-                ext = self._get_extension(media_type, getattr(media_file, "mime_type", None))
+                ext = self._get_extension(
+                    media_type or "file", getattr(media_file, "mime_type", None)
+                )
 
                 # Save to workspace/media/
                 from pathlib import Path
@@ -521,6 +582,8 @@ class TelegramChannel(BaseChannel):
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
+        metadata = self._build_message_metadata(message, user)
+        topic_session_key = self._derive_topic_session_key(message)
 
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):
@@ -531,13 +594,8 @@ class TelegramChannel(BaseChannel):
                     "chat_id": str_chat_id,
                     "contents": [],
                     "media": [],
-                    "metadata": {
-                        "message_id": message.message_id,
-                        "user_id": user.id,
-                        "username": user.username,
-                        "first_name": user.first_name,
-                        "is_group": message.chat.type != "private",
-                    },
+                    "metadata": metadata,
+                    "session_key": topic_session_key,
                 }
                 self._start_typing(str_chat_id)
             buf = self._media_group_buffers[key]
@@ -555,8 +613,10 @@ class TelegramChannel(BaseChannel):
         session_key = None
         if self.default_session and self.config.allow_from:
             owner_id = self.config.allow_from[0]
-            if owner_id == "*" or owner_id in sender_id.split("|"):
+            if self._matches_allow_entry(sender_id, owner_id):
                 session_key = self.default_session
+        if topic_session_key:
+            session_key = topic_session_key
 
         # Forward to the message bus
         await self._handle_message(
@@ -564,13 +624,7 @@ class TelegramChannel(BaseChannel):
             chat_id=str_chat_id,
             content=content,
             media=media_paths,
-            metadata={
-                "message_id": message.message_id,
-                "user_id": user.id,
-                "username": user.username,
-                "first_name": user.first_name,
-                "is_group": message.chat.type != "private",
-            },
+            metadata=metadata,
             session_key=session_key,
         )
 
@@ -587,6 +641,7 @@ class TelegramChannel(BaseChannel):
                 content=content,
                 media=list(dict.fromkeys(buf["media"])),
                 metadata=buf["metadata"],
+                session_key=buf.get("session_key"),
             )
         finally:
             self._media_group_tasks.pop(key, None)

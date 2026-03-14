@@ -6,15 +6,27 @@ from pathlib import Path
 from nanobot.config.schema import Config
 
 
+_current_config_path: Path | None = None
+
+
+def set_config_path(path: Path) -> None:
+    """Set the active config path for multi-instance runs."""
+    global _current_config_path
+    _current_config_path = Path(path).expanduser()
+
+
 def get_config_path() -> Path:
-    """Get the default configuration file path."""
+    """Get the configuration file path."""
+    if _current_config_path is not None:
+        return _current_config_path
     return Path.home() / ".nanobot" / "config.json"
 
 
 def get_data_dir() -> Path:
-    """Get the nanobot data directory."""
-    from nanobot.utils.helpers import get_data_path
-    return get_data_path()
+    """Get the nanobot data directory derived from the active config path."""
+    data_dir = get_config_path().parent
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -28,6 +40,7 @@ def load_config(config_path: Path | None = None) -> Config:
         Loaded configuration object.
     """
     path = config_path or get_config_path()
+    set_config_path(path)
 
     if path.exists():
         try:
@@ -51,6 +64,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         config_path: Optional path to save to. Uses default if not provided.
     """
     path = config_path or get_config_path()
+    set_config_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = config.model_dump(by_alias=True)
