@@ -33,6 +33,19 @@ pkgs.mkShell {
       touch .venv/.synced
     fi
 
+    # TUI: install and build if needed
+    if [ -d tui ]; then
+      if [ tui/package.json -nt tui/node_modules/.synced ] 2>/dev/null || [ ! -f tui/node_modules/.synced ]; then
+        echo "Installing TUI dependencies..."
+        (cd tui && npm install --prefer-offline && touch node_modules/.synced)
+      fi
+      if [ ! -d tui/dist ] || [ -n "$(find tui/src -newer tui/dist/main.js 2>/dev/null)" ]; then
+        echo "Building TUI..."
+        (cd tui && npx tsc)
+      fi
+      export PATH="$PWD/tui/node_modules/.bin:$PATH"
+    fi
+
     echo "nanobot dev environment ready (Python $(python --version 2>&1 | cut -d' ' -f2))"
   '';
 }

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Wrapper script for nanobot-tui — works on NixOS without global installs.
+# Ensures deps are installed and source is compiled, then runs the TUI.
+
+set -euo pipefail
+
+TUI_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Install deps if missing or stale
+if [ ! -d "$TUI_DIR/node_modules" ] || \
+   [ "$TUI_DIR/package.json" -nt "$TUI_DIR/node_modules/.synced" ] 2>/dev/null || \
+   [ ! -f "$TUI_DIR/node_modules/.synced" ]; then
+  echo "Installing dependencies..." >&2
+  (cd "$TUI_DIR" && npm install --prefer-offline 2>&1 | tail -1 >&2 && touch node_modules/.synced)
+fi
+
+# Build if dist is missing or source is newer
+if [ ! -f "$TUI_DIR/dist/main.js" ] || \
+   [ -n "$(find "$TUI_DIR/src" -newer "$TUI_DIR/dist/main.js" 2>/dev/null)" ]; then
+  echo "Building..." >&2
+  (cd "$TUI_DIR" && npx tsc >&2)
+fi
+
+exec node "$TUI_DIR/dist/main.js" "$@"
