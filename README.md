@@ -18,6 +18,20 @@
 
 📏 Real-time line count: **3,935 lines** (run `bash core_agent_lines.sh` to verify anytime)
 
+## Fork Highlights
+
+This repository is a personal fork of upstream `HKUDS/nanobot` with a stronger focus on long-running coding workflows, shared sessions, and single-user agent operations.
+
+Compared with upstream, the biggest differences are:
+
+- `subconscious` memory: the fork adds a structured markdown memory layer on top of upstream's `MEMORY.md`/`HISTORY.md` flow. Conversation turns are buffered in the background, durable facts are extracted into hierarchical notes, `qmd` is used for semantic retrieval, explicit recall is exposed through `memory_search`, and relevant memories can be classifier-gated and auto-injected into the current user turn without destabilizing the system prompt
+- shared-session UX: CLI can attach to a running gateway over a Unix socket, and sessions can mirror across channels
+- OpenCode integration: HTTP+SSE backend for the OpenCode TUI, with session APIs, streaming, permissions, revert/unrevert, and compaction hooks
+- coding-agent workflow upgrades: Pi subagent delegation, richer context/token tracking, and more aggressive session compaction behavior
+- opinionated personal-routing behavior: stronger Telegram owner/session routing and config-path-based multi-instance state handling
+
+See `FORK_DIFFERENCES.md` for a detailed fork-vs-upstream comparison.
+
 ## 📢 News
 
 - **2026-02-28** 🚀 Released **v0.1.4.post3** — cleaner context, hardened session history, and smarter agent. Please see [release notes](https://github.com/HKUDS/nanobot/releases/tag/v0.1.4.post3) for details.
