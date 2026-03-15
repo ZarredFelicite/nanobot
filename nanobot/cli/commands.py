@@ -24,6 +24,10 @@ from rich.text import Text
 
 from nanobot import __logo__, __version__
 from nanobot.config.schema import Config
+from nanobot.utils.model_probe import DEFAULT_EXACT_TEXT
+from nanobot.utils.model_probe import DEFAULT_TEST_TIMEOUT_S
+from nanobot.utils.model_probe import collect_configured_models
+from nanobot.utils.model_probe import probe_configured_models
 from nanobot.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
@@ -290,6 +294,13 @@ def _load_runtime_config(
     if workspace:
         config.agents.defaults.workspace = workspace
     return config
+
+
+def _format_duration(seconds: float | None) -> str:
+    """Render a duration consistently for tables."""
+    if seconds is None:
+        return "-"
+    return f"{seconds:.2f}s"
 
 
 # ============================================================================
@@ -1101,6 +1112,95 @@ def agent(
 # ============================================================================
 # Channel Commands
 # ============================================================================
+
+
+models_app = typer.Typer(help="List and probe configured models")
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("list")
+def models_list(
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """List the configured models nanobot knows about."""
+    config = _load_runtime_config(config_path)
+    models = collect_configured_models(config)
+
+    if not models:
+        console.print("No configured models found.")
+        raise typer.Exit(1)
+
+    table = Table(title="Configured Models")
+    table.add_column("Model", style="cyan")
+    table.add_column("Sources", style="green")
+    table.add_column("Provider")
+    table.add_column("Auth")
+
+    for entry in models:
+        table.add_row(
+            entry.model,
+            ", ".join(entry.sources),
+            entry.provider_name or "-",
+            entry.auth_mode,
+        )
+
+    console.print(table)
+
+
+@models_app.command("test")
+def models_test(
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    text: str = typer.Option(
+        DEFAULT_EXACT_TEXT, "--text", help="Exact text every model must return"
+    ),
+    timeout_s: float = typer.Option(
+        DEFAULT_TEST_TIMEOUT_S, "--timeout", help="Per-model timeout in seconds"
+    ),
+):
+    """Probe each configured model for latency and exact-text accuracy."""
+    config = _load_runtime_config(config_path)
+    models = collect_configured_models(config)
+
+    if not models:
+        console.print("No configured models found.")
+        raise typer.Exit(1)
+
+    console.print(f"Testing {len(models)} configured model(s) with exact text: [cyan]{text}[/cyan]")
+    results = asyncio.run(probe_configured_models(config, exact_text=text, timeout_s=timeout_s))
+
+    table = Table(title="Model Probe Results")
+    table.add_column("Model", style="cyan")
+    table.add_column("Provider")
+    table.add_column("TTFT", justify="right")
+    table.add_column("Total", justify="right")
+    table.add_column("Exact", justify="center")
+    table.add_column("Details", overflow="fold")
+
+    failures = 0
+    for result in results:
+        if result.error:
+            failures += 1
+        details = result.error or result.actual_text or "-"
+        if len(details) > 80:
+            details = details[:77] + "..."
+        table.add_row(
+            result.model,
+            result.provider_name or "-",
+            _format_duration(result.ttft_s),
+            _format_duration(result.total_s),
+            "yes" if result.exact_match else "no",
+            details,
+        )
+
+    console.print(table)
+
+    passed = sum(1 for result in results if result.exact_match and not result.error)
+    console.print(
+        f"Passed: [green]{passed}[/green]  Failed: [{'red' if failures else 'green'}]{failures}[/{'red' if failures else 'green'}]"
+    )
+
+    if failures:
+        raise typer.Exit(1)
 
 
 channels_app = typer.Typer(help="Manage channels")
