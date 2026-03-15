@@ -1,0 +1,45 @@
+import type { MessageWithParts, SessionInfo, SessionStatus } from '$lib/types';
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...init?.headers
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+
+  return (await response.json()) as T;
+}
+
+export function listSessions(): Promise<SessionInfo[]> {
+  return request('/session');
+}
+
+export function createSession(title?: string): Promise<SessionInfo> {
+  return request('/session', {
+    method: 'POST',
+    body: JSON.stringify(title ? { title } : {})
+  });
+}
+
+export function getMessages(sessionId: string): Promise<MessageWithParts[]> {
+  return request(`/session/${encodeURIComponent(sessionId)}/message`);
+}
+
+export function sendMessage(sessionId: string, text: string): Promise<unknown> {
+  return request(`/session/${encodeURIComponent(sessionId)}/message`, {
+    method: 'POST',
+    body: JSON.stringify({
+      parts: [{ type: 'text', text }]
+    })
+  });
+}
+
+export function getStatuses(): Promise<SessionStatus[]> {
+  return request('/session/status');
+}
