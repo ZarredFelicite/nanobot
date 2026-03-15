@@ -18,7 +18,7 @@
   let creating = $state(false);
   let sending = $state(false);
   let error = $state('');
-  let sidebarOpen = $state(true);
+  let sidebarOpen = $state(typeof window !== 'undefined' ? window.innerWidth > 768 : true);
   let showScrollButton = $state(false);
   let availableModels = $state<{ provider: string; model: string; label: string }[]>([]);
   let selectedModel = $state('');
@@ -434,6 +434,7 @@
     display: grid;
     grid-template-columns: 280px 1fr;
     height: 100vh;
+    height: 100dvh;
     transition: grid-template-columns 200ms ease;
   }
 
@@ -483,6 +484,7 @@
     grid-template-rows: auto auto 1fr auto;
     min-height: 0;
     height: 100vh;
+    height: 100dvh;
   }
 
   .chat-header {
@@ -710,6 +712,24 @@
 
     .sidebar-toggle {
       z-index: 31;
+    }
+
+    .chat-header {
+      padding: 0.65rem 0.75rem;
+    }
+
+    .chat-log {
+      padding: 0.65rem 0.5rem;
+    }
+
+    .composer-panel {
+      padding: 0.5rem 0.5rem;
+      /* extra bottom padding for mobile browser toolbar */
+      padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px));
+    }
+
+    h2 {
+      font-size: 0.95rem;
     }
   }
 </style>
