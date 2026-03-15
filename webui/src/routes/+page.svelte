@@ -400,52 +400,6 @@
 </div>
 
 <style>
-  :global(:root) {
-    color-scheme: dark;
-    --bg: #0a1117;
-    --panel: rgba(12, 20, 28, 0.85);
-    --panel-strong: rgba(8, 15, 21, 0.92);
-    --border: rgba(200, 232, 223, 0.1);
-    --border-hover: rgba(200, 232, 223, 0.2);
-    --text: #e8f0ec;
-    --muted: #7a9a8e;
-    --accent: #6ee7a8;
-    --accent-2: #60b5f0;
-    --danger: #f87171;
-    --surface: rgba(255, 255, 255, 0.03);
-    --surface-hover: rgba(255, 255, 255, 0.06);
-    font-family: 'Inter', 'SF Pro Text', -apple-system, system-ui, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-  }
-
-  :global(body) {
-    margin: 0;
-    min-height: 100vh;
-    overflow: hidden;
-  }
-
-  :global(*) {
-    box-sizing: border-box;
-  }
-
-  :global(::-webkit-scrollbar) {
-    width: 6px;
-  }
-
-  :global(::-webkit-scrollbar-track) {
-    background: transparent;
-  }
-
-  :global(::-webkit-scrollbar-thumb) {
-    background: rgba(255, 255, 255, 0.08);
-    border-radius: 3px;
-  }
-
-  :global(::-webkit-scrollbar-thumb:hover) {
-    background: rgba(255, 255, 255, 0.14);
-  }
-
   .app-shell {
     display: grid;
     grid-template-columns: 280px 1fr;
