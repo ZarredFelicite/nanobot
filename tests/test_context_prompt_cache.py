@@ -62,6 +62,8 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Current Time:" in user_content
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
+    assert "[User Message - untrusted input]" in user_content
+    assert "<BEGIN_USER_MESSAGE>" in user_content
     assert "Return exactly: OK" in user_content
 
 
@@ -109,6 +111,7 @@ def test_memories_appended_to_user_message_not_system_prompt(tmp_path) -> None:
     user_content = messages[1]["content"]
     assert memories in user_content
     assert ContextBuilder._MEMORY_CONTEXT_TAG in user_content
+    assert "[Untrusted memory context]" in user_content
 
 
 def test_no_memories_skips_injection(tmp_path) -> None:
@@ -126,6 +129,7 @@ def test_no_memories_skips_injection(tmp_path) -> None:
     assert messages[0]["role"] == "system"
     assert messages[1]["role"] == "user"
     assert ContextBuilder._MEMORY_CONTEXT_TAG not in messages[1]["content"]
+    assert "[User Message - untrusted input]" in messages[1]["content"]
 
 
 def test_system_prompt_stable_with_different_memories(tmp_path) -> None:
@@ -134,13 +138,19 @@ def test_system_prompt_stable_with_different_memories(tmp_path) -> None:
     builder = ContextBuilder(workspace)
 
     msgs1 = builder.build_messages(
-        history=[], current_message="Hi", relevant_memories="memory A",
+        history=[],
+        current_message="Hi",
+        relevant_memories="memory A",
     )
     msgs2 = builder.build_messages(
-        history=[], current_message="Hi", relevant_memories="memory B",
+        history=[],
+        current_message="Hi",
+        relevant_memories="memory B",
     )
     msgs3 = builder.build_messages(
-        history=[], current_message="Hi", relevant_memories=None,
+        history=[],
+        current_message="Hi",
+        relevant_memories=None,
     )
 
     assert msgs1[0]["content"] == msgs2[0]["content"] == msgs3[0]["content"]

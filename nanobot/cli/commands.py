@@ -5,7 +5,9 @@ import json
 import os
 import select
 import signal
+import shutil
 import sys
+from urllib import error, request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -22,6 +24,10 @@ from rich.text import Text
 
 from nanobot import __logo__, __version__
 from nanobot.config.schema import Config
+from nanobot.utils.model_probe import DEFAULT_EXACT_TEXT
+from nanobot.utils.model_probe import DEFAULT_TEST_TIMEOUT_S
+from nanobot.utils.model_probe import collect_configured_models
+from nanobot.utils.model_probe import probe_configured_models
 from nanobot.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
@@ -116,6 +122,27 @@ def _print_agent_response(response: str, render_markdown: bool) -> None:
 def _is_exit_command(command: str) -> bool:
     """Return True when input should end interactive chat."""
     return command.lower() in EXIT_COMMANDS
+
+
+def _resolve_external_tui_binary() -> str | None:
+    """Prefer the repo-local TUI script, then fall back to PATH."""
+    repo_tui = Path(__file__).resolve().parents[2] / "tui" / "nanobot-tui"
+    if repo_tui.is_file():
+        return str(repo_tui)
+    return shutil.which("nanobot-tui")
+
+
+def _launch_external_tui(port: int) -> None:
+    """Replace the current process with the external nanobot TUI."""
+    tui_binary = _resolve_external_tui_binary()
+    if not tui_binary:
+        console.print("[red]Could not find `nanobot-tui`.[/red]")
+        console.print(
+            'Expected either `tui/nanobot-tui` in this repo or `nanobot-tui` on PATH; use `nanobot agent -m "..."` for direct mode.'
+        )
+        raise typer.Exit(1)
+
+    os.execvp(tui_binary, [tui_binary, "--port", str(port)])
 
 
 async def _read_interactive_input_async() -> str:
@@ -269,6 +296,13 @@ def _load_runtime_config(
     return config
 
 
+def _format_duration(seconds: float | None) -> str:
+    """Render a duration consistently for tables."""
+    if seconds is None:
+        return "-"
+    return f"{seconds:.2f}s"
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -384,6 +418,21 @@ def gateway(
 
     # Create channel manager
     channels = ChannelManager(config, bus, session_manager=session_manager, agent_loop=agent)
+
+    def _reload_runtime_config() -> dict[str, object]:
+        reloaded = load_config(config_path)
+        new_provider = _make_provider(reloaded)
+        agent.apply_runtime_config(reloaded, new_provider)
+        channels.apply_runtime_config(reloaded)
+        resolved_path = config_path if config_path is not None else get_data_dir() / "config.json"
+        return {
+            "configPath": str(resolved_path),
+            "model": reloaded.agents.defaults.model,
+        }
+
+    opencode_channel = channels.channels.get("opencode")
+    if opencode_channel is not None and hasattr(opencode_channel, "reload_callback"):
+        opencode_channel.reload_callback = _reload_runtime_config
 
     def _parse_iso_datetime(raw: str | None) -> datetime | None:
         if not raw:
@@ -789,6 +838,36 @@ def _run_as_client_interactive(
 
 
 @app.command()
+def reload_config(
+    host: str = typer.Option("127.0.0.1", "--host", help="Gateway host"),
+    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+):
+    """Ask a running gateway to reload config from disk."""
+    req = request.Request(f"http://{host}:{port}/config/reload", method="POST")
+    try:
+        with request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        console.print(f"[red]Gateway rejected reload request ({exc.code}).[/red]")
+        if body:
+            console.print(body)
+        raise typer.Exit(1) from exc
+    except OSError as exc:
+        console.print(f"[red]Could not reach gateway at {host}:{port}.[/red]")
+        console.print(str(exc))
+        raise typer.Exit(1) from exc
+
+    if not payload.get("ok"):
+        console.print(f"[red]Reload failed:[/red] {payload.get('error', 'unknown error')}")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Reloaded config.[/green] Default model: [cyan]{payload.get('model', '')}[/cyan]"
+    )
+
+
+@app.command()
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
@@ -811,6 +890,9 @@ def agent(
 
     config = _load_runtime_config(config_path, workspace, announce=True)
     sync_workspace_templates(config.workspace_path)
+
+    if not message:
+        _launch_external_tui(config.channels.opencode.port)
 
     # --- Gateway client mode: connect to running gateway if available ---
     socket_path = Path(config.channels.cli_socket.socket_path).expanduser()
@@ -1030,6 +1112,95 @@ def agent(
 # ============================================================================
 # Channel Commands
 # ============================================================================
+
+
+models_app = typer.Typer(help="List and probe configured models")
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("list")
+def models_list(
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """List the configured models nanobot knows about."""
+    config = _load_runtime_config(config_path)
+    models = collect_configured_models(config)
+
+    if not models:
+        console.print("No configured models found.")
+        raise typer.Exit(1)
+
+    table = Table(title="Configured Models")
+    table.add_column("Model", style="cyan")
+    table.add_column("Sources", style="green")
+    table.add_column("Provider")
+    table.add_column("Auth")
+
+    for entry in models:
+        table.add_row(
+            entry.model,
+            ", ".join(entry.sources),
+            entry.provider_name or "-",
+            entry.auth_mode,
+        )
+
+    console.print(table)
+
+
+@models_app.command("test")
+def models_test(
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    text: str = typer.Option(
+        DEFAULT_EXACT_TEXT, "--text", help="Exact text every model must return"
+    ),
+    timeout_s: float = typer.Option(
+        DEFAULT_TEST_TIMEOUT_S, "--timeout", help="Per-model timeout in seconds"
+    ),
+):
+    """Probe each configured model for latency and exact-text accuracy."""
+    config = _load_runtime_config(config_path)
+    models = collect_configured_models(config)
+
+    if not models:
+        console.print("No configured models found.")
+        raise typer.Exit(1)
+
+    console.print(f"Testing {len(models)} configured model(s) with exact text: [cyan]{text}[/cyan]")
+    results = asyncio.run(probe_configured_models(config, exact_text=text, timeout_s=timeout_s))
+
+    table = Table(title="Model Probe Results")
+    table.add_column("Model", style="cyan")
+    table.add_column("Provider")
+    table.add_column("TTFT", justify="right")
+    table.add_column("Total", justify="right")
+    table.add_column("Exact", justify="center")
+    table.add_column("Details", overflow="fold")
+
+    failures = 0
+    for result in results:
+        if result.error:
+            failures += 1
+        details = result.error or result.actual_text or "-"
+        if len(details) > 80:
+            details = details[:77] + "..."
+        table.add_row(
+            result.model,
+            result.provider_name or "-",
+            _format_duration(result.ttft_s),
+            _format_duration(result.total_s),
+            "yes" if result.exact_match else "no",
+            details,
+        )
+
+    console.print(table)
+
+    passed = sum(1 for result in results if result.exact_match and not result.error)
+    console.print(
+        f"Passed: [green]{passed}[/green]  Failed: [{'red' if failures else 'green'}]{failures}[/{'red' if failures else 'green'}]"
+    )
+
+    if failures:
+        raise typer.Exit(1)
 
 
 channels_app = typer.Typer(help="Manage channels")

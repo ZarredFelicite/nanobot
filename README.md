@@ -28,6 +28,7 @@ Compared with upstream, the biggest differences are:
 - shared-session UX: CLI can attach to a running gateway over a Unix socket, and sessions can mirror across channels
 - OpenCode integration: HTTP+SSE backend for the OpenCode TUI, with session APIs, streaming, permissions, revert/unrevert, and compaction hooks
 - coding-agent workflow upgrades: Pi subagent delegation, richer context/token tracking, and more aggressive session compaction behavior
+- OWASP-style prompt-injection hardening: explicit user/untrusted-content boundaries, remote-content sanitization for web/email/memory flows, and final-output leakage blocking
 - opinionated personal-routing behavior: stronger Telegram owner/session routing and config-path-based multi-instance state handling
 
 See `FORK_DIFFERENCES.md` for a detailed fork-vs-upstream comparison.
@@ -85,6 +86,14 @@ See `FORK_DIFFERENCES.md` for a detailed fork-vs-upstream comparison.
 </p>
 
 ## ✨ Features
+
+### Security Hardening in This Fork
+
+- Prompt assembly separates system instructions from user data and recalled memory
+- Web search/fetch, memory recall, and inbound email content are reintroduced as untrusted blocks instead of raw instructions
+- Remote-content sanitization filters common prompt-injection patterns, encoded payloads, typoglycemia variants, scratchpad/tool-forging text, and HTML exfil markers
+- Final model responses are screened for system-prompt leakage and obvious secret disclosure
+- OWASP-style regression tests cover direct, encoded, typoglycemia, spacing/casing, HTML, and scratchpad injection examples
 
 <table align="center">
   <tr align="center">
@@ -175,6 +184,12 @@ nanobot agent
 ```
 
 That's it! You have a working AI assistant in 2 minutes.
+
+## Security Notes
+
+- Restrict channel `allowFrom` lists before exposing nanobot outside a trusted personal setup
+- Treat web pages, emails, issue text, and retrieved memory as untrusted content even when they look benign
+- Review `SECURITY.md` for deployment guidance, tool-risk guidance, and current prompt-injection defenses
 
 ## 💬 Chat Apps
 

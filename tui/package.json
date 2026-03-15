@@ -1,0 +1,26 @@
+{
+  "name": "nanobot-tui",
+  "version": "0.1.0",
+  "description": "Pi-TUI frontend for nanobot",
+  "type": "module",
+  "main": "dist/main.js",
+  "bin": {
+    "nanobot-tui": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "dev": "tsc && node dist/main.js"
+  },
+  "dependencies": {
+    "@mariozechner/pi-tui": "^0.58.0",
+    "eventsource": "^3.0.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

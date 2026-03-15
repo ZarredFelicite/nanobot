@@ -25,9 +25,11 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider, ToolCallRequest
+from nanobot.security.prompt_injection import validate_model_output
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
+    from nanobot.config.schema import Config
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, SubconsciousConfig
     from nanobot.cron.service import CronService
 
@@ -165,6 +167,7 @@ class AgentLoop:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
+                untrusted_programs=self.exec_config.untrusted_programs,
             )
         )
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
@@ -634,7 +637,14 @@ class AgentLoop:
                     )
             else:
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
+                validation = validate_model_output(clean)
+                if not validation.safe:
+                    logger.warning(
+                        "Blocked suspicious model output due to: {}",
+                        ", ".join(validation.findings),
+                    )
+                    clean = validation.replacement
+                # Don't persist error responses to session history - they can
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
@@ -685,6 +695,37 @@ class AgentLoop:
                     if t in self._active_tasks.get(k, [])
                     else None
                 )
+
+    def apply_runtime_config(self, config: "Config", provider: LLMProvider) -> None:
+        """Apply a freshly loaded runtime config without restarting sessions."""
+        self.channels_config = config.channels
+        self.provider = provider
+        self.model = config.agents.defaults.model
+        self.max_iterations = config.agents.defaults.max_tool_iterations
+        self.temperature = config.agents.defaults.temperature
+        self.max_tokens = config.agents.defaults.max_tokens
+        self.memory_window = config.agents.defaults.memory_window
+        self.context_tokens = max(4096, config.agents.defaults.context_tokens)
+        self.reserve_tokens_floor = max(0, config.agents.defaults.reserve_tokens_floor)
+        self.reasoning_effort = config.agents.defaults.reasoning_effort
+        self.brave_api_key = config.tools.web.search.api_key or None
+        self.web_proxy = config.tools.web.proxy or None
+        self.exec_config = config.tools.exec
+        self.restrict_to_workspace = config.tools.restrict_to_workspace
+        self._mcp_servers = config.tools.mcp_servers
+
+        self.subagents.provider = provider
+        self.subagents.model = self.model
+        self.subagents.temperature = self.temperature
+        self.subagents.max_tokens = self.max_tokens
+        self.subagents.reasoning_effort = self.reasoning_effort
+        self.subagents.brave_api_key = self.brave_api_key
+        self.subagents.web_proxy = self.web_proxy
+        self.subagents.exec_config = self.exec_config
+        self.subagents.restrict_to_workspace = self.restrict_to_workspace
+
+        if self._subconscious:
+            self._subconscious.set_provider(provider)
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
