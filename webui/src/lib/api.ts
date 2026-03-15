@@ -1,4 +1,4 @@
-import type { MessageWithParts, SessionInfo, SessionStatus } from '$lib/types';
+import type { MessageWithParts, ProviderInfo, SessionInfo, SessionStatus } from '$lib/types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -31,15 +31,23 @@ export function getMessages(sessionId: string): Promise<MessageWithParts[]> {
   return request(`/session/${encodeURIComponent(sessionId)}/message`);
 }
 
-export function sendMessage(sessionId: string, text: string): Promise<unknown> {
+export function sendMessage(sessionId: string, text: string, model?: string): Promise<unknown> {
+  const body: Record<string, unknown> = {
+    parts: [{ type: 'text', text }]
+  };
+  if (model) {
+    body.model = model;
+  }
   return request(`/session/${encodeURIComponent(sessionId)}/message`, {
     method: 'POST',
-    body: JSON.stringify({
-      parts: [{ type: 'text', text }]
-    })
+    body: JSON.stringify(body)
   });
 }
 
 export function getStatuses(): Promise<SessionStatus[]> {
   return request('/session/status');
+}
+
+export function getProviders(): Promise<ProviderInfo[]> {
+  return request('/provider');
 }

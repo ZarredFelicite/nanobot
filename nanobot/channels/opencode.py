@@ -194,6 +194,8 @@ class OpenCodeChannel(BaseChannel):
         self.permission_config = permission_config
         self.reload_callback = reload_callback
         self.port = config.port
+        self.web_ui_enabled = config.web_ui_enabled
+        self.web_ui_path = config.web_ui_path
 
         self._sse_clients: list[web.StreamResponse] = []
         self._id_counter = 0  # Only used by _next_id (kept for potential future use)
@@ -414,9 +416,9 @@ class OpenCodeChannel(BaseChannel):
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, "127.0.0.1", self.port)
+        site = web.TCPSite(self._runner, "0.0.0.0", self.port)
         await site.start()
-        logger.info("OpenCode API listening on http://127.0.0.1:{}", self.port)
+        logger.info("OpenCode API listening on http://0.0.0.0:{}", self.port)
 
         # Keep alive
         while self._running:
@@ -509,6 +511,56 @@ class OpenCodeChannel(BaseChannel):
         app.router.add_post("/log", self._handle_stub_ok)
         app.router.add_post("/instance/dispose", self._handle_stub_ok)
         app.router.add_post("/global/dispose", self._handle_stub_ok)
+
+        # Browser UI (added last so API routes win)
+        app.router.add_get("/", self._handle_web_ui)
+        app.router.add_get(r"/{path:.*}", self._handle_web_ui)
+
+    def _web_ui_root(self) -> Path | None:
+        if not self.web_ui_enabled:
+            return None
+
+        if self.web_ui_path.strip():
+            candidate = Path(self.web_ui_path).expanduser()
+        else:
+            candidate = Path(__file__).resolve().parents[2] / "webui" / "build"
+
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+
+        return None
+
+    async def _handle_web_ui(self, request: web.Request) -> web.StreamResponse:
+        web_root = self._web_ui_root()
+        if web_root is None:
+            return web.Response(
+                text=(
+                    "<html><body><h1>nanobot web UI not built</h1>"
+                    "<p>Run <code>npm install</code> and <code>npm run build</code> in "
+                    "<code>webui/</code>, then restart the gateway.</p></body></html>"
+                ),
+                content_type="text/html",
+            )
+
+        raw_path = request.match_info.get("path", "") or "index.html"
+        relative = Path(raw_path)
+        target = (web_root / relative).resolve()
+
+        try:
+            target.relative_to(web_root.resolve())
+        except ValueError:
+            raise web.HTTPForbidden()
+
+        if target.is_dir():
+            target = target / "index.html"
+
+        if target.exists() and target.is_file():
+            return web.FileResponse(target)
+
+        if not target.suffix:
+            return web.FileResponse(web_root / "index.html")
+
+        raise web.HTTPNotFound()
 
     # ------------------------------------------------------------------
     # Bootstrap endpoints

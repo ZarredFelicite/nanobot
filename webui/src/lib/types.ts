@@ -90,6 +90,18 @@ export interface SessionStatus {
   };
 }
 
+export interface ModelInfo {
+  id: string;
+  providerID: string;
+  name: string;
+}
+
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  models: Record<string, ModelInfo>;
+}
+
 export interface ApiError {
   error: string;
 }

@@ -5,8 +5,8 @@
   import Composer from '$lib/components/Composer.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import SessionSidebar from '$lib/components/SessionSidebar.svelte';
-  import { createSession, getMessages, getStatuses, listSessions, sendMessage } from '$lib/api';
-  import type { MessageInfo, MessagePart, MessageWithParts, SessionInfo, SessionStatus, SseEvent } from '$lib/types';
+  import { createSession, getMessages, getProviders, getStatuses, listSessions, sendMessage } from '$lib/api';
+  import type { MessageInfo, MessagePart, MessageWithParts, ProviderInfo, SessionInfo, SessionStatus, SseEvent } from '$lib/types';
 
   let sessions = $state<SessionInfo[]>([]);
   let statuses = $state<Record<string, SessionStatus['status']>>({});
@@ -20,6 +20,8 @@
   let error = $state('');
   let sidebarOpen = $state(true);
   let showScrollButton = $state(false);
+  let availableModels = $state<{ provider: string; model: string; label: string }[]>([]);
+  let selectedModel = $state('');
 
   let stream: EventSource | null = null;
   let chatLogEl: HTMLElement | undefined = $state();
@@ -48,11 +50,31 @@
       sessionsLoading = true;
       error = '';
 
-      const [sessionList, statusList] = await Promise.all([listSessions(), getStatuses()]);
+      const [sessionList, statusList, providerList] = await Promise.all([
+        listSessions(),
+        getStatuses(),
+        getProviders(),
+      ]);
       sessions = sortSessions(sessionList);
       statuses = Object.fromEntries(
         statusList.map((item: SessionStatus) => [item.sessionID, item.status])
       );
+
+      // Build flat model list from providers
+      const models: { provider: string; model: string; label: string }[] = [];
+      for (const provider of providerList) {
+        for (const modelId of Object.keys(provider.models)) {
+          models.push({
+            provider: provider.id,
+            model: modelId,
+            label: `${provider.id}/${modelId}`,
+          });
+        }
+      }
+      availableModels = models;
+      if (models.length > 0 && !selectedModel) {
+        selectedModel = models[0].label;
+      }
 
       const requested = page.url.searchParams.get('session');
       const target = requested && sessions.some((session) => session.id === requested)
@@ -136,7 +158,7 @@
       sending = true;
       error = '';
       draft = '';
-      await sendMessage(selectedSessionId, text);
+      await sendMessage(selectedSessionId, text, selectedModel || undefined);
       await tick();
       scrollToBottom();
     } catch (err) {
@@ -393,7 +415,15 @@
       </div>
 
       <div class="composer-panel">
-        <Composer value={draft} disabled={!selectedSessionId || sending} onInput={updateDraft} onSend={handleSend} />
+        <Composer
+          value={draft}
+          disabled={!selectedSessionId || sending}
+          models={availableModels}
+          {selectedModel}
+          onInput={updateDraft}
+          onSend={handleSend}
+          onModelChange={(m) => selectedModel = m}
+        />
       </div>
     {/if}
   </main>

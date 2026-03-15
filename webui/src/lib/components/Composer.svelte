@@ -1,12 +1,17 @@
 <script lang="ts">
+  import type { ProviderInfo } from '$lib/types';
+
   interface Props {
     value: string;
     disabled: boolean;
+    models: { provider: string; model: string; label: string }[];
+    selectedModel: string;
     onInput: (value: string) => void;
     onSend: () => void;
+    onModelChange: (model: string) => void;
   }
 
-  let { value, disabled, onInput, onSend }: Props = $props();
+  let { value, disabled, models, selectedModel, onInput, onSend, onModelChange }: Props = $props();
   let textareaEl: HTMLTextAreaElement | undefined = $state();
 
   function handleKeydown(event: KeyboardEvent): void {
@@ -34,24 +39,80 @@
   });
 </script>
 
-<div class="composer">
-  <textarea
-    bind:this={textareaEl}
-    rows="1"
-    placeholder="Message nanobot..."
-    {value}
-    oninput={handleInput}
-    onkeydown={handleKeydown}
-    {disabled}
-  ></textarea>
-  <button onclick={onSend} disabled={disabled || !value.trim()} aria-label="Send message">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
-    </svg>
-  </button>
+<div class="composer-wrap">
+  <div class="model-bar">
+    <select
+      class="model-select"
+      value={selectedModel}
+      onchange={(e) => onModelChange((e.currentTarget as HTMLSelectElement).value)}
+    >
+      {#each models as m (m.label)}
+        <option value={m.label}>{m.label}</option>
+      {/each}
+    </select>
+  </div>
+  <div class="composer">
+    <textarea
+      bind:this={textareaEl}
+      rows="1"
+      placeholder="Message nanobot..."
+      {value}
+      oninput={handleInput}
+      onkeydown={handleKeydown}
+      {disabled}
+    ></textarea>
+    <button onclick={onSend} disabled={disabled || !value.trim()} aria-label="Send message">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
+      </svg>
+    </button>
+  </div>
 </div>
 
 <style>
+  .composer-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .model-bar {
+    display: flex;
+    align-items: center;
+  }
+
+  .model-select {
+    appearance: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 0.4rem;
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.72rem;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+    outline: none;
+    max-width: 100%;
+    transition: color 150ms, border-color 150ms;
+    /* custom arrow */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%237a9a8e' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.4rem center;
+    padding-right: 1.4rem;
+  }
+
+  .model-select:hover,
+  .model-select:focus {
+    color: var(--text);
+    border-color: var(--border-hover);
+  }
+
+  .model-select option {
+    background: #0c141c;
+    color: var(--text);
+  }
+
   .composer {
     display: flex;
     align-items: flex-end;

@@ -8,6 +8,7 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [sveltekit()],
     server: {
+      host: '0.0.0.0',
       port: 4173,
       proxy: {
         '^/(config|provider|agent|event|global|session|command|skill|lsp|mcp|experimental|formatter|vcs|path|find|file|permission|question|log|instance)(/.*)?$': {
