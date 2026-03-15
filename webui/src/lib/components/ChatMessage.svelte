@@ -139,7 +139,6 @@
   .msg {
     max-width: 100%;
     min-width: 0;
-    overflow-x: hidden;
   }
 
   .msg.user {

@@ -435,9 +435,6 @@
     grid-template-columns: 280px 1fr;
     height: 100vh;
     height: 100dvh;
-    width: 100%;
-    max-width: 100vw;
-    overflow: hidden;
     transition: grid-template-columns 200ms ease;
   }
 
@@ -489,7 +486,6 @@
     min-width: 0;
     height: 100vh;
     height: 100dvh;
-    overflow: hidden;
   }
 
   .chat-header {
@@ -595,11 +591,13 @@
   .chat-window-wrapper {
     position: relative;
     min-height: 0;
+    min-width: 0;
     overflow: hidden;
   }
 
   .chat-log {
     height: 100%;
+    min-width: 0;
     overflow-y: auto;
     padding: 1rem 1.25rem;
     display: flex;
