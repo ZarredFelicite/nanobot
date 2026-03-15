@@ -25,6 +25,7 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider, ToolCallRequest
+from nanobot.security.prompt_injection import validate_model_output
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
@@ -635,7 +636,14 @@ class AgentLoop:
                     )
             else:
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
+                validation = validate_model_output(clean)
+                if not validation.safe:
+                    logger.warning(
+                        "Blocked suspicious model output due to: {}",
+                        ", ".join(validation.findings),
+                    )
+                    clean = validation.replacement
+                # Don't persist error responses to session history - they can
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])

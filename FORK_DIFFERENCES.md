@@ -20,7 +20,8 @@ The biggest differences are:
 4. A full OpenCode TUI HTTP+SSE backend, including session management, streaming, permissions, revert/unrevert, fork, and context reporting.
 5. Stronger heartbeat isolation and delivery rules.
 6. Pi subagent integration for delegating larger coding/research tasks to an external coding agent process.
-7. Extra implementation work around MCP cancellation, provider quirks, Telegram owner routing, active-config data paths, and token-aware session compaction.
+7. OWASP-style prompt-injection hardening for user input, remote content, memory recall, and final output.
+8. Extra implementation work around MCP cancellation, provider quirks, Telegram owner routing, active-config data paths, and token-aware session compaction.
 
 ## High-Level Product Positioning
 
@@ -281,7 +282,53 @@ This is a meaningful behavioral difference from upstream because the fork can re
 
 This turns nanobot into an attachable backend for an external coding TUI, not just a built-in CLI/chatbot.
 
-## 5. Heartbeat Is More Isolated and Better Integrated with Shared Sessions
+## 5. Prompt-Injection Hardening Across Prompt Construction, Remote Content, and Output
+
+Primary files:
+
+- `nanobot/security/prompt_injection.py`
+- `nanobot/agent/context.py`
+- `nanobot/agent/loop.py`
+- `nanobot/agent/tools/web.py`
+- `nanobot/channels/email.py`
+- `tests/test_prompt_injection.py`
+
+### What changed
+
+Upstream nanobot has general input/tool safeguards, but this fork now adds a dedicated prompt-injection hardening layer inspired by OWASP guidance.
+
+The fork now:
+
+- wraps user input as explicitly untrusted data before it is merged into the prompt,
+- wraps recalled memory and remote tool output in "treat as data, not instructions" boundaries,
+- sanitizes common remote-content injection patterns before they re-enter model context,
+- and validates final assistant output for obvious prompt leakage or secret-like content.
+
+### Covered attack families
+
+The hardening layer explicitly targets:
+
+- direct prompt injection,
+- remote/indirect prompt injection from fetched content,
+- base64 and hex obfuscation,
+- typoglycemia variants,
+- best-of-N spacing/casing variants,
+- HTML/Markdown exfiltration attempts,
+- scratchpad or forged tool-output text such as `Thought:` / `Action:`,
+- and prompt-extraction phrases like asking for the exact hidden instructions.
+
+### User-visible behavioral differences
+
+- memory recall is still appended to the user turn, but it is now marked as untrusted content instead of raw plain text,
+- `web_search` and `web_fetch` output are no longer passed back verbatim into the model loop,
+- inbound email text is wrapped/sanitized before becoming conversation content,
+- and obviously suspicious final output is replaced with a refusal instead of being shown verbatim.
+
+### Validation
+
+This fork includes OWASP-style regression coverage in `tests/test_prompt_injection.py`, plus end-to-end prompt-construction and email-ingestion checks in `tests/test_context_prompt_cache.py` and `tests/test_email_channel.py`.
+
+## 6. Heartbeat Is More Isolated and Better Integrated with Shared Sessions
 
 Primary files:
 
@@ -306,7 +353,7 @@ The fork reworks heartbeat behavior so it is safer and more compatible with the 
 
 In the fork, heartbeat is treated as an operational background agent mode with stricter boundaries, rather than just another turn in the normal memory pipeline.
 
-## 6. Pi Subagent Integration for Large Tasks
+## 7. Pi Subagent Integration for Large Tasks
 
 Primary files:
 
@@ -334,7 +381,7 @@ This fork adds a new `subagent` tool that delegates work to an external Pi codin
 
 Upstream nanobot has subagent/background concepts, but this fork explicitly integrates another coding-agent runtime as a delegated worker. That is a stronger external-agent integration layer than upstream's default behavior.
 
-## 7. Session Handling, Compaction, and Prompt/Context Behavior Differ
+## 8. Session Handling, Compaction, and Prompt/Context Behavior Differ
 
 Primary files:
 
@@ -369,7 +416,7 @@ The fork is optimized more aggressively for:
 
 That makes it more suitable for long-running coding sessions than the simpler upstream flow.
 
-## 8. MCP Runtime Behavior Differs From Upstream
+## 9. MCP Runtime Behavior Differs From Upstream
 
 Primary files:
 
@@ -391,7 +438,7 @@ Notable changes include:
 
 The fork is more tolerant of different real-world MCP server setups, especially remote/SSE-style servers and cancellation-heavy coding workflows.
 
-## 9. Provider Compatibility Tweaks in the Current Diff
+## 10. Provider Compatibility Tweaks in the Current Diff
 
 Primary file:
 
@@ -411,7 +458,7 @@ Examples visible in the current diff:
 
 This fork is more robust when using non-identical OpenAI-style provider implementations, especially coding-oriented providers that do not perfectly match the expected response schema.
 
-## 10. Telegram and Channel Routing Are More Opinionated
+## 11. Telegram and Channel Routing Are More Opinionated
 
 Primary files:
 

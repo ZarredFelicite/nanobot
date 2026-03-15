@@ -200,6 +200,33 @@ Delegates complex tasks to a Pi coding agent subprocess via RPC (JSONL over stdi
 
 ---
 
+## 7. Prompt-Injection Hardening
+
+**Files**: `nanobot/security/prompt_injection.py`, `nanobot/agent/context.py`, `nanobot/agent/loop.py`, `nanobot/agent/tools/web.py`, `nanobot/channels/email.py`, `tests/test_prompt_injection.py`
+
+The fork now applies OWASP-style prompt-injection defenses across user input, remote content, memory injection, and final model output.
+
+### What changed
+- **Structured prompt separation**: user input is wrapped as explicit untrusted data before being merged into the final user message
+- **Untrusted remote content boundaries**: recalled memories, `web_search` output, `web_fetch` output, and inbound email bodies are wrapped with clear "treat as data, not instructions" markers
+- **Remote content sanitization**: common attacks are filtered before re-entering model context, including prompt overrides, forged tool markup, scratchpad text like `Thought:`/`Action:`, HTML exfil tags, hidden rendered text, and encoded payloads
+- **Output validation**: final assistant text is checked for obvious system prompt leakage and secret-looking output before being returned to the user
+
+### Detection coverage
+- direct prompt injection (`ignore all previous instructions`)
+- base64 and hex obfuscation
+- typoglycemia variants (`ignroe`, `revael`, etc.)
+- best-of-N spacing/casing variants
+- HTML/Markdown injection attempts
+- system prompt extraction patterns
+- agent scratchpad/tool-forging text
+
+### Tests
+- `tests/test_prompt_injection.py` covers OWASP-style red-team examples and regression cases
+- validated with `nix-shell --run "python -m pytest tests/test_prompt_injection.py tests/test_context_prompt_cache.py tests/test_email_channel.py -q"`
+
+---
+
 ## Tests
 
 | File | Coverage |
@@ -208,4 +235,27 @@ Delegates complex tasks to a Pi coding agent subprocess via RPC (JSONL over stdi
 | `tests/test_opencode_api.py` | Bootstrap, session CRUD, message send, SSE, stubs |
 | `tests/test_consolidate_offset.py` | Session consolidation, /clear command, cache immutability |
 | `tests/test_context_prompt_cache.py` | Memory injection via user message, system prompt stability |
+| `tests/test_prompt_injection.py` | OWASP-style prompt injection, sanitization, and leak-blocking checks |
 | `tests/test_loop_save_turn.py` | Turn saving, memory tag stripping |
+
+---
+
+## Todo
+
+High-impact OpenClaw features to implement in nanobot for a single-user, hackable setup:
+
+- [ ] Context budget visibility (`/context` + richer `/status`) — show system prompt size, injected file sizes, tool schema overhead, and session token usage
+- [ ] Manual + auto compaction (`/compact`, persisted summaries) — summarize older history into durable compact entries while keeping recent turns intact
+- [ ] Pre-compaction memory flush — run a silent memory-write reminder turn before compaction to reduce durable fact loss
+- [ ] Session pruning for tool output (TTL-aware) — trim or clear stale bulky tool results before model calls
+- [ ] Queue modes + per-session concurrency controls — add `collect`, `steer`, `followup`, with debounce and overflow behavior
+- [ ] Model failover + credential/profile rotation — rotate credentials on transient failures with cooldowns, then fallback through model chains
+- [ ] Usage/cost telemetry in chat (`/usage`, `/status`) — add per-response token/cost footer and provider usage snapshot
+- [ ] Heartbeat v2 — add active-hour windows, destination routing, and ACK suppression rules
+- [ ] Isolated cron jobs with delivery modes — support main vs isolated runs and `announce`/`webhook`/`none` with retries and run logs
+- [ ] Tool loop detection / circuit breaker — detect repetitive no-progress tool loops and apply guardrails
+
+Suggested first 3 to ship:
+1. Context budget visibility
+2. Compaction (manual + auto)
+3. Session pruning for tool outputs

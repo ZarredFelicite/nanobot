@@ -188,7 +188,25 @@ For production use:
 - **Chat history is stored locally** - protect the `~/.nanobot` directory
 - **API keys are in plain text** - use OS keyring for production
 
-### 10. Incident Response
+### 10. Prompt Injection and Untrusted Content
+
+nanobot treats user messages, recalled memory, web content, and email bodies as potentially hostile content.
+
+**Built-in prompt-injection hardening:**
+- Structured prompt boundaries separate system instructions from user data
+- User messages are wrapped as untrusted input before reaching the model
+- `web_search`, `web_fetch`, `memory_search`, and inbound email content are wrapped as untrusted content before being fed back into the model
+- Common remote-content attacks are sanitized, including prompt overrides, HTML tag injection, scratchpad/tool-forging text, hidden rendered text, and encoded payloads
+- Detection covers direct attacks, base64/hex obfuscation, typoglycemia variants, and spacing/casing variants
+- Final model output is checked for prompt leakage and obvious secret disclosure patterns before it is shown to the user
+
+**Operational guidance:**
+- Treat fetched web pages, documentation, issue text, commit messages, and email bodies as data, not instructions
+- Keep tool access narrow for sessions that read large amounts of untrusted content
+- Prefer approval-gated or read-only workflows when enabling shell/file-write actions in high-risk channels
+- Review suspicious prompt-injection findings in logs when debugging odd model behavior
+
+### 11. Incident Response
 
 If you suspect a security breach:
 
@@ -210,6 +228,8 @@ If you suspect a security breach:
 - Path traversal protection on file operations
 - Dangerous command pattern detection
 - Input length limits on HTTP requests
+- Prompt-injection detection for direct, encoded, typoglycemia, and remote-content attacks
+- Untrusted-content wrapping for user input, memory recall, web fetch/search output, and inbound email bodies
 
 ✅ **Authentication**
 - Allow-list based access control — in `v0.1.4.post3` and earlier empty means allow all; in newer versions empty means deny all (`["*"]` to explicitly allow all)
@@ -225,6 +245,11 @@ If you suspect a security breach:
 - TLS for Telegram API
 - WhatsApp bridge: localhost-only binding + optional token auth
 
+✅ **Prompt/Output Hardening**
+- User-data vs instruction separation in prompt assembly
+- Sanitization of suspicious remote content before tool results are reintroduced into context
+- Output validation that blocks obvious system-prompt and secret leakage
+
 ## Known Limitations
 
 ⚠️ **Current Security Limitations:**
@@ -234,6 +259,7 @@ If you suspect a security breach:
 3. **No Session Management** - No automatic session expiry
 4. **Limited Command Filtering** - Only blocks obvious dangerous patterns
 5. **No Audit Trail** - Limited security event logging (enhance as needed)
+6. **No Full Multimodal Scanning** - Image/document prompt-injection defenses are limited to text paths today
 
 ## Security Checklist
 
@@ -252,7 +278,7 @@ Before deploying nanobot:
 
 ## Updates
 
-**Last Updated**: 2026-02-03
+**Last Updated**: 2026-03-15
 
 For the latest security updates and announcements, check:
 - GitHub Security Advisories: https://github.com/HKUDS/nanobot/security/advisories
