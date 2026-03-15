@@ -246,7 +246,7 @@
   }
 
   function messageInfoFromPart(part: MessagePart): MessageInfo {
-    const created = part.type === 'text' ? part.time.created : part.state.time.start;
+    const created = part.type === 'text' ? part.time.start : part.state.time.start;
 
     return {
       id: part.messageID,
