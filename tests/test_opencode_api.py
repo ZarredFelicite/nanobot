@@ -12,7 +12,7 @@ from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.opencode import OpenCodeChannel
-from nanobot.config.schema import AgentDefaults, ModelsConfig, OpenCodeConfig
+from nanobot.config.schema import AgentDefaults, Config, ModelsConfig, OpenCodeConfig
 from nanobot.session.manager import Session, SessionManager
 
 
@@ -177,6 +177,122 @@ async def test_config_exposes_all_configured_providers(bus, session_manager, moc
         assert "openrouter" in data["provider"]
         assert "openai-codex" in data["provider"]
         assert "anthropic" in data["provider"]
+    finally:
+        await client.close()
+
+
+async def test_config_reload_updates_model_catalog(bus, session_manager, mock_agent_loop):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+        models_config=ModelsConfig(primary="anthropic/claude-sonnet-4-20250514"),
+    )
+
+    def _reload() -> dict[str, object]:
+        cfg = Config()
+        cfg.agents.defaults.model = "openrouter/minimax/minimax-m2.5"
+        cfg.models.primary = "openrouter/minimax/minimax-m2.5"
+        cfg.models.fallbacks = ["openai-codex/gpt-5.3-codex"]
+        channel.apply_runtime_config(cfg)
+        return {"configPath": "/tmp/config.json"}
+
+    channel.reload_callback = _reload
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        resp = await client.post("/config/reload")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ok"] is True
+        assert data["model"] == "openrouter/minimax/minimax-m2.5"
+        assert data["configPath"] == "/tmp/config.json"
+        assert "openrouter" in {provider["id"] for provider in data["providers"]}
+    finally:
+        await client.close()
+
+
+async def test_reload_command_returns_assistant_message(bus, session_manager, mock_agent_loop):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+    )
+
+    def _reload() -> dict[str, object]:
+        cfg = Config()
+        cfg.agents.defaults.model = "openrouter/minimax/minimax-m2.5"
+        cfg.models.primary = "openrouter/minimax/minimax-m2.5"
+        channel.apply_runtime_config(cfg)
+        return {}
+
+    channel.reload_callback = _reload
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        create_resp = await client.post("/session")
+        session = await create_resp.json()
+        sid = session["id"]
+
+        resp = await client.post(f"/session/{sid}/command", json={"command": "reload-config"})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["parts"][0]["type"] == "text"
+        assert "openrouter/minimax/minimax-m2.5" in data["parts"][0]["text"]
+    finally:
+        await client.close()
+
+
+async def test_reload_command_accepts_slash_prefixed_name(bus, session_manager, mock_agent_loop):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+    )
+
+    def _reload() -> dict[str, object]:
+        cfg = Config()
+        cfg.agents.defaults.model = "openrouter/minimax/minimax-m2.5"
+        cfg.models.primary = "openrouter/minimax/minimax-m2.5"
+        channel.apply_runtime_config(cfg)
+        return {}
+
+    channel.reload_callback = _reload
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        create_resp = await client.post("/session")
+        session = await create_resp.json()
+        sid = session["id"]
+
+        resp = await client.post(f"/session/{sid}/command", json={"command": "/reload-config"})
+        assert resp.status == 200
+        data = await resp.json()
+        assert "openrouter/minimax/minimax-m2.5" in data["parts"][0]["text"]
     finally:
         await client.close()
 
@@ -965,7 +1081,9 @@ async def test_sse_connected(client):
 async def test_stub_command(client):
     resp = await client.get("/command")
     assert resp.status == 200
-    assert await resp.json() == []
+    data = await resp.json()
+    names = {item["name"] for item in data}
+    assert {"reload-config", "clear", "help"}.issubset(names)
 
 
 async def test_stub_lsp(client):

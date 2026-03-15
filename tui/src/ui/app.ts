@@ -49,6 +49,13 @@ export class App {
   private isBusy = false;
   private defaultModel = "";
   private providerCatalog: ProviderCatalog | null = null;
+  private slashCommands = [
+    { name: "/new", description: "Create a new session" },
+    { name: "/sessions", description: "Switch session" },
+    { name: "/model", description: "Switch model" },
+    { name: "/abort", description: "Abort current request" },
+    { name: "/compact", description: "Summarize session" },
+  ];
 
   constructor(client: NanobotClient) {
     this.client = client;
@@ -69,15 +76,8 @@ export class App {
     this.editor.onSubmit = (text) => this.handleSubmit(text);
     this.editorContainer.addChild(this.editor);
 
-    const slashCommands = [
-      { name: "/new", description: "Create a new session" },
-      { name: "/sessions", description: "Switch session" },
-      { name: "/model", description: "Switch model" },
-      { name: "/abort", description: "Abort current request" },
-      { name: "/compact", description: "Summarize session" },
-    ];
     this.editor.setAutocompleteProvider(
-      new CombinedAutocompleteProvider(slashCommands)
+      new CombinedAutocompleteProvider(this.slashCommands)
     );
 
     this.sse = new SSEConnection(
@@ -116,14 +116,16 @@ export class App {
     this.tui.requestRender();
 
     try {
-      const [providers, sessions] = await Promise.all([
+      const [providers, sessions, commands] = await Promise.all([
         this.client.getProviders(),
         this.client.listSessions(),
+        this.client.listCommands().catch(() => []),
       ]);
 
       this.providerCatalog = providers;
       this.defaultModel = providers.defaultModel;
       this.updateFooterModel(this.defaultModel);
+      this.applyServerCommands(commands);
 
       const session =
         sessions.length > 0
@@ -338,9 +340,38 @@ export class App {
       }
 
       default:
-        this.chatLog.addSystem(`Unknown command: ${cmd}`);
+        try {
+          await this.client.executeCommand(this.activeSessionId, cmd);
+        } catch (err) {
+          this.chatLog.addSystem(
+            `Unknown command: ${cmd}${err instanceof Error ? ` (${err.message})` : ""}`
+          );
+        }
     }
     this.tui.requestRender();
+  }
+
+  private applyServerCommands(commands: Record<string, unknown>[]): void {
+    const mapped = commands
+      .map((command) => {
+        const name = typeof command.name === "string" ? command.name : "";
+        if (!name) return null;
+        return {
+          name: name.startsWith("/") ? name : `/${name}`,
+          description:
+            typeof command.description === "string" ? command.description : "",
+        };
+      })
+      .filter((command): command is { name: string; description: string } => command !== null);
+
+    const merged = new Map<string, { name: string; description: string }>();
+    for (const command of [...this.slashCommands, ...mapped]) {
+      merged.set(command.name, command);
+    }
+    this.slashCommands = [...merged.values()];
+    this.editor.setAutocompleteProvider(
+      new CombinedAutocompleteProvider(this.slashCommands)
+    );
   }
 
   private async switchSession(session: SessionInfo): Promise<void> {

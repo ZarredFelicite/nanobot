@@ -189,6 +189,18 @@ class ChannelManager:
                     f'Set ["*"] to allow everyone, or add specific user IDs.'
                 )
 
+    def apply_runtime_config(self, config: Config) -> None:
+        """Update live channel config that can be refreshed safely."""
+        self.config = config
+
+        cli_channel = self.channels.get("cli")
+        if cli_channel is not None and hasattr(cli_channel, "default_session"):
+            cli_channel.default_session = config.agents.defaults.session
+
+        opencode_channel = self.channels.get("opencode")
+        if opencode_channel is not None and hasattr(opencode_channel, "apply_runtime_config"):
+            opencode_channel.apply_runtime_config(config)
+
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""
         try:

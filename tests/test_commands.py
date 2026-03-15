@@ -1,6 +1,9 @@
+import io
 import shutil
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import pytest
 from typer.testing import CliRunner
@@ -296,3 +299,40 @@ def test_load_runtime_config_overrides_workspace(tmp_path):
     config = _load_runtime_config(config_path, str(workspace))
 
     assert config.agents.defaults.workspace == str(workspace)
+
+
+def test_reload_config_command_hits_gateway_endpoint():
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"ok": true, "model": "openrouter/minimax/minimax-m2.5"}'
+
+    with patch("urllib.request.urlopen", return_value=Response()) as mock_urlopen:
+        result = runner.invoke(app, ["reload-config", "--host", "127.0.0.1", "--port", "18790"])
+
+    assert result.exit_code == 0
+    assert "Reloaded config." in result.stdout
+    req = mock_urlopen.call_args.args[0]
+    assert req.full_url == "http://127.0.0.1:18790/config/reload"
+    assert req.get_method() == "POST"
+
+
+def test_reload_config_command_handles_http_error():
+    err = HTTPError(
+        url="http://127.0.0.1:18790/config/reload",
+        code=500,
+        msg="boom",
+        hdrs=Message(),
+        fp=io.BytesIO(b'{"ok": false, "error": "boom"}'),
+    )
+
+    with patch("urllib.request.urlopen", side_effect=err):
+        result = runner.invoke(app, ["reload-config"])
+
+    assert result.exit_code == 1
+    assert "Gateway rejected reload request" in result.stdout

@@ -7,6 +7,7 @@ import select
 import signal
 import shutil
 import sys
+from urllib import error, request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -406,6 +407,21 @@ def gateway(
 
     # Create channel manager
     channels = ChannelManager(config, bus, session_manager=session_manager, agent_loop=agent)
+
+    def _reload_runtime_config() -> dict[str, object]:
+        reloaded = load_config(config_path)
+        new_provider = _make_provider(reloaded)
+        agent.apply_runtime_config(reloaded, new_provider)
+        channels.apply_runtime_config(reloaded)
+        resolved_path = config_path if config_path is not None else get_data_dir() / "config.json"
+        return {
+            "configPath": str(resolved_path),
+            "model": reloaded.agents.defaults.model,
+        }
+
+    opencode_channel = channels.channels.get("opencode")
+    if opencode_channel is not None and hasattr(opencode_channel, "reload_callback"):
+        opencode_channel.reload_callback = _reload_runtime_config
 
     def _parse_iso_datetime(raw: str | None) -> datetime | None:
         if not raw:
@@ -808,6 +824,36 @@ def _run_as_client_interactive(
 # ============================================================================
 # Agent Commands
 # ============================================================================
+
+
+@app.command()
+def reload_config(
+    host: str = typer.Option("127.0.0.1", "--host", help="Gateway host"),
+    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+):
+    """Ask a running gateway to reload config from disk."""
+    req = request.Request(f"http://{host}:{port}/config/reload", method="POST")
+    try:
+        with request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        console.print(f"[red]Gateway rejected reload request ({exc.code}).[/red]")
+        if body:
+            console.print(body)
+        raise typer.Exit(1) from exc
+    except OSError as exc:
+        console.print(f"[red]Could not reach gateway at {host}:{port}.[/red]")
+        console.print(str(exc))
+        raise typer.Exit(1) from exc
+
+    if not payload.get("ok"):
+        console.print(f"[red]Reload failed:[/red] {payload.get('error', 'unknown error')}")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Reloaded config.[/green] Default model: [cyan]{payload.get('model', '')}[/cyan]"
+    )
 
 
 @app.command()

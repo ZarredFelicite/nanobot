@@ -14,7 +14,7 @@ import json
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from aiohttp import web
 from loguru import logger
@@ -25,6 +25,7 @@ from nanobot.channels.base import BaseChannel
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
+    from nanobot.config.schema import Config
     from nanobot.session.manager import Session, SessionManager
 
 from nanobot.config.schema import (
@@ -182,6 +183,7 @@ class OpenCodeChannel(BaseChannel):
         models_config: ModelsConfig | None = None,
         tui_config: TUIConfig | None = None,
         permission_config: PermissionConfig | None = None,
+        reload_callback: Callable[[], dict[str, Any]] | None = None,
     ):
         super().__init__(config, bus)
         self.session_manager = session_manager
@@ -190,6 +192,7 @@ class OpenCodeChannel(BaseChannel):
         self.models_config = models_config
         self.tui_config = tui_config or TUIConfig()
         self.permission_config = permission_config
+        self.reload_callback = reload_callback
         self.port = config.port
 
         self._sse_clients: list[web.StreamResponse] = []
@@ -240,6 +243,13 @@ class OpenCodeChannel(BaseChannel):
         if key in self.session_manager._cache:
             return True
         return any(s.get("key") == key for s in self.session_manager.list_sessions())
+
+    def apply_runtime_config(self, config: "Config") -> None:
+        """Apply refreshed config to the OpenCode-facing runtime state."""
+        self.agent_config = config.agents.defaults
+        self.models_config = config.models
+        self.tui_config = config.channels.tui
+        self.permission_config = config.tools.permissions
 
     def _split_model(self, full_model: str) -> tuple[str, str]:
         """Split full model name into (provider, short model id)."""
@@ -438,6 +448,7 @@ class OpenCodeChannel(BaseChannel):
     def _register_routes(self, app: web.Application) -> None:
         # Bootstrap endpoints (TUI blocks on all 4)
         app.router.add_get("/config/providers", self._handle_config_providers)
+        app.router.add_post("/config/reload", self._handle_config_reload)
         app.router.add_get("/provider", self._handle_provider)
         app.router.add_get("/agent", self._handle_agent)
         app.router.add_get("/config", self._handle_config)
@@ -516,6 +527,10 @@ class OpenCodeChannel(BaseChannel):
     async def _handle_provider(self, request: web.Request) -> web.Response:
         providers, _ = self._model_catalog()
         return web.json_response(providers)
+
+    async def _handle_config_reload(self, request: web.Request) -> web.Response:
+        payload, status = await self._reload_runtime_config()
+        return web.json_response(payload, status=status)
 
     async def _handle_agent(self, request: web.Request) -> web.Response:
         return web.json_response(
@@ -1430,6 +1445,13 @@ class OpenCodeChannel(BaseChannel):
 
     _COMMANDS = [
         {
+            "name": "reload-config",
+            "description": "Reload config from disk",
+            "source": "command",
+            "template": "/reload-config",
+            "hints": [],
+        },
+        {
             "name": "clear",
             "description": "Clear session history",
             "source": "command",
@@ -1458,9 +1480,13 @@ class OpenCodeChannel(BaseChannel):
         except Exception:
             body = {}
         command_name = body.get("command", "") if isinstance(body, dict) else ""
-        cmd = self._COMMANDS_BY_NAME.get(command_name)
+        normalized_command_name = command_name.lstrip("/") if isinstance(command_name, str) else ""
+        cmd = self._COMMANDS_BY_NAME.get(normalized_command_name)
         if not cmd:
             return web.json_response({"error": f"unknown command: {command_name}"}, status=404)
+
+        if normalized_command_name == "reload-config":
+            return await self._handle_reload_command(session_id)
 
         # Resolve template — substitute $ARGUMENTS if present
         template = cmd["template"]
@@ -1541,6 +1567,94 @@ class OpenCodeChannel(BaseChannel):
                 "parts": [asst_part],
             }
         )
+
+    async def _reload_runtime_config(self) -> tuple[dict[str, Any], int]:
+        if not self.reload_callback:
+            return {"ok": False, "error": "config reload unavailable"}, 501
+
+        try:
+            result = self.reload_callback() or {}
+        except Exception as exc:
+            logger.exception("Config reload failed")
+            return {"ok": False, "error": str(exc)}, 500
+
+        providers, default_model = self._model_catalog()
+        payload = {
+            "ok": True,
+            "model": default_model,
+            "providers": providers,
+            "tui": self.tui_config.model_dump(by_alias=True),
+            **result,
+        }
+        await self._broadcast_sse(
+            "config.reloaded",
+            {
+                "model": default_model,
+                "providerCount": len(providers),
+            },
+        )
+        return payload, 200
+
+    async def _handle_reload_command(self, session_id: str) -> web.Response:
+        payload, status = await self._reload_runtime_config()
+        if status != 200:
+            text = f"Failed to reload config: {payload.get('error', 'unknown error')}"
+        else:
+            provider_count = len(payload.get("providers", []))
+            text = (
+                f"Reloaded config from disk. Default model is now {payload['model']} "
+                f"across {provider_count} configured provider catalog entries."
+            )
+
+        session, key = self._find_session(session_id)
+        if not session:
+            if not self.session_manager:
+                return web.json_response({"error": "no session manager"}, status=500)
+            key = session_id
+            session = self.session_manager.get_or_create(key)
+
+        session.add_message("assistant", text)
+        if self.session_manager:
+            self.session_manager.save(session)
+
+        now_ms = self._epoch_ms(time.time())
+        provider_name, model_id = self._parse_model()
+        display_idx = max(0, self._display_count(session, session_id) - 1)
+        msg_id, part_id = self._ids_for_index(session_id, display_idx)
+        asst_msg = {
+            "id": msg_id,
+            "sessionID": session_id,
+            "role": "assistant",
+            "time": {"created": now_ms, "completed": now_ms},
+            "modelID": model_id,
+            "providerID": provider_name,
+            "mode": "default",
+            "agent": "default",
+            "path": {"cwd": str(self.agent_loop.workspace), "root": ""}
+            if self.agent_loop
+            else {"cwd": "", "root": ""},
+            "cost": 0,
+            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        }
+        asst_part = {
+            "id": part_id,
+            "sessionID": session_id,
+            "messageID": msg_id,
+            "type": "text",
+            "text": text,
+            "time": {"created": now_ms},
+        }
+
+        await self._broadcast_sse("message.updated", {"info": asst_msg})
+        await self._broadcast_sse("message.part.updated", {"part": asst_part})
+        await self._broadcast_sse(
+            "session.updated", {"info": self._session_to_info(session, session_id)}
+        )
+        await self._broadcast_sse(
+            "session.status",
+            {"sessionID": session_id, "status": {"type": "idle"}},
+        )
+        return web.json_response({"info": asst_msg, "parts": [asst_part]}, status=status)
 
     # ------------------------------------------------------------------
     # Stub endpoints
