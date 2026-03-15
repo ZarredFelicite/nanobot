@@ -6,10 +6,63 @@ const marked = new Marked({
   gfm: true
 });
 
+// Tags allowed in rendered markdown output. Everything else is stripped.
+const ALLOWED_TAGS = new Set([
+  'p', 'br', 'strong', 'b', 'em', 'i', 'u', 's', 'del',
+  'code', 'pre', 'blockquote',
+  'ul', 'ol', 'li',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'a', 'img',
+  'table', 'thead', 'tbody', 'tr', 'th', 'td',
+  'hr', 'sup', 'sub', 'details', 'summary',
+]);
+
+const ALLOWED_ATTRS: Record<string, Set<string>> = {
+  a: new Set(['href', 'title']),
+  img: new Set(['src', 'alt', 'title']),
+  td: new Set(['align']),
+  th: new Set(['align']),
+};
+
+function sanitizeHtml(html: string): string {
+  // Strip dangerous tags and attributes while keeping allowed markdown output
+  return html.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)?\/?>/g, (match, tag, attrs) => {
+    const lowerTag = tag.toLowerCase();
+    if (!ALLOWED_TAGS.has(lowerTag)) {
+      return '';
+    }
+    // Closing tag
+    if (match.startsWith('</')) {
+      return `</${lowerTag}>`;
+    }
+    // Filter attributes
+    const allowedAttrs = ALLOWED_ATTRS[lowerTag];
+    if (!allowedAttrs || !attrs) {
+      const selfClose = match.endsWith('/>') ? ' /' : '';
+      return `<${lowerTag}${selfClose}>`;
+    }
+    const cleanAttrs = (attrs as string)
+      .match(/\s+([a-zA-Z-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)
+      ?.filter((attr: string) => {
+        const name = attr.trim().split(/\s*=/)[0].toLowerCase();
+        return allowedAttrs.has(name);
+      })
+      ?.map((attr: string) => {
+        // Block javascript: URLs
+        if (/javascript\s*:/i.test(attr)) return '';
+        return attr;
+      })
+      .join('') ?? '';
+    const selfClose = match.endsWith('/>') ? ' /' : '';
+    return `<${lowerTag}${cleanAttrs}${selfClose}>`;
+  });
+}
+
 export function renderMarkdown(text: string): string {
   if (!text) return '';
   try {
-    return marked.parse(text) as string;
+    const raw = marked.parse(text) as string;
+    return sanitizeHtml(raw);
   } catch {
     return escapeHtml(text);
   }
