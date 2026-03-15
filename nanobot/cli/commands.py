@@ -5,6 +5,7 @@ import json
 import os
 import select
 import signal
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -116,6 +117,27 @@ def _print_agent_response(response: str, render_markdown: bool) -> None:
 def _is_exit_command(command: str) -> bool:
     """Return True when input should end interactive chat."""
     return command.lower() in EXIT_COMMANDS
+
+
+def _resolve_external_tui_binary() -> str | None:
+    """Prefer the repo-local TUI script, then fall back to PATH."""
+    repo_tui = Path(__file__).resolve().parents[2] / "tui" / "nanobot-tui"
+    if repo_tui.is_file():
+        return str(repo_tui)
+    return shutil.which("nanobot-tui")
+
+
+def _launch_external_tui(port: int) -> None:
+    """Replace the current process with the external nanobot TUI."""
+    tui_binary = _resolve_external_tui_binary()
+    if not tui_binary:
+        console.print("[red]Could not find `nanobot-tui`.[/red]")
+        console.print(
+            'Expected either `tui/nanobot-tui` in this repo or `nanobot-tui` on PATH; use `nanobot agent -m "..."` for direct mode.'
+        )
+        raise typer.Exit(1)
+
+    os.execvp(tui_binary, [tui_binary, "--port", str(port)])
 
 
 async def _read_interactive_input_async() -> str:
@@ -811,6 +833,9 @@ def agent(
 
     config = _load_runtime_config(config_path, workspace, announce=True)
     sync_workspace_templates(config.workspace_path)
+
+    if not message:
+        _launch_external_tui(config.channels.opencode.port)
 
     # --- Gateway client mode: connect to running gateway if available ---
     socket_path = Path(config.channels.cli_socket.socket_path).expanduser()

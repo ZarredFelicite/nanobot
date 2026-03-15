@@ -68,27 +68,6 @@ class DiscordConfig(Base):
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
 
 
-class MatrixConfig(Base):
-    """Matrix (Element) channel configuration."""
-
-    enabled: bool = False
-    homeserver: str = "https://matrix.org"
-    access_token: str = ""
-    user_id: str = ""  # @bot:matrix.org
-    device_id: str = ""
-    e2ee_enabled: bool = True  # Enable Matrix E2EE support (encryption + encrypted room handling).
-    sync_stop_grace_seconds: int = (
-        2  # Max seconds to wait for sync_forever to stop gracefully before cancellation fallback.
-    )
-    max_media_bytes: int = (
-        20 * 1024 * 1024
-    )  # Max attachment size accepted for Matrix media handling (inbound + outbound).
-    allow_from: list[str] = Field(default_factory=list)
-    group_policy: Literal["open", "mention", "allowlist"] = "open"
-    group_allow_from: list[str] = Field(default_factory=list)
-    allow_room_mentions: bool = False
-
-
 class EmailConfig(Base):
     """Email channel configuration (IMAP inbound + SMTP outbound)."""
 
@@ -229,6 +208,28 @@ class OpenCodeConfig(Base):
     port: int = 4096
 
 
+class OpenCodeThemeConfig(Base):
+    """Theme overrides for the OpenCode-compatible TUI."""
+
+    accent: str = "#9ccfd8"
+    border: str = "#524f67"
+    user_background: str = "#1f1d2e"
+    user_text: str = "#c4a7e7"
+    assistant_text: str = "#9ccfd8"
+    heading_text: str = "#e0def4"
+    thinking_text: str = "#908caa"
+    tool_name: str = "#ebbcba"
+    tool_output: str = "#524f67"
+    code: str = "#ebbcba"
+    code_block: str = "#31748f"
+
+
+class TUIConfig(Base):
+    """User-facing TUI configuration surfaced to the external frontend."""
+
+    theme: OpenCodeThemeConfig = Field(default_factory=OpenCodeThemeConfig)
+
+
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
@@ -236,6 +237,7 @@ class ChannelsConfig(Base):
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
     cli_socket: CLISocketConfig = Field(default_factory=CLISocketConfig)
     opencode: OpenCodeConfig = Field(default_factory=OpenCodeConfig)
+    tui: TUIConfig = Field(default_factory=TUIConfig)
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)

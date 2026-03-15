@@ -16,12 +16,12 @@ export class ToolExecutionComponent {
         tui,
         colors.toolRunning,
         colors.dim,
-        this.formatTitle(state)
+        this.withIndent(this.formatTitle(state))
       );
       loader.start();
       this.container = loader;
     } else {
-      this.container = new Text(this.formatCompleted(state), 1, 0);
+      this.container = new Text(this.formatCompleted(state), 3, 0);
     }
   }
 
@@ -30,7 +30,7 @@ export class ToolExecutionComponent {
 
     if (state.status === "running") {
       if (this.container instanceof Loader) {
-        this.container.setMessage(this.formatTitle(state));
+        this.container.setMessage(this.withIndent(this.formatTitle(state)));
         return oldContainer;
       }
     }
@@ -45,12 +45,12 @@ export class ToolExecutionComponent {
         this.tui,
         colors.toolRunning,
         colors.dim,
-        this.formatTitle(state)
+        this.withIndent(this.formatTitle(state))
       );
       loader.start();
       this.container = loader;
     } else {
-      this.container = new Text(this.formatCompleted(state), 1, 0);
+      this.container = new Text(this.formatCompleted(state), 3, 0);
     }
 
     return oldContainer;
@@ -63,21 +63,19 @@ export class ToolExecutionComponent {
   }
 
   private formatTitle(state: ToolState): string {
-    if (state.title) return `${colors.toolName(this.toolName)} ${state.title}`;
+    if (state.title) return `${colors.toolLabel("tool")} ${colors.toolName(this.toolName)} ${colors.dim(state.title)}`;
     const input = state.input;
-    if (input.command) return `${colors.toolName(this.toolName)}  ${colors.dim(input.command)}`;
-    if (input.filePath) return `${colors.toolName(this.toolName)}  ${colors.dim(input.filePath)}`;
-    if (input.pattern) return `${colors.toolName(this.toolName)}  ${colors.dim(input.pattern)}`;
-    if (input.query) return `${colors.toolName(this.toolName)}  ${colors.dim(input.query)}`;
-    if (input.url) return `${colors.toolName(this.toolName)}  ${colors.dim(input.url)}`;
-    return colors.toolName(this.toolName);
+    if (input.command) return `${colors.toolLabel("tool")} ${colors.toolName(this.toolName)} ${colors.dim(input.command)}`;
+    if (input.filePath) return `${colors.toolLabel("tool")} ${colors.toolName(this.toolName)} ${colors.dim(input.filePath)}`;
+    if (input.pattern) return `${colors.toolLabel("tool")} ${colors.toolName(this.toolName)} ${colors.dim(input.pattern)}`;
+    if (input.query) return `${colors.toolLabel("tool")} ${colors.toolName(this.toolName)} ${colors.dim(input.query)}`;
+    if (input.url) return `${colors.toolLabel("tool")} ${colors.toolName(this.toolName)} ${colors.dim(input.url)}`;
+    return `${colors.toolLabel("tool")} ${colors.toolName(this.toolName)}`;
   }
 
   private formatCompleted(state: ToolState): string {
     const icon =
-      state.status === "error"
-        ? colors.toolError("✗")
-        : colors.toolDone("✓");
+      state.status === "error" ? colors.toolError("x") : colors.toolDone("+");
     const name = colors.toolName(this.toolName);
     const title = state.title || "";
 
@@ -91,12 +89,16 @@ export class ToolExecutionComponent {
     if (state.output) {
       const lines = state.output.split("\n").filter((l) => l.trim());
       if (lines.length > 0) {
-        const shown = lines.slice(0, 3).join("\n  ");
+        const shown = lines.slice(0, 3).join(`\n  `);
         const more = lines.length > 3 ? colors.dim(` (+${lines.length - 3} lines)`) : "";
-        preview = `\n  ${colors.dim(shown)}${more}`;
+        preview = `\n  ${colors.toolOutput(shown)}${more}`;
       }
     }
 
     return `${icon} ${name} ${title}${preview}`;
+  }
+
+  private withIndent(text: string): string {
+    return `  ${text}`;
   }
 }

@@ -1,12 +1,20 @@
 import { Markdown } from "@mariozechner/pi-tui";
-import { markdownTheme, defaultTextStyle } from "../theme.js";
+import { markdownTheme, defaultTextStyle, thinkingTextStyle } from "../theme.js";
+
+type AssistantMessageVariant = "assistant" | "thinking";
 
 export class AssistantMessageComponent {
   readonly container: Markdown;
   private text = "";
 
-  constructor() {
-    this.container = new Markdown("", 1, 0, markdownTheme, defaultTextStyle);
+  constructor(variant: AssistantMessageVariant = "assistant") {
+    this.container = new Markdown(
+      "",
+      3,
+      0,
+      markdownTheme,
+      variant === "thinking" ? thinkingTextStyle : defaultTextStyle
+    );
   }
 
   updateContent(text: string): void {

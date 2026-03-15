@@ -1,43 +1,63 @@
-import { Text } from "@mariozechner/pi-tui";
+import type { Component } from "@mariozechner/pi-tui";
 import { colors } from "../theme.js";
 
-export class FooterComponent {
-  readonly container: Text;
+export class FooterComponent implements Component {
+  private provider = "";
   private model = "";
-  private sessionTitle = "";
-  private busy = false;
-  private tokenCount = 0;
+  private thinkingLevel = "auto";
+  private contextUsed = 0;
+  private contextRemaining = 0;
 
-  constructor() {
-    this.container = new Text("", 0, 0, colors.statusBar);
-    this.render();
-  }
-
-  setModel(model: string): void {
+  setProviderModel(provider: string, model: string): void {
+    this.provider = provider;
     this.model = model;
-    this.render();
   }
 
-  setSession(title: string): void {
-    this.sessionTitle = title;
-    this.render();
+  setThinkingLevel(level: string): void {
+    this.thinkingLevel = level;
   }
 
-  setBusy(busy: boolean): void {
-    this.busy = busy;
-    this.render();
+  setContextUsage(used: number, remaining: number): void {
+    this.contextUsed = used;
+    this.contextRemaining = remaining;
   }
 
-  setTokens(count: number): void {
-    this.tokenCount = count;
-    this.render();
-  }
+  handleInput(): void {}
 
-  private render(): void {
-    const status = this.busy ? " ● busy" : " ○ idle";
-    const model = this.model ? ` ${this.model}` : "";
-    const session = this.sessionTitle ? ` │ ${this.sessionTitle}` : "";
-    const tokens = this.tokenCount > 0 ? ` │ ${this.tokenCount} tokens` : "";
-    this.container.setText(`${status}${model}${session}${tokens}`);
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    const total = this.contextUsed + this.contextRemaining;
+    const percent = total > 0 ? ((this.contextUsed / total) * 100).toFixed(1) : "0.0";
+    const leftParts = [colors.dim(`${percent}%/${formatCompact(total)}`)];
+
+    const rightParts = [
+      this.provider ? colors.muted(`(${this.provider})`) : "",
+      this.model ? colors.dim(this.model) : "",
+      colors.dim(`• ${normalizeThinking(this.thinkingLevel)}`),
+    ].filter(Boolean);
+
+    const left = leftParts.join(colors.border(" | "));
+    const right = rightParts.join(colors.border(" | "));
+    const gap = Math.max(1, width - stripAnsi(left).length - stripAnsi(right).length);
+    return [`${left}${" ".repeat(gap)}${right}`];
   }
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\x1B\[[0-9;]*m/g, "");
+}
+
+function formatCompact(value: number): string {
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(0)}k`;
+  }
+  return String(value);
+}
+
+function normalizeThinking(value: string): string {
+  if (!value || value === "default") {
+    return "auto";
+  }
+  return value;
 }

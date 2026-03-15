@@ -25,8 +25,15 @@ from nanobot.channels.base import BaseChannel
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
-    from nanobot.config.schema import AgentDefaults, ModelsConfig, OpenCodeConfig, PermissionConfig
     from nanobot.session.manager import Session, SessionManager
+
+from nanobot.config.schema import (
+    AgentDefaults,
+    ModelsConfig,
+    OpenCodeConfig,
+    PermissionConfig,
+    TUIConfig,
+)
 
 # Map nanobot tool names → OpenCode tool names so the TUI uses the right renderer.
 _TOOL_NAME_MAP: dict[str, str] = {
@@ -173,6 +180,7 @@ class OpenCodeChannel(BaseChannel):
         agent_loop: AgentLoop | None = None,
         agent_config: AgentDefaults | None = None,
         models_config: ModelsConfig | None = None,
+        tui_config: TUIConfig | None = None,
         permission_config: PermissionConfig | None = None,
     ):
         super().__init__(config, bus)
@@ -180,6 +188,7 @@ class OpenCodeChannel(BaseChannel):
         self.agent_loop = agent_loop
         self.agent_config = agent_config
         self.models_config = models_config
+        self.tui_config = tui_config or TUIConfig()
         self.permission_config = permission_config
         self.port = config.port
 
@@ -536,7 +545,7 @@ class OpenCodeChannel(BaseChannel):
             {
                 "theme": "catppuccin-mocha",
                 "keybinds": {},
-                "tui": {},
+                "tui": self.tui_config.model_dump(by_alias=True),
                 "model": default_model,
                 "provider": provider_map,
                 "mcp": {},
@@ -889,6 +898,8 @@ class OpenCodeChannel(BaseChannel):
             accumulated_text: list[str] = []
             part_counter = 0
             current_text_part_id = f"{asst_part_id}_p0"
+            current_text_part_created_ms = now_ms + 1
+            current_text_part_phase = "thinking"
             has_seen_tools = False
             tool_call_part: dict[str, int] = {}
 
@@ -898,7 +909,12 @@ class OpenCodeChannel(BaseChannel):
                 tool_hint: bool = False,
                 tool_event: dict | None = None,
             ) -> None:
-                nonlocal part_counter, current_text_part_id, has_seen_tools
+                nonlocal \
+                    part_counter, \
+                    current_text_part_id, \
+                    current_text_part_created_ms, \
+                    current_text_part_phase, \
+                    has_seen_tools
 
                 if tool_event:
                     evt_type = tool_event.get("type", "")
@@ -983,6 +999,8 @@ class OpenCodeChannel(BaseChannel):
                 if has_seen_tools:
                     part_counter += 1
                     current_text_part_id = f"{asst_part_id}_p{part_counter}"
+                    current_text_part_created_ms = self._epoch_ms(time.time())
+                    current_text_part_phase = "assistant"
                     accumulated_text.clear()
                     has_seen_tools = False
 
@@ -996,7 +1014,8 @@ class OpenCodeChannel(BaseChannel):
                             "messageID": asst_msg_id,
                             "type": "text",
                             "text": "\n".join(accumulated_text),
-                            "time": {"created": now_ms + 1},
+                            "time": {"created": current_text_part_created_ms},
+                            "phase": current_text_part_phase,
                         },
                         "delta": content,
                     },
@@ -1045,13 +1064,16 @@ class OpenCodeChannel(BaseChannel):
             if response and has_seen_tools:
                 part_counter += 1
                 current_text_part_id = f"{asst_part_id}_p{part_counter}"
+                current_text_part_created_ms = self._epoch_ms(time.time())
+                current_text_part_phase = "assistant"
             asst_part_final = {
                 "id": current_text_part_id,
                 "sessionID": session_id,
                 "messageID": asst_msg_id,
                 "type": "text",
                 "text": final_text,
-                "time": {"created": now_ms + 1},
+                "time": {"created": current_text_part_created_ms},
+                "phase": current_text_part_phase,
             }
             await self._broadcast_sse("message.part.updated", {"part": asst_part_final})
 
@@ -1662,9 +1684,10 @@ class OpenCodeChannel(BaseChannel):
 
             if tool_calls:
                 merged = dict(entry)
-                text_parts: list[str] = []
+                pre_tool_text = ""
+                post_tool_text = ""
                 if isinstance(content, str) and content.strip():
-                    text_parts.append(content.strip())
+                    pre_tool_text = content.strip()
 
                 usage_source: dict[str, Any] = entry
                 j = i + 1
@@ -1673,13 +1696,14 @@ class OpenCodeChannel(BaseChannel):
                     if candidate.get("role") == "assistant" and not candidate.get("tool_calls"):
                         c = candidate.get("content", "")
                         if isinstance(c, str) and c.strip():
-                            text_parts.append(c.strip())
+                            post_tool_text = c.strip()
                             usage_source = candidate
                         j += 1
                         break
                     j += 1
 
-                merged["content"] = "\n\n".join(text_parts)
+                merged["pre_tool_content"] = pre_tool_text
+                merged["content"] = post_tool_text
                 if usage_source is not entry:
                     if usage_source.get("usage") is not None:
                         merged["usage"] = usage_source.get("usage")
@@ -1737,8 +1761,11 @@ class OpenCodeChannel(BaseChannel):
                 continue
 
             text = content if isinstance(content, str) else ""
+            pre_tool_text = m.get("pre_tool_content", "")
+            if not isinstance(pre_tool_text, str):
+                pre_tool_text = ""
             tool_calls = m.get("tool_calls", [])
-            if not text and not tool_calls:
+            if not text and not pre_tool_text and not tool_calls:
                 continue
 
             created_assistant = created
@@ -1747,7 +1774,6 @@ class OpenCodeChannel(BaseChannel):
 
             parts: list[dict[str, Any]] = []
             part_idx = 0
-
             for tc in tool_calls:
                 tc_id = tc.get("id", "")
                 tc_func = tc.get("function", {})
@@ -1817,6 +1843,20 @@ class OpenCodeChannel(BaseChannel):
                 )
                 part_idx += 1
 
+            if pre_tool_text:
+                parts.append(
+                    {
+                        "id": f"{part_id}_{part_idx}",
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                        "type": "text",
+                        "text": pre_tool_text,
+                        "time": {"start": created_assistant, "end": created_assistant},
+                        "phase": "thinking",
+                    }
+                )
+                part_idx += 1
+
             if text:
                 parts.append(
                     {
@@ -1826,6 +1866,7 @@ class OpenCodeChannel(BaseChannel):
                         "type": "text",
                         "text": text,
                         "time": {"start": created_assistant, "end": created_assistant},
+                        "phase": "assistant",
                     }
                 )
                 part_idx += 1

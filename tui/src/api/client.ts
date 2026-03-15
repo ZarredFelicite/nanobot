@@ -1,9 +1,11 @@
 import type {
+  AppConfig,
   SessionInfo,
   MessageInfo,
   MessagePart,
   MessageWithParts,
   ProviderCatalog,
+  ProviderCatalogResponse,
   PermissionReply,
   SessionStatus,
 } from "./types.js";
@@ -34,10 +36,14 @@ export class NanobotClient {
 
   // Bootstrap
   async getProviders(): Promise<ProviderCatalog> {
-    return this.request("/config/providers");
+    const response = await this.request<ProviderCatalogResponse>("/config/providers");
+    return {
+      providers: response.providers,
+      defaultModel: response.default?.default || "",
+    };
   }
 
-  async getConfig(): Promise<Record<string, unknown>> {
+  async getConfig(): Promise<AppConfig> {
     return this.request("/config");
   }
 
@@ -71,12 +77,16 @@ export class NanobotClient {
 
   async patchSession(
     id: string,
-    data: Partial<SessionInfo>
+    data: Partial<SessionInfo> & Record<string, unknown>
   ): Promise<SessionInfo> {
     return this.request(`/session/${id}`, {
       method: "PATCH",
       body: JSON.stringify(data),
     });
+  }
+
+  async setSessionModel(id: string, model: string): Promise<SessionInfo> {
+    return this.patchSession(id, { model });
   }
 
   async getSessionStatuses(): Promise<SessionStatus[]> {

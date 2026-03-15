@@ -110,6 +110,9 @@ async def test_config(client):
     assert isinstance(data, dict)
     assert isinstance(data["model"], str)
     assert "/" in data["model"]
+    assert data["tui"]["theme"]["userBackground"] == "#1f1d2e"
+    assert data["tui"]["theme"]["userText"] == "#c4a7e7"
+    assert data["tui"]["theme"]["thinkingText"] == "#908caa"
 
 
 async def test_config_providers_uses_models_catalog(bus, session_manager, mock_agent_loop):
@@ -346,6 +349,126 @@ async def test_send_message_uses_requested_model(bus, session_manager, mock_agen
         )
     finally:
         await client.close()
+
+
+async def test_sse_text_after_tools_uses_later_timestamp(bus, session_manager, tmp_path):
+    mock_loop = MagicMock()
+    mock_loop.workspace = tmp_path / "workspace"
+
+    async def _process_direct(**kwargs):
+        on_progress = kwargs["on_progress"]
+        await on_progress(
+            "",
+            tool_event={
+                "type": "tool_start",
+                "call_id": "call_1",
+                "name": "list_dir",
+                "input": {"path": "/tmp"},
+            },
+        )
+        await on_progress(
+            "",
+            tool_event={
+                "type": "tool_done",
+                "call_id": "call_1",
+                "name": "list_dir",
+                "input": {"path": "/tmp"},
+                "output": "file.txt",
+            },
+        )
+        await on_progress("hello")
+        return "hello"
+
+    mock_loop.process_direct = AsyncMock(side_effect=_process_direct)
+    mock_loop.get_last_llm_usage = MagicMock(return_value=None)
+    mock_loop.get_last_context_stats = MagicMock(return_value={})
+
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+    )
+
+    events: list[tuple[str, dict]] = []
+
+    async def _capture(event_type: str, payload: dict) -> None:
+        events.append((event_type, payload))
+
+    channel._broadcast_sse = _capture  # type: ignore[method-assign]
+
+    payload, status = await channel._process_session_send(
+        "session-1",
+        {"parts": [{"type": "text", "text": "hi"}]},
+    )
+
+    assert status == 200
+    tool_event = next(
+        payload["part"]
+        for event_type, payload in events
+        if event_type == "message.part.updated" and payload["part"]["type"] == "tool"
+    )
+    final_text_event = next(
+        payload["part"]
+        for event_type, payload in reversed(events)
+        if event_type == "message.part.updated" and payload["part"]["type"] == "text"
+    )
+    assert final_text_event["text"] == "hello"
+    assert final_text_event["time"]["created"] >= tool_event["state"]["time"]["end"]
+    assert final_text_event["phase"] == "assistant"
+
+
+def test_messages_to_opencode_marks_pre_tool_text_as_thinking(
+    bus, session_manager, mock_agent_loop
+):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+    )
+
+    session = Session(key="session-1")
+    session.messages = [
+        {"role": "user", "content": "hello", "timestamp": "2026-03-10T23:58:10"},
+        {
+            "role": "assistant",
+            "content": "I'll check first.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"filePath": "/tmp/x"}'},
+                }
+            ],
+            "timestamp": "2026-03-10T23:58:11",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "read_file",
+            "content": "ok",
+            "timestamp": "2026-03-10T23:58:12",
+        },
+        {
+            "role": "assistant",
+            "content": "Done.",
+            "timestamp": "2026-03-10T23:58:13",
+        },
+    ]
+
+    messages = channel._messages_to_opencode(session, "session-1")
+    assistant_parts = messages[1]["parts"]
+    assert assistant_parts[1]["type"] == "text"
+    assert assistant_parts[1]["phase"] == "thinking"
+    assert assistant_parts[2]["type"] == "text"
+    assert assistant_parts[2]["phase"] == "assistant"
 
 
 async def test_session_status_returns_context_breakdown(bus, session_manager):

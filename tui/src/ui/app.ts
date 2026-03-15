@@ -2,11 +2,13 @@ import {
   TUI,
   ProcessTerminal,
   Container,
+  Spacer,
   Text,
   Loader,
   Editor,
   matchesKey,
   Key,
+  type Component,
   type OverlayHandle,
   CombinedAutocompleteProvider,
 } from "@mariozechner/pi-tui";
@@ -19,6 +21,7 @@ import type {
   MessageInfo,
   MessagePart,
   PermissionRequest,
+  ProviderCatalog,
 } from "../api/types.js";
 
 import { editorTheme, colors } from "./theme.js";
@@ -45,6 +48,7 @@ export class App {
   private activeSessionId = "";
   private isBusy = false;
   private defaultModel = "";
+  private providerCatalog: ProviderCatalog | null = null;
 
   constructor(client: NanobotClient) {
     this.client = client;
@@ -59,7 +63,7 @@ export class App {
     this.tui.addChild(this.chatLog);
     this.tui.addChild(this.statusContainer);
     this.tui.addChild(this.editorContainer);
-    this.tui.addChild(this.footer.container);
+    this.tui.addChild(this.footer);
 
     this.editor = new Editor(this.tui, editorTheme, { paddingX: 1 });
     this.editor.onSubmit = (text) => this.handleSubmit(text);
@@ -117,8 +121,9 @@ export class App {
         this.client.listSessions(),
       ]);
 
+      this.providerCatalog = providers;
       this.defaultModel = providers.defaultModel;
-      this.footer.setModel(this.defaultModel);
+      this.updateFooterModel(this.defaultModel);
 
       const session =
         sessions.length > 0
@@ -126,9 +131,11 @@ export class App {
           : await this.client.createSession();
 
       this.activeSessionId = session.id;
-      this.footer.setSession(session.title || session.id);
 
-      await this.loadHistory(session.id);
+      const historyCount = await this.loadHistory(session.id);
+      if (historyCount === 0) {
+        this.chatLog.setEmptyState(this.buildEmptyState());
+      }
       this.chatLog.removeChild(connecting);
 
       this.sse.connect();
@@ -143,15 +150,17 @@ export class App {
     }
   }
 
-  private async loadHistory(sessionId: string): Promise<void> {
+  private async loadHistory(sessionId: string): Promise<number> {
     try {
       const messages = await this.client.getMessages(sessionId);
       this.chatLog.clearAll();
       for (const msg of messages) {
         this.chatLog.addHistoryMessage(msg);
       }
+      return messages.length;
     } catch {
       // No history or error - that's fine
+      return 0;
     }
   }
 
@@ -179,11 +188,6 @@ export class App {
 
       case "session.created":
       case "session.updated":
-        if (event.properties.info.id === this.activeSessionId) {
-          this.footer.setSession(
-            event.properties.info.title || event.properties.info.id
-          );
-        }
         break;
     }
 
@@ -193,13 +197,12 @@ export class App {
   private handleSessionStatus(status: { type: string; context?: Record<string, unknown> }): void {
     const busy = status.type === "busy";
     this.isBusy = busy;
-    this.footer.setBusy(busy);
 
     if (busy) {
       if (!this.statusLoader) {
         this.statusLoader = new Loader(
           this.tui,
-          colors.accent,
+          colors.dim,
           colors.dim,
           "Thinking..."
         );
@@ -213,18 +216,26 @@ export class App {
     }
 
     if (status.context) {
-      const tokens = status.context.tokens as { used?: number } | undefined;
-      if (tokens?.used) {
-        this.footer.setTokens(tokens.used);
+      const tokens = status.context.tokens as { used?: number; remaining?: number } | undefined;
+      if (typeof tokens?.used === "number" || typeof tokens?.remaining === "number") {
+        this.footer.setContextUsage(tokens?.used ?? 0, tokens?.remaining ?? 0);
+      }
+
+      const mode = status.context.mode;
+      if (typeof mode === "string" && mode) {
+        this.footer.setThinkingLevel(mode);
       }
     }
   }
 
   private handleMessageUpdated(info: MessageInfo): void {
+    this.chatLog.clearEmptyState();
+    this.syncFooterFromMessage(info);
     this.chatLog.upsertMessageInfo(info);
   }
 
   private handlePartUpdated(part: MessagePart): void {
+    this.chatLog.clearEmptyState();
     if (part.type === "text") {
       this.chatLog.upsertTextPart(part);
     } else if (part.type === "tool") {
@@ -265,7 +276,11 @@ export class App {
     }
 
     try {
-      await this.client.sendMessage(this.activeSessionId, normalized);
+      await this.client.sendMessage(
+        this.activeSessionId,
+        normalized,
+        this.defaultModel || undefined
+      );
     } catch (err) {
       this.chatLog.addSystem(
         `Send failed: ${err instanceof Error ? err.message : String(err)}`
@@ -293,9 +308,16 @@ export class App {
       case "/model": {
         const modelName = parts.slice(1).join(" ");
         if (modelName) {
-          this.defaultModel = modelName;
-          this.footer.setModel(modelName);
-          this.chatLog.addSystem(`Model set to ${modelName}`);
+          try {
+            await this.client.setSessionModel(this.activeSessionId, modelName);
+            this.defaultModel = modelName;
+            this.updateFooterModel(modelName);
+            this.chatLog.addSystem(`Model set to ${modelName}`);
+          } catch (err) {
+            this.chatLog.addSystem(
+              `Failed to set model: ${err instanceof Error ? err.message : String(err)}`
+            );
+          }
         } else {
           await this.showModelSelector();
         }
@@ -323,7 +345,6 @@ export class App {
 
   private async switchSession(session: SessionInfo): Promise<void> {
     this.activeSessionId = session.id;
-    this.footer.setSession(session.title || session.id);
 
     this.chatLog.clearAll();
 
@@ -333,7 +354,10 @@ export class App {
       this.statusLoader = null;
     }
 
-    await this.loadHistory(session.id);
+    const historyCount = await this.loadHistory(session.id);
+    if (historyCount === 0) {
+      this.chatLog.setEmptyState(this.buildEmptyState());
+    }
     this.tui.requestRender();
   }
 
@@ -385,10 +409,17 @@ export class App {
       const { selectListTheme } = await import("./theme.js");
 
       const list = new SelectList(items, 10, selectListTheme);
-      list.onSelect = (item) => {
-        this.defaultModel = item.value;
-        this.footer.setModel(item.value);
-        this.chatLog.addSystem(`Model: ${item.value}`);
+      list.onSelect = async (item) => {
+        try {
+          await this.client.setSessionModel(this.activeSessionId, item.value);
+          this.defaultModel = item.value;
+          this.updateFooterModel(item.value);
+          this.chatLog.addSystem(`Model: ${item.value}`);
+        } catch (err) {
+          this.chatLog.addSystem(
+            `Failed to set model: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
         this.overlay?.hide();
         this.overlay = null;
         this.tui.setFocus(this.editor);
@@ -418,5 +449,61 @@ export class App {
     this.sse.disconnect();
     this.tui.stop();
     process.exit(0);
+  }
+
+  private buildEmptyState(): string[] {
+    return [
+      `${colors.accentBold("nanobot tui")}${colors.dim("  rose pine")}`,
+      colors.dim(""),
+      `${colors.text("Start a session below or use a command:")}`,
+      `${colors.dim("/new")}${colors.border("  -  ")}${colors.dim("create a new session")}`,
+      `${colors.dim("/sessions")}${colors.border("  -  ")}${colors.dim("switch sessions")}`,
+      `${colors.dim("/model")}${colors.border("  -  ")}${colors.dim("select a model")}`,
+      `${colors.dim("/compact")}${colors.border("  -  ")}${colors.dim("summarize current session")}`,
+      colors.dim(""),
+      `${colors.muted("Messages, tool runs, and replies will appear here in chronological order.")}`,
+    ];
+  }
+
+  private syncFooterFromMessage(info: MessageInfo): void {
+    if (info.providerID || info.modelID) {
+      this.footer.setProviderModel(info.providerID || "", info.modelID || "");
+    }
+
+    if (info.mode) {
+      this.footer.setThinkingLevel(info.mode);
+    }
+
+    if (info.tokens) {
+      const used = info.tokens.input + info.tokens.output + info.tokens.reasoning;
+      const total = this.currentContextLimit();
+      const remaining = total > 0 ? Math.max(0, total - used) : 0;
+      this.footer.setContextUsage(used, remaining);
+    }
+  }
+
+  private updateFooterModel(fullModelId: string): void {
+    if (!fullModelId) {
+      this.footer.setProviderModel("", "");
+      return;
+    }
+    const [provider, ...rest] = fullModelId.split("/");
+    this.footer.setProviderModel(provider || "", rest.join("/") || fullModelId);
+  }
+
+  private currentContextLimit(): number {
+    if (!this.providerCatalog) {
+      return 0;
+    }
+
+    for (const provider of this.providerCatalog.providers) {
+      for (const model of Object.values(provider.models)) {
+        if (`${provider.id}/${model.id}` === this.defaultModel) {
+          return model.limit.context;
+        }
+      }
+    }
+
+    return 0;
   }
 }

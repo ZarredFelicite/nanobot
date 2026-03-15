@@ -23,6 +23,7 @@ export class ChatLog extends Container {
   private readonly assistantMessages = new Map<string, AssistantMessageComponent>();
   private readonly toolComponents = new Map<string, ToolExecutionComponent>();
   private readonly entries = new Map<string, EntryRecord>();
+  private emptyState: string[] = [];
   private systemSeq = 0;
   private orderSeq = 0;
 
@@ -41,8 +42,22 @@ export class ChatLog extends Container {
     this.assistantMessages.clear();
     this.toolComponents.clear();
     this.entries.clear();
+    this.emptyState = [];
     this.systemSeq = 0;
     this.orderSeq = 0;
+  }
+
+  setEmptyState(lines: string[]): void {
+    this.emptyState = lines;
+    this.rebuild();
+  }
+
+  clearEmptyState(): void {
+    if (this.emptyState.length === 0) {
+      return;
+    }
+    this.emptyState = [];
+    this.rebuild();
   }
 
   addSystem(text: string): void {
@@ -91,16 +106,19 @@ export class ChatLog extends Container {
       return;
     }
 
-    let component = this.assistantMessages.get(part.messageID);
+    const created = part.time.created || meta.created;
+    const partKey = `part:${part.id}`;
+    const variant = part.phase === "thinking" ? "thinking" : "assistant";
+    let component = this.assistantMessages.get(part.id);
     if (!component) {
-      component = new AssistantMessageComponent();
-      this.assistantMessages.set(part.messageID, component);
+      component = new AssistantMessageComponent(variant);
+      this.assistantMessages.set(part.id, component);
     }
 
     component.updateContent(part.text);
-    this.entries.set(`msg:${part.messageID}`, {
-      order: meta.created,
-      seq: this.entrySeq(`msg:${part.messageID}`),
+    this.entries.set(partKey, {
+      order: created,
+      seq: this.entrySeq(partKey),
       component: this.wrapWithSpacing(component.container),
     });
     this.rebuild();
@@ -143,6 +161,11 @@ export class ChatLog extends Container {
 
   private rebuild(): void {
     this.clear();
+
+    if (this.entries.size === 0 && this.emptyState.length > 0) {
+      this.addChild(new Text(this.emptyState.join("\n"), 1, 0));
+      this.addChild(new Spacer());
+    }
 
     const ordered = [...this.entries.values()].sort((a, b) => {
       if (a.order !== b.order) {

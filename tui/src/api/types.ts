@@ -62,6 +62,7 @@ export interface TextPart {
   type: "text";
   text: string;
   time: { created: number };
+  phase?: "thinking" | "assistant";
   delta?: string;
 }
 
@@ -157,4 +158,39 @@ export interface Provider {
 export interface ProviderCatalog {
   providers: Provider[];
   defaultModel: string;
+}
+
+export interface ProviderCatalogResponse {
+  providers: Provider[];
+  default?: {
+    default?: string;
+  };
+}
+
+export interface TUIThemeConfig {
+  accent?: string;
+  border?: string;
+  userBackground?: string;
+  userText?: string;
+  assistantText?: string;
+  headingText?: string;
+  thinkingText?: string;
+  toolName?: string;
+  toolOutput?: string;
+  code?: string;
+  codeBlock?: string;
+}
+
+export interface AppConfig {
+  theme?: string;
+  keybinds?: Record<string, unknown>;
+  tui?: {
+    theme?: TUIThemeConfig;
+  };
+  model?: string;
+  provider?: Record<string, unknown>;
+  mcp?: Record<string, unknown>;
+  agent?: Record<string, unknown>;
+  permission?: Record<string, unknown>;
+  tools?: Record<string, unknown>;
 }

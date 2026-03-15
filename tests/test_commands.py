@@ -6,6 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.cli.commands import app
+from nanobot.cli.commands import _resolve_external_tui_binary
 from nanobot.cli.commands import _load_runtime_config
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
@@ -248,6 +249,43 @@ def test_agent_help_lists_config_and_workspace_flags():
     assert result.exit_code == 0
     assert "--config" in result.stdout
     assert "--workspace" in result.stdout
+
+
+def test_agent_launches_external_tui_when_no_message(tmp_path):
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+    config.channels.opencode.port = 4096
+
+    with (
+        patch("nanobot.cli.commands._load_runtime_config", return_value=config),
+        patch("nanobot.cli.commands.sync_workspace_templates"),
+        patch("nanobot.cli.commands._launch_external_tui") as mock_launch,
+    ):
+        result = runner.invoke(app, ["agent"])
+
+    assert result.exit_code == 0
+    mock_launch.assert_called_once_with(4096)
+
+
+def test_resolve_external_tui_binary_prefers_repo_local_script():
+    with (
+        patch("pathlib.Path.is_file", lambda self: str(self).endswith("tui/nanobot-tui")),
+        patch("nanobot.cli.commands.shutil.which", return_value="/usr/bin/nanobot-tui"),
+    ):
+        resolved = _resolve_external_tui_binary()
+
+    assert resolved is not None
+    assert resolved.endswith("tui/nanobot-tui")
+
+
+def test_resolve_external_tui_binary_falls_back_to_path():
+    with (
+        patch("pathlib.Path.is_file", return_value=False),
+        patch("nanobot.cli.commands.shutil.which", return_value="/usr/bin/nanobot-tui"),
+    ):
+        resolved = _resolve_external_tui_binary()
+
+    assert resolved == "/usr/bin/nanobot-tui"
 
 
 def test_load_runtime_config_overrides_workspace(tmp_path):

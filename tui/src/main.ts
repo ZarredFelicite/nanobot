@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { NanobotClient } from "./api/client.js";
+import { applyTheme } from "./ui/theme.js";
 import { App } from "./ui/app.js";
 
 function parseArgs(): { host: string; port: number } {
@@ -31,6 +32,13 @@ async function main(): Promise<void> {
     );
     console.error("Start it with: nanobot gateway --port " + port);
     process.exit(1);
+  }
+
+  try {
+    const config = await client.getConfig();
+    applyTheme(config.tui?.theme ?? {});
+  } catch {
+    // Keep builtin defaults if config bootstrap fails.
   }
 
   const app = new App(client);
