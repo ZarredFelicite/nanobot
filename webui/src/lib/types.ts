@@ -93,6 +93,8 @@ export interface SessionStatus {
       model?: string;
       tokens?: { used: number; remaining: number };
       mode?: string;
+      compactionPasses?: number;
+      trimmedHistoryMessages?: number;
     };
   };
 }

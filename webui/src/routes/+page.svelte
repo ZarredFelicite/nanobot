@@ -511,15 +511,22 @@
         </div>
       </div>
       {#if contextInfo?.usagePercent != null}
-        <div
-          class="token-bar"
-          title="{Math.round(contextInfo.usagePercent)}% context used"
-        >
+        <div class="token-row">
           <div
-            class="token-bar-fill"
-            class:over-budget={!contextInfo.withinBudget}
-            style="width: {Math.min(contextInfo.usagePercent, 100)}%"
-          ></div>
+            class="token-bar"
+            title="{Math.round(contextInfo.usagePercent)}% context used"
+          >
+            <div
+              class="token-bar-fill"
+              class:over-budget={!contextInfo.withinBudget}
+              style="width: {Math.min(contextInfo.usagePercent, 100)}%"
+            ></div>
+          </div>
+          {#if contextInfo.compactionPasses && contextInfo.compactionPasses > 0}
+            <span class="compaction-tag" title="Context was compacted to fit budget">
+              compacted
+            </span>
+          {/if}
         </div>
       {/if}
     </div>
@@ -896,11 +903,18 @@
     animation: pulse-anim 1.4s ease-in-out infinite;
   }
 
+  .token-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+
   .token-bar {
+    flex: 1;
     height: 3px;
     background: var(--surface);
     border-radius: 1.5px;
-    margin-top: 0.5rem;
     overflow: hidden;
   }
 
@@ -913,6 +927,16 @@
 
   .token-bar-fill.over-budget {
     background: var(--danger);
+  }
+
+  .compaction-tag {
+    flex-shrink: 0;
+    font-size: 0.6rem;
+    font-weight: 500;
+    color: #fbbf24;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    opacity: 0.8;
   }
 
   @media (max-width: 768px) {

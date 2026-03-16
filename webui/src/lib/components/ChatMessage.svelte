@@ -29,6 +29,7 @@
 
   const isAssistant = $derived(message.info.role === 'assistant');
   const isUser = $derived(message.info.role === 'user');
+  const isCompact = $derived(message.info.mode === 'compact');
 
   const thinkingParts = $derived(textParts.filter(p => p.phase === 'thinking'));
   const contentParts = $derived(textParts.filter(p => p.phase !== 'thinking'));
@@ -56,8 +57,22 @@
   }
 </script>
 
-<article class:assistant={isAssistant} class:user={isUser} class="msg">
-  {#if isUser}
+<article class:assistant={isAssistant} class:user={isUser} class:compact={isCompact} class="msg">
+  {#if isCompact}
+    <div class="compact-divider">
+      <div class="compact-line"></div>
+      <span class="compact-label">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0022 16z" />
+          <path d="M7.5 4.21l4.5 2.6 4.5-2.6M7.5 19.79V14.6L3 12M21 12l-4.5 2.6v5.19" />
+        </svg>
+        {#each contentParts as part (part.id)}
+          {part.text}
+        {/each}
+      </span>
+      <div class="compact-line"></div>
+    </div>
+  {:else if isUser}
     <div class="user-content">
       {#each textParts as part (part.id)}
         <div class="user-text">{part.text}</div>
@@ -478,5 +493,37 @@
     color: var(--muted);
     font-size: 0.85rem;
     font-style: italic;
+  }
+
+  .msg.compact {
+    padding: 0.5rem 0;
+  }
+
+  .compact-divider {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .compact-line {
+    flex: 1;
+    height: 1px;
+    background: rgba(251, 191, 36, 0.2);
+  }
+
+  .compact-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: #fbbf24;
+    white-space: nowrap;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .compact-label svg {
+    opacity: 0.7;
   }
 </style>

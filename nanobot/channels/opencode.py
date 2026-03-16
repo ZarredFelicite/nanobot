@@ -1472,7 +1472,7 @@ class OpenCodeChannel(BaseChannel):
             "time": {"created": now_ms, "completed": now_ms},
             "modelID": model_id,
             "providerID": provider_name,
-            "mode": "default",
+            "mode": "compact",
             "agent": "default",
             "path": {"cwd": str(self.agent_loop.workspace), "root": str(self.agent_loop.workspace)},
             "cost": 0,

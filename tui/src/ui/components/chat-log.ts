@@ -9,6 +9,7 @@ import { UserMessageComponent } from "./user-message.js";
 type MessageMeta = {
   role: "user" | "assistant";
   created: number;
+  mode?: string;
 };
 
 type EntryRecord = {
@@ -87,6 +88,7 @@ export class ChatLog extends Container {
     this.messageMeta.set(info.id, {
       role: info.role,
       created: existing?.created ?? info.time.created,
+      mode: info.mode ?? existing?.mode,
     });
   }
 
@@ -101,6 +103,21 @@ export class ChatLog extends Container {
         order: meta.created,
         seq: this.nextSeq(),
         component: this.wrapWithSpacing(new UserMessageComponent(part.text).container),
+      });
+      this.rebuild();
+      return;
+    }
+
+    if (meta.mode === "compact") {
+      const partKey = `part:${part.id}`;
+      const created = part.time.created || meta.created;
+      const label = part.text || "Context compacted";
+      const line = colors.warning("─".repeat(3));
+      const text = `${line} ${colors.warningBold("⊟ " + label)} ${line}`;
+      this.entries.set(partKey, {
+        order: created,
+        seq: this.entrySeq(partKey),
+        component: this.wrapWithSpacing(new Text(text, 1, 0)),
       });
       this.rebuild();
       return;

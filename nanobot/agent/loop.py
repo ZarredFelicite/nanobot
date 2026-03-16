@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import weakref
+from datetime import datetime
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -1196,23 +1197,94 @@ class AgentLoop:
         if self._subconscious and session.key != "heartbeat":
             self._subconscious.feed_messages(messages[skip:], session_key=session.key)
 
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
-        """Consolidate session history by trimming old messages.
+    async def _consolidate_memory(
+        self, session, archive_all: bool = False, *, generate_summary: bool = False,
+    ) -> bool | str:
+        """Consolidate session history: extract memories, summarize, then trim.
 
-        When subconscious is active, extraction happens continuously so
-        consolidation only needs to trim the session. Falls back to the
-        legacy MemoryStore consolidation when subconscious is disabled.
+        When subconscious is active, runs a final extraction pass on the messages
+        being compacted, generates a summary, inserts it as a system message in the
+        session, then trims. Falls back to legacy MemoryStore when subconscious is
+        disabled.
+
+        Returns True/str on success (str is the summary when generate_summary=True),
+        False on failure.
         """
         if self._subconscious:
-            # Subconscious handles extraction; just trim session messages
             if archive_all:
-                session.last_consolidated = len(session.messages)
-                return True
-            keep_count = self.memory_window // 2
-            if len(session.messages) <= keep_count:
-                return True
-            session.last_consolidated = len(session.messages) - keep_count
-            return True
+                old_messages = session.messages
+                keep_count = 0
+            else:
+                keep_count = self.memory_window // 2
+                if len(session.messages) <= keep_count:
+                    return True
+                old_messages = session.messages[session.last_consolidated : -keep_count] if keep_count else session.messages[session.last_consolidated :]
+                if not old_messages:
+                    return True
+
+            logger.info(
+                "Subconscious compaction: {} messages to compact, {} to keep",
+                len(old_messages), keep_count,
+            )
+
+            # 1) Extract memories from the messages being compacted
+            extractable = [m for m in old_messages if m.get("role") in ("user", "assistant") and m.get("content")]
+            if extractable:
+                try:
+                    await self._subconscious._extract(extractable)
+                    logger.info("Subconscious compaction: extracted memories from {} messages", len(extractable))
+                except Exception:
+                    logger.exception("Subconscious compaction: extraction failed, continuing with summarization")
+
+            # 2) Generate summary of compacted messages
+            summary = ""
+            if generate_summary and extractable and self._subconscious._provider:
+                conversation = "\n".join(
+                    f"[{m['role']}]: {m['content']}" for m in extractable
+                )
+                try:
+                    response = await self._subconscious._provider.chat(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Summarize this conversation comprehensively. Cover all topics "
+                                    "discussed, decisions made, problems solved, and outcomes reached. "
+                                    "Include enough detail that someone reading only this summary would "
+                                    "understand the full context of what happened. "
+                                    "Use [[Name]] wikilinks for people and entities."
+                                ),
+                            },
+                            {"role": "user", "content": conversation},
+                        ],
+                        model=self._subconscious._config.extraction_model,
+                    )
+                    if response.content:
+                        summary = response.content.strip()
+                except Exception:
+                    logger.exception("Subconscious compaction: summarization failed")
+
+            # 3) Insert summary as system message in the session before the kept messages
+            if summary:
+                insert_pos = len(session.messages) - keep_count if keep_count else len(session.messages)
+                session.messages.insert(insert_pos, {
+                    "role": "system",
+                    "content": f"[Compaction Summary]\n\n{summary}",
+                    "timestamp": datetime.now().isoformat(),
+                    "compact_event": True,
+                })
+                logger.info("Subconscious compaction: summary inserted as system message")
+
+            # 4) Trim session — account for the inserted summary message
+            if archive_all:
+                extra = 1 if summary else 0
+                session.last_consolidated = len(session.messages) - extra
+            else:
+                # keep_count messages + the summary message if inserted
+                kept = keep_count + (1 if summary else 0)
+                session.last_consolidated = len(session.messages) - kept
+
+            return summary if summary else True
 
         # Legacy fallback
         from nanobot.agent.memory import MemoryStore
@@ -1235,14 +1307,18 @@ class AgentLoop:
         try:
             async with lock:
                 before = session.last_consolidated
-                success = await self._consolidate_memory(session, archive_all=archive_all)
+                result = await self._consolidate_memory(
+                    session, archive_all=archive_all, generate_summary=True,
+                )
                 self.sessions.save(session)
+                summary = result if isinstance(result, str) else ""
                 return {
-                    "ok": bool(success),
+                    "ok": bool(result),
                     "archiveAll": archive_all,
                     "lastConsolidatedBefore": before,
                     "lastConsolidatedAfter": session.last_consolidated,
                     "messageCount": len(session.messages),
+                    "historyEntry": summary,
                 }
         finally:
             self._consolidating.discard(session.key)
