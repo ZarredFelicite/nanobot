@@ -258,9 +258,7 @@ class OpenCodeChannel(BaseChannel):
             vapid.save_public_key(str(push_dir / "vapid_public.pem"))
             logger.info("Generated VAPID keys for Web Push")
 
-        vapid = Vapid.from_file(str(key_file))
-        raw = vapid.private_pem()
-        self._vapid_private_key = raw.decode() if isinstance(raw, bytes) else raw
+        self._vapid_private_key = str(key_file)
         self._vapid_claims = {"sub": "mailto:nanobot@localhost"}
 
         # Load saved subscriptions
