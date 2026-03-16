@@ -989,8 +989,13 @@ class OpenCodeChannel(BaseChannel):
             body = await request.json()
         except Exception:
             body = {}
-        payload, status = await self._process_session_send(session_id, body)
-        return web.json_response(payload, status=status)
+
+        # Return immediately and process in background so mobile browsers
+        # don't timeout the POST (agent responses can take 30s+).
+        task = asyncio.create_task(self._process_session_send(session_id, body))
+        self._active_tasks.setdefault(session_id, set()).add(task)
+        task.add_done_callback(lambda t: self._active_tasks.get(session_id, set()).discard(t))
+        return web.json_response({"ok": True})
 
     async def _process_session_send(
         self,
