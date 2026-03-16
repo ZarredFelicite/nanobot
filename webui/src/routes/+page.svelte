@@ -207,7 +207,7 @@
 
   async function handleSend(): Promise<void> {
     const text = draft.trim();
-    if (!text || !selectedSessionId) return;
+    if (!text || !selectedSessionId || sending) return;
 
     try {
       sending = true;
