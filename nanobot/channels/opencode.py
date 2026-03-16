@@ -1284,6 +1284,10 @@ class OpenCodeChannel(BaseChannel):
                 part_counter += 1
                 current_text_part_id = f"{asst_part_id}_p{part_counter}"
                 current_text_part_created_ms = self._epoch_ms(time.time())
+            # The final response text is always "assistant" phase — only
+            # reasoning_content (sent via on_progress with is_reasoning=True)
+            # should be "thinking".
+            if final_text:
                 current_text_part_phase = "assistant"
             asst_part_final = {
                 "id": current_text_part_id,
