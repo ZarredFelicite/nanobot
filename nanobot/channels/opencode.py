@@ -21,6 +21,13 @@ from typing import TYPE_CHECKING, Any, Callable
 from aiohttp import web
 from loguru import logger
 
+try:
+    from pywebpush import webpush, WebPushException
+    from py_vapid import Vapid
+    HAS_WEBPUSH = True
+except ImportError:
+    HAS_WEBPUSH = False
+
 from nanobot.bus.events import OutboundMessage
 from nanobot.channels.base import BaseChannel
 
@@ -212,6 +219,13 @@ class OpenCodeChannel(BaseChannel):
         self._runner: web.AppRunner | None = None
         self._sse_write_timeout_s = 2.0
 
+        # Web Push notifications
+        self._push_subscriptions: list[dict[str, Any]] = []
+        self._vapid_private_key: str = ""
+        self._vapid_claims: dict[str, str] = {}
+        if HAS_WEBPUSH:
+            self._init_push()
+
     # ------------------------------------------------------------------
     # ID generation
     # ------------------------------------------------------------------
@@ -223,6 +237,92 @@ class OpenCodeChannel(BaseChannel):
     @staticmethod
     def _epoch_ms(ts: float) -> int:
         return int(ts * 1000)
+
+    # ------------------------------------------------------------------
+    # Web Push notifications
+    # ------------------------------------------------------------------
+
+    def _init_push(self) -> None:
+        """Initialize VAPID keys and load saved subscriptions."""
+        if not HAS_WEBPUSH:
+            return
+        workspace = self.agent_loop.workspace if self.agent_loop else Path.home() / ".nanobot"
+        push_dir = workspace / "push"
+        push_dir.mkdir(parents=True, exist_ok=True)
+
+        key_file = push_dir / "vapid_private.pem"
+        if not key_file.exists():
+            vapid = Vapid()
+            vapid.generate_keys()
+            vapid.save_key(str(key_file))
+            vapid.save_public_key(str(push_dir / "vapid_public.pem"))
+            logger.info("Generated VAPID keys for Web Push")
+
+        vapid = Vapid.from_file(str(key_file))
+        raw = vapid.private_pem()
+        self._vapid_private_key = raw.decode() if isinstance(raw, bytes) else raw
+        self._vapid_claims = {"sub": "mailto:nanobot@localhost"}
+
+        # Load saved subscriptions
+        subs_file = push_dir / "subscriptions.json"
+        if subs_file.exists():
+            try:
+                self._push_subscriptions = json.loads(subs_file.read_text())
+            except Exception:
+                self._push_subscriptions = []
+
+    def _get_vapid_public_key(self) -> str:
+        """Return the application server key (VAPID public key) as URL-safe base64."""
+        if not HAS_WEBPUSH:
+            return ""
+        workspace = self.agent_loop.workspace if self.agent_loop else Path.home() / ".nanobot"
+        key_file = workspace / "push" / "vapid_private.pem"
+        if not key_file.exists():
+            return ""
+        import base64
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        vapid = Vapid.from_file(str(key_file))
+        raw_pub = vapid.public_key.public_bytes(
+            encoding=Encoding.X962, format=PublicFormat.UncompressedPoint,
+        )
+        return base64.urlsafe_b64encode(raw_pub).rstrip(b"=").decode()
+
+    def _save_subscriptions(self) -> None:
+        workspace = self.agent_loop.workspace if self.agent_loop else Path.home() / ".nanobot"
+        subs_file = workspace / "push" / "subscriptions.json"
+        subs_file.parent.mkdir(parents=True, exist_ok=True)
+        subs_file.write_text(json.dumps(self._push_subscriptions))
+
+    async def _send_push(self, title: str, body: str, url: str = "/") -> None:
+        """Send push notification to all subscriptions."""
+        if not HAS_WEBPUSH or not self._push_subscriptions or not self._vapid_private_key:
+            return
+
+        payload = json.dumps({"title": title, "body": body, "url": url})
+        stale: list[int] = []
+
+        for i, sub in enumerate(self._push_subscriptions):
+            try:
+                webpush(
+                    subscription_info=sub,
+                    data=payload,
+                    vapid_private_key=self._vapid_private_key,
+                    vapid_claims=self._vapid_claims,
+                )
+            except WebPushException as e:
+                resp = getattr(e, "response", None)
+                status = getattr(resp, "status_code", 0) if resp else 0
+                if status in (404, 410):
+                    stale.append(i)
+                else:
+                    logger.debug("Push notification failed: {}", e)
+            except Exception as e:
+                logger.debug("Push notification failed: {}", e)
+
+        if stale:
+            for idx in reversed(stale):
+                self._push_subscriptions.pop(idx)
+            self._save_subscriptions()
 
     @staticmethod
     def _default_title_for_session(session: Session) -> str:
@@ -542,6 +642,11 @@ class OpenCodeChannel(BaseChannel):
         app.router.add_post("/log", self._handle_stub_ok)
         app.router.add_post("/instance/dispose", self._handle_stub_ok)
         app.router.add_post("/global/dispose", self._handle_stub_ok)
+
+        # Web Push
+        app.router.add_get("/push/vapid-key", self._handle_push_vapid_key)
+        app.router.add_post("/push/subscribe", self._handle_push_subscribe)
+        app.router.add_post("/push/unsubscribe", self._handle_push_unsubscribe)
 
         # Browser UI (added last so API routes win)
         app.router.add_get("/", self._handle_web_ui)
@@ -1178,6 +1283,20 @@ class OpenCodeChannel(BaseChannel):
             asst_msg["time"]["completed"] = self._epoch_ms(time.time())
             await self._broadcast_sse("message.updated", {"info": asst_msg})
 
+            # Send push notification for completed assistant message
+            if final_text:
+                preview = final_text[:200] + ("…" if len(final_text) > 200 else "")
+                session_title = ""
+                if self.session_manager:
+                    s, _ = self._find_session(session_id)
+                    if s:
+                        session_title = s.metadata.get("title", session_id)
+                await self._send_push(
+                    title=session_title or session_id,
+                    body=preview,
+                    url=f"/?session={session_id}",
+                )
+
             # Re-broadcast user message after turn completes to ensure the TUI
             # has it — the initial broadcast may race with optimistic updates.
             await self._broadcast_sse("message.updated", {"info": user_msg})
@@ -1770,6 +1889,41 @@ class OpenCodeChannel(BaseChannel):
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"healthy": True, "version": "0.1.4"})
+
+    # ------------------------------------------------------------------
+    # Web Push handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_push_vapid_key(self, request: web.Request) -> web.Response:
+        if not HAS_WEBPUSH:
+            return web.json_response({"error": "pywebpush not installed"}, status=501)
+        key = self._get_vapid_public_key()
+        if not key:
+            return web.json_response({"error": "VAPID keys not initialized"}, status=500)
+        return web.json_response({"key": key})
+
+    async def _handle_push_subscribe(self, request: web.Request) -> web.Response:
+        if not HAS_WEBPUSH:
+            return web.json_response({"error": "pywebpush not installed"}, status=501)
+        body = await request.json()
+        sub = body.get("subscription")
+        if not sub or not sub.get("endpoint"):
+            return web.json_response({"error": "invalid subscription"}, status=400)
+        # Deduplicate by endpoint
+        endpoints = {s.get("endpoint") for s in self._push_subscriptions}
+        if sub["endpoint"] not in endpoints:
+            self._push_subscriptions.append(sub)
+            self._save_subscriptions()
+        return web.json_response({"ok": True})
+
+    async def _handle_push_unsubscribe(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        endpoint = body.get("endpoint", "")
+        self._push_subscriptions = [
+            s for s in self._push_subscriptions if s.get("endpoint") != endpoint
+        ]
+        self._save_subscriptions()
+        return web.json_response({"ok": True})
 
     # ------------------------------------------------------------------
     # Data translation

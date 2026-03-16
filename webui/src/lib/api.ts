@@ -66,3 +66,23 @@ export function patchSession(sessionId: string, body: Record<string, unknown>): 
 export function getProviders(): Promise<ProviderInfo[]> {
   return request('/provider');
 }
+
+// Web Push
+export async function getVapidKey(): Promise<string> {
+  const res = await request<{ key: string }>('/push/vapid-key');
+  return res.key;
+}
+
+export function pushSubscribe(subscription: PushSubscription): Promise<unknown> {
+  return request('/push/subscribe', {
+    method: 'POST',
+    body: JSON.stringify({ subscription: subscription.toJSON() })
+  });
+}
+
+export function pushUnsubscribe(endpoint: string): Promise<unknown> {
+  return request('/push/unsubscribe', {
+    method: 'POST',
+    body: JSON.stringify({ endpoint })
+  });
+}

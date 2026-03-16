@@ -27,6 +27,12 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // Network-only for push subscription endpoints
+  if (url.pathname.startsWith('/push')) {
+    event.respondWith(fetch(event.request));
+    return;
+  }
+
   // Cache-first for static assets (GET only)
   if (event.request.method === 'GET') {
     event.respondWith(
@@ -42,4 +48,44 @@ self.addEventListener('fetch', (event) => {
       })
     );
   }
+});
+
+// Web Push notification handler
+self.addEventListener('push', (event) => {
+  if (!event.data) return;
+
+  let data;
+  try {
+    data = event.data.json();
+  } catch {
+    data = { title: 'Nanobot', body: event.data.text() };
+  }
+
+  event.waitUntil(
+    self.registration.showNotification(data.title || 'Nanobot', {
+      body: data.body || '',
+      icon: '/icon-192.png',
+      badge: '/icon-192.png',
+      tag: 'nanobot-message',
+      renotify: true,
+      data: { url: data.url || '/' }
+    })
+  );
+});
+
+// Click notification to open/focus the app
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const url = event.notification.data?.url || '/';
+
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) {
+        if (new URL(client.url).pathname === '/' && 'focus' in client) {
+          return client.focus();
+        }
+      }
+      return self.clients.openWindow(url);
+    })
+  );
 });
