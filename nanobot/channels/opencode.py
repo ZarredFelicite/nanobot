@@ -1872,6 +1872,12 @@ class OpenCodeChannel(BaseChannel):
                 i += 1
                 continue
 
+            # System messages (e.g. compaction summaries) — treat as display messages.
+            if role == "system":
+                display_messages.append(entry)
+                i += 1
+                continue
+
             if role != "assistant":
                 i += 1
                 continue
@@ -1895,6 +1901,14 @@ class OpenCodeChannel(BaseChannel):
                         if isinstance(c, str) and c.strip():
                             post_tool_text = c.strip()
                             usage_source = candidate
+                        # Merge reasoning_content from follow-up if present.
+                        rc = candidate.get("reasoning_content", "")
+                        if isinstance(rc, str) and rc.strip():
+                            existing_rc = merged.get("reasoning_content", "")
+                            if existing_rc:
+                                merged["reasoning_content"] = existing_rc + "\n\n" + rc.strip()
+                            else:
+                                merged["reasoning_content"] = rc.strip()
                         j += 1
                         break
                     j += 1
@@ -1954,6 +1968,34 @@ class OpenCodeChannel(BaseChannel):
                 prev_user_created_ms = created
                 continue
 
+            # System messages (compaction summaries) — render as compact assistant messages.
+            if role == "system" and m.get("compact_event"):
+                text = content if isinstance(content, str) else ""
+                if text:
+                    msg = {
+                        "info": {
+                            "id": msg_id,
+                            "sessionID": session_id,
+                            "role": "assistant",
+                            "time": {"created": created, "completed": created},
+                            "mode": "compact",
+                            "agent": "default",
+                        },
+                        "parts": [
+                            {
+                                "id": part_id,
+                                "sessionID": session_id,
+                                "messageID": msg_id,
+                                "type": "text",
+                                "text": text,
+                                "time": {"start": created, "end": created},
+                                "phase": "assistant",
+                            }
+                        ],
+                    }
+                    result.append(msg)
+                continue
+
             if role != "assistant":
                 continue
 
@@ -1961,8 +2003,11 @@ class OpenCodeChannel(BaseChannel):
             pre_tool_text = m.get("pre_tool_content", "")
             if not isinstance(pre_tool_text, str):
                 pre_tool_text = ""
+            reasoning_text = m.get("reasoning_content", "")
+            if not isinstance(reasoning_text, str):
+                reasoning_text = ""
             tool_calls = m.get("tool_calls", [])
-            if not text and not pre_tool_text and not tool_calls:
+            if not text and not pre_tool_text and not reasoning_text and not tool_calls:
                 continue
 
             created_assistant = created
@@ -2040,7 +2085,24 @@ class OpenCodeChannel(BaseChannel):
                 )
                 part_idx += 1
 
+            if reasoning_text:
+                parts.append(
+                    {
+                        "id": f"{part_id}_{part_idx}",
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                        "type": "text",
+                        "text": reasoning_text,
+                        "time": {"start": created_assistant, "end": created_assistant},
+                        "phase": "thinking",
+                    }
+                )
+                part_idx += 1
+
             if pre_tool_text:
+                # When reasoning_content exists, pre_tool_text is the visible response
+                # before tool calls (not thinking). Otherwise it's legacy thinking text.
+                phase = "assistant" if reasoning_text else "thinking"
                 parts.append(
                     {
                         "id": f"{part_id}_{part_idx}",
@@ -2049,7 +2111,7 @@ class OpenCodeChannel(BaseChannel):
                         "type": "text",
                         "text": pre_tool_text,
                         "time": {"start": created_assistant, "end": created_assistant},
-                        "phase": "thinking",
+                        "phase": phase,
                     }
                 )
                 part_idx += 1
