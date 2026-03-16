@@ -10,7 +10,6 @@ export default defineConfig(({ mode }) => {
     server: {
       host: '0.0.0.0',
       port: 4173,
-      allowedHosts: ['web.manticore-lenok.ts.net'],
       proxy: {
         '^/(config|provider|agent|event|global|session|command|skill|lsp|mcp|experimental|formatter|vcs|path|find|file|permission|question|log|instance)(/.*)?$': {
           target,
