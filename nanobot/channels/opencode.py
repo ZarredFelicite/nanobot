@@ -308,15 +308,16 @@ class OpenCodeChannel(BaseChannel):
                         vapid_private_key=self._vapid_private_key,
                         vapid_claims=self._vapid_claims,
                     )
-                except WebPushException as e:
+                except Exception as e:
+                    # Detect gone/expired subscriptions from response or message.
                     resp = getattr(e, "response", None)
                     status = getattr(resp, "status_code", 0) if resp else 0
-                    if status in (404, 410):
+                    msg = str(e)
+                    if status in (404, 410) or "410" in msg or "unsubscribed" in msg:
                         stale.append(i)
+                        logger.debug("Push subscription expired, removing: {}", msg[:120])
                     else:
-                        logger.debug("Push notification failed: {}", e)
-                except Exception as e:
-                    logger.debug("Push notification failed: {}", e)
+                        logger.debug("Push notification failed: {}", msg[:200])
             return stale
 
         loop = asyncio.get_running_loop()
