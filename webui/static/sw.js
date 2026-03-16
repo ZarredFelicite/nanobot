@@ -20,14 +20,14 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
-  // Never cache SSE or API calls
-  if (url.pathname.startsWith('/event') || url.pathname.startsWith('/session') ||
-      url.pathname.startsWith('/provider') || url.pathname.startsWith('/config') ||
-      url.pathname.startsWith('/command') || url.pathname.startsWith('/agent')) {
+  // Network-only for SSE and API calls — pass through without caching
+  const apiPrefixes = ['/event', '/session', '/provider', '/config', '/command', '/agent'];
+  if (apiPrefixes.some((p) => url.pathname.startsWith(p))) {
+    event.respondWith(fetch(event.request));
     return;
   }
 
-  // Cache-first for static assets
+  // Cache-first for static assets (GET only)
   if (event.request.method === 'GET') {
     event.respondWith(
       caches.match(event.request).then((cached) => {
