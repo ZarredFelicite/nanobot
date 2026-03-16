@@ -299,26 +299,30 @@ class OpenCodeChannel(BaseChannel):
             return
 
         payload = json.dumps({"title": title, "body": body, "url": url})
-        stale: list[int] = []
 
-        for i, sub in enumerate(self._push_subscriptions):
-            try:
-                webpush(
-                    subscription_info=sub,
-                    data=payload,
-                    vapid_private_key=self._vapid_private_key,
-                    vapid_claims=self._vapid_claims,
-                )
-            except WebPushException as e:
-                resp = getattr(e, "response", None)
-                status = getattr(resp, "status_code", 0) if resp else 0
-                if status in (404, 410):
-                    stale.append(i)
-                else:
+        def _do_push() -> list[int]:
+            stale: list[int] = []
+            for i, sub in enumerate(self._push_subscriptions):
+                try:
+                    webpush(
+                        subscription_info=sub,
+                        data=payload,
+                        vapid_private_key=self._vapid_private_key,
+                        vapid_claims=self._vapid_claims,
+                    )
+                except WebPushException as e:
+                    resp = getattr(e, "response", None)
+                    status = getattr(resp, "status_code", 0) if resp else 0
+                    if status in (404, 410):
+                        stale.append(i)
+                    else:
+                        logger.debug("Push notification failed: {}", e)
+                except Exception as e:
                     logger.debug("Push notification failed: {}", e)
-            except Exception as e:
-                logger.debug("Push notification failed: {}", e)
+            return stale
 
+        loop = asyncio.get_running_loop()
+        stale = await loop.run_in_executor(None, _do_push)
         if stale:
             for idx in reversed(stale):
                 self._push_subscriptions.pop(idx)
@@ -1111,6 +1115,7 @@ class OpenCodeChannel(BaseChannel):
                 *,
                 tool_hint: bool = False,
                 tool_event: dict | None = None,
+                is_reasoning: bool = False,
             ) -> None:
                 nonlocal \
                     part_counter, \
@@ -1199,13 +1204,20 @@ class OpenCodeChannel(BaseChannel):
                 if tool_hint:
                     return
 
-                if has_seen_tools:
+                # Determine the correct phase for this chunk.
+                desired_phase = "thinking" if is_reasoning else "assistant"
+
+                if has_seen_tools or (current_text_part_phase != desired_phase and accumulated_text):
+                    # Phase changed or tools seen — start a new text part.
                     part_counter += 1
                     current_text_part_id = f"{asst_part_id}_p{part_counter}"
                     current_text_part_created_ms = self._epoch_ms(time.time())
-                    current_text_part_phase = "assistant"
+                    current_text_part_phase = desired_phase
                     accumulated_text.clear()
                     has_seen_tools = False
+                elif not accumulated_text:
+                    # First text chunk — set the phase.
+                    current_text_part_phase = desired_phase
 
                 accumulated_text.append(content)
                 await self._broadcast_sse(

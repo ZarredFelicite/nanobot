@@ -520,6 +520,9 @@ class AgentLoop:
                         break
 
                 if on_progress:
+                    # Send reasoning_content first (as thinking), then content (as visible).
+                    if response.reasoning_content:
+                        await on_progress(response.reasoning_content, is_reasoning=True)
                     clean = self._strip_think(response.content)
                     if parsed_markup_calls:
                         clean = None
@@ -1069,6 +1072,7 @@ class AgentLoop:
             *,
             tool_hint: bool = False,
             tool_event: dict | None = None,
+            is_reasoning: bool = False,
         ) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
