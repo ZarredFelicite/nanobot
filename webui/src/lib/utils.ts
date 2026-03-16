@@ -1,15 +1,64 @@
 import { Marked } from 'marked';
 import type { TokenInfo } from '$lib/types';
+import hljs from 'highlight.js/lib/core';
+import javascript from 'highlight.js/lib/languages/javascript';
+import typescript from 'highlight.js/lib/languages/typescript';
+import python from 'highlight.js/lib/languages/python';
+import bash from 'highlight.js/lib/languages/bash';
+import json from 'highlight.js/lib/languages/json';
+import css from 'highlight.js/lib/languages/css';
+import xml from 'highlight.js/lib/languages/xml';
+import go from 'highlight.js/lib/languages/go';
+import rust from 'highlight.js/lib/languages/rust';
+import sql from 'highlight.js/lib/languages/sql';
+import yaml from 'highlight.js/lib/languages/yaml';
+import markdown from 'highlight.js/lib/languages/markdown';
+import diff from 'highlight.js/lib/languages/diff';
+import nix from 'highlight.js/lib/languages/nix';
+
+hljs.registerLanguage('javascript', javascript);
+hljs.registerLanguage('js', javascript);
+hljs.registerLanguage('typescript', typescript);
+hljs.registerLanguage('ts', typescript);
+hljs.registerLanguage('python', python);
+hljs.registerLanguage('py', python);
+hljs.registerLanguage('bash', bash);
+hljs.registerLanguage('sh', bash);
+hljs.registerLanguage('shell', bash);
+hljs.registerLanguage('json', json);
+hljs.registerLanguage('css', css);
+hljs.registerLanguage('html', xml);
+hljs.registerLanguage('xml', xml);
+hljs.registerLanguage('go', go);
+hljs.registerLanguage('rust', rust);
+hljs.registerLanguage('sql', sql);
+hljs.registerLanguage('yaml', yaml);
+hljs.registerLanguage('yml', yaml);
+hljs.registerLanguage('markdown', markdown);
+hljs.registerLanguage('md', markdown);
+hljs.registerLanguage('diff', diff);
+hljs.registerLanguage('nix', nix);
 
 const marked = new Marked({
   breaks: true,
-  gfm: true
+  gfm: true,
+  renderer: {
+    code({ text, lang }) {
+      let highlighted: string;
+      if (lang && hljs.getLanguage(lang)) {
+        highlighted = hljs.highlight(text, { language: lang }).value;
+      } else {
+        highlighted = hljs.highlightAuto(text).value;
+      }
+      return `<pre><code class="hljs${lang ? ` language-${lang}` : ''}">${highlighted}</code></pre>`;
+    }
+  }
 });
 
 // Tags allowed in rendered markdown output. Everything else is stripped.
 const ALLOWED_TAGS = new Set([
   'p', 'br', 'strong', 'b', 'em', 'i', 'u', 's', 'del',
-  'code', 'pre', 'blockquote',
+  'code', 'pre', 'blockquote', 'span',
   'ul', 'ol', 'li',
   'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
   'a', 'img',
@@ -22,6 +71,9 @@ const ALLOWED_ATTRS: Record<string, Set<string>> = {
   img: new Set(['src', 'alt', 'title']),
   td: new Set(['align']),
   th: new Set(['align']),
+  span: new Set(['class']),
+  code: new Set(['class']),
+  pre: new Set(['class']),
 };
 
 function sanitizeHtml(html: string): string {
@@ -50,6 +102,14 @@ function sanitizeHtml(html: string): string {
       ?.map((attr: string) => {
         // Block javascript: URLs
         if (/javascript\s*:/i.test(attr)) return '';
+        // Restrict class values to hljs-* and language-* prefixes
+        if (/^\s*class\s*=/i.test(attr)) {
+          const valueMatch = attr.match(/=\s*(?:"([^"]*)"|'([^']*)')/);
+          const value = valueMatch?.[1] ?? valueMatch?.[2] ?? '';
+          const safe = value.split(/\s+/).filter(c => /^(hljs|language-)/.test(c)).join(' ');
+          if (!safe) return '';
+          return ` class="${safe}"`;
+        }
         return attr;
       })
       .join('') ?? '';

@@ -9,9 +9,10 @@
     onInput: (value: string) => void;
     onSend: () => void;
     onModelChange: (model: string) => void;
+    onAbort?: () => void;
   }
 
-  let { value, disabled, models, selectedModel, onInput, onSend, onModelChange }: Props = $props();
+  let { value, disabled, models, selectedModel, onInput, onSend, onModelChange, onAbort }: Props = $props();
   let textareaEl: HTMLTextAreaElement | undefined = $state();
 
   function handleKeydown(event: KeyboardEvent): void {
@@ -61,11 +62,19 @@
       onkeydown={handleKeydown}
       {disabled}
     ></textarea>
-    <button onclick={onSend} disabled={disabled || !value.trim()} aria-label="Send message">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
-      </svg>
-    </button>
+    {#if onAbort}
+      <button class="abort-btn" onclick={onAbort} aria-label="Stop generation">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+          <rect x="4" y="4" width="16" height="16" rx="2" />
+        </svg>
+      </button>
+    {:else}
+      <button onclick={onSend} disabled={disabled || !value.trim()} aria-label="Send message">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
+        </svg>
+      </button>
+    {/if}
   </div>
 </div>
 
@@ -169,6 +178,25 @@
   }
 
   button:not(:disabled):hover {
+    opacity: 0.85;
+  }
+
+  .abort-btn {
+    flex-shrink: 0;
+    width: 2.25rem;
+    height: 2.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 0.5rem;
+    background: var(--danger);
+    color: #0a1117;
+    cursor: pointer;
+    transition: opacity 150ms;
+  }
+
+  .abort-btn:hover {
     opacity: 0.85;
   }
 </style>

@@ -4,6 +4,7 @@ export interface SessionInfo {
   directory: string;
   title: string;
   version: string;
+  model?: string;
   time: {
     created: number;
     updated: number;
@@ -84,6 +85,12 @@ export interface SessionStatus {
   status: {
     type: 'idle' | 'busy';
     context?: {
+      budget?: number;
+      usagePercent?: number;
+      withinBudget?: boolean;
+      contextTokens?: number;
+      final?: { total: number };
+      model?: string;
       tokens?: { used: number; remaining: number };
       mode?: string;
     };

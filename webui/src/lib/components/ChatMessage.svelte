@@ -9,6 +9,15 @@
   let { message }: Props = $props();
 
   let collapsedTools = $state<Set<string>>(new Set());
+  let copied = $state(false);
+
+  function copyMessage(): void {
+    const text = textParts.filter(p => p.phase !== 'thinking').map(p => p.text).join('\n\n');
+    navigator.clipboard.writeText(text).then(() => {
+      copied = true;
+      setTimeout(() => { copied = false; }, 1500);
+    });
+  }
 
   const textParts = $derived(
     message.parts.filter((part): part is TextPart => part.type === 'text')
@@ -66,6 +75,18 @@
       {#if message.info.cost}
         <span class="cost-info">{formatCost(message.info.cost)}</span>
       {/if}
+      <button class="copy-btn" onclick={copyMessage} aria-label="Copy message">
+        {#if copied}
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 6L9 17l-5-5" />
+          </svg>
+        {:else}
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+            <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+          </svg>
+        {/if}
+      </button>
     </div>
 
     <div class="content-stack">
@@ -187,6 +208,28 @@
   time, .token-info, .cost-info {
     font-size: 0.7rem;
     color: var(--muted);
+  }
+
+  .copy-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0.15rem;
+    border-radius: 0.25rem;
+    opacity: 0;
+    transition: opacity 150ms, color 150ms;
+  }
+
+  .msg.assistant:hover .copy-btn {
+    opacity: 1;
+  }
+
+  .copy-btn:hover {
+    color: var(--accent);
   }
 
   .content-stack {

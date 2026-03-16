@@ -9,16 +9,28 @@
     creating: boolean;
     onCreate: () => void;
     onSelect: (sessionId: string) => void;
+    onDelete?: (sessionId: string) => void;
   }
 
-  let { sessions, activeSessionId, statuses, creating, onCreate, onSelect }: Props = $props();
+  let { sessions, activeSessionId, statuses, creating, onCreate, onSelect, onDelete }: Props = $props();
 
-  function statusLabel(sessionId: string): string {
-    return statuses[sessionId]?.type === 'busy' ? 'Busy' : 'Idle';
-  }
+  let searchQuery = $state('');
+
+  const filteredSessions = $derived(
+    searchQuery.trim()
+      ? sessions.filter(s =>
+          (s.title || 'Untitled').toLowerCase().includes(searchQuery.trim().toLowerCase())
+        )
+      : sessions
+  );
 
   function isBusy(sessionId: string): boolean {
     return statuses[sessionId]?.type === 'busy';
+  }
+
+  function handleDelete(event: Event, sessionId: string): void {
+    event.stopPropagation();
+    onDelete?.(sessionId);
   }
 </script>
 
@@ -37,13 +49,26 @@
     </button>
   </div>
 
+  <div class="search-bar">
+    <input
+      type="text"
+      placeholder="Search sessions..."
+      bind:value={searchQuery}
+      class="search-input"
+    />
+  </div>
+
   <div class="session-list">
     {#if sessions.length === 0}
       <div class="empty-state">
         <p>No sessions</p>
       </div>
+    {:else if filteredSessions.length === 0}
+      <div class="empty-state">
+        <p>No matches</p>
+      </div>
     {:else}
-      {#each sessions as session (session.id)}
+      {#each filteredSessions as session (session.id)}
         <button
           class:active={session.id === activeSessionId}
           class="session-card"
@@ -53,6 +78,22 @@
             <span class="card-title">{session.title || 'Untitled'}</span>
             {#if isBusy(session.id)}
               <span class="dot busy"></span>
+            {/if}
+            {#if onDelete}
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore node_invalid_placement_ssr -->
+              <span
+                class="delete-btn"
+                role="button"
+                tabindex="-1"
+                onclick={(e) => handleDelete(e, session.id)}
+                aria-label="Delete session"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2" />
+                </svg>
+              </span>
             {/if}
           </div>
           <div class="card-meta">
@@ -129,6 +170,32 @@
     to { transform: rotate(360deg); }
   }
 
+  .search-bar {
+    padding-bottom: 0.5rem;
+  }
+
+  .search-input {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.4rem;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.78rem;
+    padding: 0.35rem 0.5rem;
+    outline: none;
+    transition: border-color 150ms;
+  }
+
+  .search-input::placeholder {
+    color: var(--muted);
+    opacity: 0.6;
+  }
+
+  .search-input:focus {
+    border-color: rgba(110, 231, 168, 0.3);
+  }
+
   .session-list {
     overflow-y: auto;
     flex: 1;
@@ -175,6 +242,32 @@
     text-overflow: ellipsis;
     flex: 1;
     min-width: 0;
+  }
+
+  .delete-btn {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.4rem;
+    height: 1.4rem;
+    border: none;
+    border-radius: 0.3rem;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 150ms, color 150ms, background 150ms;
+    padding: 0;
+  }
+
+  .session-card:hover .delete-btn {
+    opacity: 1;
+  }
+
+  .delete-btn:hover {
+    color: var(--danger);
+    background: rgba(248, 113, 113, 0.1);
   }
 
   .dot {

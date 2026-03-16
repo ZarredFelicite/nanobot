@@ -48,6 +48,21 @@ export function getStatuses(): Promise<SessionStatus[]> {
   return request('/session/status');
 }
 
+export function deleteSession(sessionId: string): Promise<unknown> {
+  return request(`/session/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+}
+
+export function abortSession(sessionId: string): Promise<unknown> {
+  return request(`/session/${encodeURIComponent(sessionId)}/abort`, { method: 'POST' });
+}
+
+export function patchSession(sessionId: string, body: Record<string, unknown>): Promise<unknown> {
+  return request(`/session/${encodeURIComponent(sessionId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(body)
+  });
+}
+
 export function getProviders(): Promise<ProviderInfo[]> {
   return request('/provider');
 }

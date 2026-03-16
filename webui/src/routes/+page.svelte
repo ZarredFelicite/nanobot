@@ -5,7 +5,7 @@
   import Composer from '$lib/components/Composer.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import SessionSidebar from '$lib/components/SessionSidebar.svelte';
-  import { createSession, getMessages, getProviders, getStatuses, listSessions, sendMessage } from '$lib/api';
+  import { abortSession, createSession, deleteSession, getMessages, getProviders, getStatuses, listSessions, patchSession, sendMessage } from '$lib/api';
   import type { MessageInfo, MessagePart, MessageWithParts, ProviderInfo, SessionInfo, SessionStatus, SseEvent } from '$lib/types';
 
   let sessions = $state<SessionInfo[]>([]);
@@ -22,9 +22,14 @@
   let showScrollButton = $state(false);
   let availableModels = $state<{ provider: string; model: string; label: string }[]>([]);
   let selectedModel = $state('');
+  let sseDisconnected = $state(false);
+  let editingTitle = $state(false);
+  let titleDraft = $state('');
 
   let stream: EventSource | null = null;
   let chatLogEl: HTMLElement | undefined = $state();
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectDelay = 1000;
 
   const currentSession = $derived(
     sessions.find((session) => session.id === selectedSessionId) ?? null
@@ -36,14 +41,50 @@
 
   const isBusy = $derived(currentStatus?.type === 'busy');
 
+  const contextInfo = $derived(
+    selectedSessionId ? statuses[selectedSessionId]?.context : null
+  );
+
   onMount(() => {
     void boot();
     connectStream();
 
     return () => {
       stream?.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
     };
   });
+
+  function handleGlobalKeydown(event: KeyboardEvent): void {
+    const mod = event.ctrlKey || event.metaKey;
+    if (!mod) {
+      if (event.key === 'Escape') {
+        const ta = document.querySelector('textarea') as HTMLElement | null;
+        ta?.focus();
+        return;
+      }
+      return;
+    }
+
+    const target = event.target as HTMLElement;
+    const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA';
+
+    if (mod && event.key === 'n' && !isInput) {
+      event.preventDefault();
+      void handleCreateSession();
+      return;
+    }
+
+    if (mod && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+      event.preventDefault();
+      const idx = sessions.findIndex(s => s.id === selectedSessionId);
+      if (idx < 0) return;
+      const next = event.key === 'ArrowUp'
+        ? Math.max(0, idx - 1)
+        : Math.min(sessions.length - 1, idx + 1);
+      if (next !== idx) void selectSession(sessions[next].id);
+    }
+  }
 
   async function boot(): Promise<void> {
     try {
@@ -94,6 +135,7 @@
   }
 
   function connectStream(): void {
+    stream?.close();
     stream = new EventSource('/event');
 
     stream.onmessage = (event) => {
@@ -105,7 +147,13 @@
     };
 
     stream.onerror = () => {
-      error = error || 'Realtime connection dropped. Retrying...';
+      sseDisconnected = true;
+      stream?.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        connectStream();
+      }, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
     };
   }
 
@@ -125,7 +173,14 @@
 
   async function selectSession(sessionId: string, updateUrl = true): Promise<void> {
     selectedSessionId = sessionId;
+    editingTitle = false;
     error = '';
+
+    // Restore model from session metadata if available
+    const session = sessions.find(s => s.id === sessionId);
+    if (session?.model && availableModels.some(m => m.label === session.model)) {
+      selectedModel = session.model;
+    }
 
     if (updateUrl) {
       const url = new URL(page.url);
@@ -169,8 +224,59 @@
     }
   }
 
+  async function handleDeleteSession(sessionId: string): Promise<void> {
+    try {
+      await deleteSession(sessionId);
+    } catch (err) {
+      error = toErrorMessage(err, 'Failed to delete session');
+    }
+  }
+
+  async function handleAbort(): Promise<void> {
+    if (!selectedSessionId) return;
+    try {
+      await abortSession(selectedSessionId);
+    } catch (err) {
+      error = toErrorMessage(err, 'Failed to abort');
+    }
+  }
+
+  async function handleModelChange(model: string): Promise<void> {
+    selectedModel = model;
+    if (selectedSessionId) {
+      try {
+        await patchSession(selectedSessionId, { model });
+      } catch {
+        // Non-critical — model still used locally
+      }
+    }
+  }
+
+  async function handleTitleSubmit(): Promise<void> {
+    if (!selectedSessionId || !editingTitle) return;
+    const newTitle = titleDraft.trim();
+    editingTitle = false;
+    if (!newTitle || newTitle === currentSession?.title) return;
+    try {
+      await patchSession(selectedSessionId, { title: newTitle });
+    } catch (err) {
+      error = toErrorMessage(err, 'Failed to rename session');
+    }
+  }
+
+  function handleTitleKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void handleTitleSubmit();
+    } else if (event.key === 'Escape') {
+      editingTitle = false;
+    }
+  }
+
   function applyEvent(event: SseEvent): void {
     if (event.type === 'server.connected') {
+      sseDisconnected = false;
+      reconnectDelay = 1000;
       error = '';
       return;
     }
@@ -239,12 +345,21 @@
 
     const existingIndex = target.parts.findIndex((item: MessagePart) => item.id === part.id);
     if (existingIndex >= 0) {
-      target.parts[existingIndex] = mergeParts(target.parts[existingIndex], part);
+      const existing = target.parts[existingIndex];
+      // Mutate text parts in-place for Svelte 5 fine-grained reactivity
+      if (existing.type === 'text' && part.type === 'text') {
+        existing.text = part.text || existing.text;
+        existing.time = part.time;
+        if (part.phase) existing.phase = part.phase;
+      } else if (existing.type === 'tool' && part.type === 'tool') {
+        Object.assign(existing.state, part.state);
+        Object.assign(existing.state.input, part.state.input);
+      } else {
+        target.parts[existingIndex] = part;
+      }
     } else {
-      target.parts = [...target.parts, part];
+      target.parts.push(part);
     }
-
-    messages = [...messages];
   }
 
   function mergeParts(current: MessagePart, incoming: MessagePart): MessagePart {
@@ -320,6 +435,8 @@
   <title>Nanobot</title>
 </svelte:head>
 
+<svelte:window onkeydown={handleGlobalKeydown} />
+
 <div class="app-shell" class:sidebar-collapsed={!sidebarOpen}>
   <aside class="sidebar" class:open={sidebarOpen}>
     <SessionSidebar
@@ -329,8 +446,12 @@
       {creating}
       onCreate={handleCreateSession}
       onSelect={(id) => selectSession(id)}
+      onDelete={handleDeleteSession}
     />
   </aside>
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div class="backdrop" class:visible={sidebarOpen} onclick={() => sidebarOpen = false}></div>
 
   <button class="sidebar-toggle" onclick={() => sidebarOpen = !sidebarOpen} aria-label="Toggle sidebar">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
@@ -346,13 +467,38 @@
     <div class="chat-header">
       <div class="title-block">
         <div>
-          <h2>{currentSession?.title || 'New Session'}</h2>
-          {#if currentSession}
+          {#if editingTitle}
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="title-input"
+              type="text"
+              bind:value={titleDraft}
+              onblur={handleTitleSubmit}
+              onkeydown={handleTitleKeydown}
+              autofocus
+            />
+          {:else}
+            <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+            <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
+            <h2
+              class="title-editable"
+              role="button"
+              tabindex="0"
+              onclick={() => { editingTitle = true; titleDraft = currentSession?.title || ''; }}
+              onkeydown={(e) => { if (e.key === 'Enter') { editingTitle = true; titleDraft = currentSession?.title || ''; }}}
+            >{currentSession?.title || 'New Session'}</h2>
+          {/if}
+          {#if currentSession && !editingTitle}
             <span class="session-id">{currentSession.id}</span>
           {/if}
         </div>
-        {#if currentSession}
-          <div class="status-group">
+        <div class="status-group">
+          {#if sseDisconnected}
+            <span class="sse-pill" title="Connection lost — reconnecting...">
+              <span class="sse-dot"></span> Offline
+            </span>
+          {/if}
+          {#if currentSession}
             {#if isBusy}
               <span class="status-badge busy">
                 <span class="pulse"></span>
@@ -361,9 +507,21 @@
             {:else}
               <span class="status-badge idle">Idle</span>
             {/if}
-          </div>
-        {/if}
+          {/if}
+        </div>
       </div>
+      {#if contextInfo?.usagePercent != null}
+        <div
+          class="token-bar"
+          title="{Math.round(contextInfo.usagePercent)}% context used"
+        >
+          <div
+            class="token-bar-fill"
+            class:over-budget={!contextInfo.withinBudget}
+            style="width: {Math.min(contextInfo.usagePercent, 100)}%"
+          ></div>
+        </div>
+      {/if}
     </div>
 
     {#if error}
@@ -422,7 +580,8 @@
           {selectedModel}
           onInput={updateDraft}
           onSend={handleSend}
-          onModelChange={(m) => selectedModel = m}
+          onModelChange={handleModelChange}
+          onAbort={isBusy ? handleAbort : undefined}
         />
       </div>
     {/if}
@@ -688,6 +847,74 @@
     padding: 0.75rem 1.25rem;
   }
 
+  .backdrop {
+    display: none;
+  }
+
+  .title-editable {
+    cursor: pointer;
+    transition: color 150ms;
+  }
+
+  .title-editable:hover {
+    color: var(--accent);
+  }
+
+  .title-input {
+    font-size: 1.1rem;
+    font-weight: 600;
+    background: var(--surface);
+    border: 1px solid rgba(110, 231, 168, 0.3);
+    border-radius: 0.35rem;
+    color: var(--text);
+    padding: 0.15rem 0.4rem;
+    font: inherit;
+    font-size: 1.1rem;
+    font-weight: 600;
+    outline: none;
+    width: 100%;
+  }
+
+  .sse-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: #fbbf24;
+    background: rgba(251, 191, 36, 0.1);
+    border: 1px solid rgba(251, 191, 36, 0.2);
+    padding: 0.2rem 0.5rem;
+    border-radius: 999px;
+  }
+
+  .sse-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #fbbf24;
+    animation: pulse-anim 1.4s ease-in-out infinite;
+  }
+
+  .token-bar {
+    height: 3px;
+    background: var(--surface);
+    border-radius: 1.5px;
+    margin-top: 0.5rem;
+    overflow: hidden;
+  }
+
+  .token-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 1.5px;
+    transition: width 300ms ease;
+  }
+
+  .token-bar-fill.over-budget {
+    background: var(--danger);
+  }
+
   @media (max-width: 768px) {
     .app-shell,
     .app-shell.sidebar-collapsed {
@@ -716,6 +943,14 @@
 
     .sidebar-toggle {
       z-index: 31;
+    }
+
+    .backdrop.visible {
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 29;
+      background: rgba(0, 0, 0, 0.5);
     }
 
     .chat-header {
