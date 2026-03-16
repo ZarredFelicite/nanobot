@@ -11,6 +11,8 @@ import asyncio
 from contextvars import ContextVar
 from datetime import datetime
 import json
+import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -419,6 +421,7 @@ class OpenCodeChannel(BaseChannel):
         site = web.TCPSite(self._runner, "0.0.0.0", self.port)
         await site.start()
         logger.info("OpenCode API listening on http://0.0.0.0:{}", self.port)
+        self._start_tailscale_serve()
 
         # Keep alive
         while self._running:
@@ -426,6 +429,7 @@ class OpenCodeChannel(BaseChannel):
 
     async def stop(self) -> None:
         self._running = False
+        self._stop_tailscale_serve()
         # Close SSE clients
         for client in list(self._sse_clients):
             try:
@@ -437,6 +441,33 @@ class OpenCodeChannel(BaseChannel):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+
+    def _start_tailscale_serve(self) -> None:
+        """Start tailscale serve to proxy HTTPS traffic to the gateway for PWA support."""
+        if not shutil.which("tailscale"):
+            return
+        try:
+            subprocess.run(
+                ["tailscale", "serve", "--bg", "--https", "443",
+                 f"http://127.0.0.1:{self.port}"],
+                capture_output=True, timeout=10,
+            )
+            logger.info("Tailscale HTTPS serve started on port 443 -> {}", self.port)
+        except Exception as exc:
+            logger.warning("Failed to start tailscale serve: {}", exc)
+
+    def _stop_tailscale_serve(self) -> None:
+        """Tear down tailscale serve proxy."""
+        if not shutil.which("tailscale"):
+            return
+        try:
+            subprocess.run(
+                ["tailscale", "serve", "--https=443", "off"],
+                capture_output=True, timeout=10,
+            )
+            logger.info("Tailscale HTTPS serve stopped")
+        except Exception as exc:
+            logger.warning("Failed to stop tailscale serve: {}", exc)
 
     async def send(self, msg: OutboundMessage) -> None:
         # Outbound messages from the bus are not directly used by OpenCode;
