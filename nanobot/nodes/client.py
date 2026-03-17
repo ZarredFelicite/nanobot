@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import signal
 import uuid
+from pathlib import Path
 from typing import Any, Callable
 
 import aiohttp
@@ -38,7 +40,12 @@ def _guard_command(command: str, deny_patterns: list[str] | None = None) -> str 
 
 
 class NodeClient:
-    """WebSocket client that connects a node to a nanobot gateway."""
+    """WebSocket client that connects a node to a nanobot gateway.
+
+    Also runs a local CLI socket server so ``nanobot agent`` on the same
+    machine can connect transparently, with messages bridged through the
+    gateway WS connection.
+    """
 
     def __init__(
         self,
@@ -47,18 +54,27 @@ class NodeClient:
         token: str,
         deny_patterns: list[str] | None = None,
         on_response: Callable[[str, str], Any] | None = None,
+        socket_path: str = "~/.nanobot/cli.sock",
     ):
         self.gateway_url = gateway_url
         self.node_id = node_id
         self.token = token
         self.deny_patterns = deny_patterns if deny_patterns is not None else _DEFAULT_DENY_PATTERNS
         self.on_response = on_response  # callback(msg_id, content)
+        self._socket_path = Path(socket_path).expanduser()
 
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._session: aiohttp.ClientSession | None = None
         self._running = False
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
+
+        # CLI socket bridge state
+        self._cli_server: asyncio.AbstractServer | None = None
+        self._cli_clients: dict[str, asyncio.StreamWriter] = {}
+        self._cli_counter = 0
+        # Track which CLI client sent each message so responses route back
+        self._pending_cli: dict[str, str] = {}  # ws msg_id -> cli chat_id
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -75,6 +91,9 @@ class NodeClient:
                 loop.add_signal_handler(sig, lambda: asyncio.ensure_future(self.stop()))
             except NotImplementedError:
                 pass
+
+        # Start local CLI socket bridge
+        await self._start_cli_socket()
 
         self._session = aiohttp.ClientSession()
         try:
@@ -95,6 +114,7 @@ class NodeClient:
                     )
         finally:
             await self._session.close()
+            await self._stop_cli_socket()
 
     async def stop(self) -> None:
         self._running = False
@@ -234,6 +254,23 @@ class NodeClient:
     def _handle_response(self, msg: dict[str, Any]) -> None:
         content = msg.get("content", "")
         msg_id = msg.get("id", "")
+
+        # Route to the CLI client that sent this message, if any
+        cli_chat_id = self._pending_cli.pop(msg_id, None)
+        if cli_chat_id:
+            writer = self._cli_clients.get(cli_chat_id)
+            if writer and not writer.is_closing():
+                self._cli_write_json(writer, {"type": "response", "content": content})
+            return
+
+        # Fallback: broadcast to all CLI clients (e.g. unsolicited agent message)
+        if self._cli_clients:
+            for writer in self._cli_clients.values():
+                if not writer.is_closing():
+                    self._cli_write_json(writer, {"type": "response", "content": content})
+            return
+
+        # No CLI clients — use callback or print
         if self.on_response:
             self.on_response(msg_id, content)
         else:
@@ -243,15 +280,123 @@ class NodeClient:
     # Send user message to gateway
     # ------------------------------------------------------------------
 
-    async def send_message(self, content: str, sender: str = "user") -> None:
+    async def send_message(self, content: str, sender: str = "user") -> str:
+        """Send a chat message to the gateway. Returns the message ID."""
+        msg_id = uuid.uuid4().hex
         if self._ws is None or self._ws.closed:
             logger.warning("Not connected to gateway")
-            return
+            return msg_id
         await self._ws.send_json(
             {
                 "type": "message",
-                "id": uuid.uuid4().hex,
+                "id": msg_id,
                 "content": content,
                 "sender": sender,
             }
         )
+        return msg_id
+
+    # ------------------------------------------------------------------
+    # Local CLI socket bridge
+    # ------------------------------------------------------------------
+
+    async def _start_cli_socket(self) -> None:
+        """Start a local Unix socket server so `nanobot agent` can connect."""
+        if self._socket_path.exists():
+            try:
+                self._socket_path.unlink()
+            except OSError:
+                pass
+
+        self._socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self._cli_server = await asyncio.start_unix_server(
+            self._handle_cli_client, path=str(self._socket_path)
+        )
+        logger.info("CLI socket bridge listening on {}", self._socket_path)
+
+    async def _stop_cli_socket(self) -> None:
+        """Stop the local CLI socket server."""
+        for writer in list(self._cli_clients.values()):
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+        self._cli_clients.clear()
+        self._pending_cli.clear()
+
+        if self._cli_server:
+            self._cli_server.close()
+            await self._cli_server.wait_closed()
+            self._cli_server = None
+
+        if self._socket_path.exists():
+            try:
+                self._socket_path.unlink()
+            except OSError:
+                pass
+
+    async def _handle_cli_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Handle a single CLI client connection, bridging to the gateway WS."""
+        chat_id = f"cli_{self._cli_counter}"
+        self._cli_counter += 1
+        self._cli_clients[chat_id] = writer
+
+        logger.info("CLI client connected via node bridge: {}", chat_id)
+
+        # Send welcome (same protocol as CLISocketServer)
+        self._cli_write_json(writer, {
+            "type": "welcome",
+            "chatId": chat_id,
+            "defaultSession": f"node:{self.node_id}",
+        })
+        try:
+            await writer.drain()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self._cli_clients.pop(chat_id, None)
+            return
+
+        try:
+            while self._running:
+                line = await reader.readline()
+                if not line:
+                    break
+
+                try:
+                    data = json.loads(line.decode().strip())
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    self._cli_write_json(writer, {"type": "error", "content": "Invalid JSON"})
+                    continue
+
+                if data.get("type") != "message":
+                    continue
+
+                content = data.get("content", "").strip()
+                if not content:
+                    continue
+
+                # Forward to gateway over WS
+                msg_id = await self.send_message(content)
+                self._pending_cli[msg_id] = chat_id
+
+        except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
+            pass
+        finally:
+            self._cli_clients.pop(chat_id, None)
+            try:
+                if not writer.is_closing():
+                    writer.close()
+                    await writer.wait_closed()
+            except Exception:
+                pass
+            logger.info("CLI client disconnected: {}", chat_id)
+
+    @staticmethod
+    def _cli_write_json(writer: asyncio.StreamWriter, data: dict[str, Any]) -> None:
+        """Write a JSON line to a CLI client."""
+        try:
+            writer.write(json.dumps(data).encode() + b"\n")
+        except Exception:
+            pass

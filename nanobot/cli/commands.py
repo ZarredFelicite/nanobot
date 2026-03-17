@@ -2039,11 +2039,14 @@ def node(
         except Exception:
             console.print(content)
 
+    socket_path = str(Path(config.channels.cli_socket.socket_path).expanduser())
+
     client = NodeClient(
         gateway_url=gw_url,
         node_id=nid,
         token=tok,
         on_response=on_response,
+        socket_path=socket_path,
     )
 
     async def run():
