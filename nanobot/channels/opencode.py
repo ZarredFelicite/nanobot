@@ -219,6 +219,12 @@ class OpenCodeChannel(BaseChannel):
         self._runner: web.AppRunner | None = None
         self._sse_write_timeout_s = 2.0
 
+        # Log streaming
+        self._log_clients: list[web.StreamResponse] = []
+        self._log_buffer: list[dict[str, Any]] = []  # Ring buffer of recent logs
+        self._log_buffer_max = 500
+        self._setup_log_sink()
+
         # Web Push notifications
         self._push_subscriptions: list[dict[str, Any]] = []
         self._vapid_private_key: str = ""
@@ -326,6 +332,90 @@ class OpenCodeChannel(BaseChannel):
             for idx in reversed(stale):
                 self._push_subscriptions.pop(idx)
             self._save_subscriptions()
+
+    # ------------------------------------------------------------------
+    # Log streaming
+    # ------------------------------------------------------------------
+
+    def _setup_log_sink(self) -> None:
+        """Add a loguru sink that captures logs for streaming to web clients."""
+        channel = self
+
+        def _sink(message: Any) -> None:
+            record = message.record
+            entry = {
+                "time": record["time"].isoformat(),
+                "level": record["level"].name,
+                "module": record["name"],
+                "function": record["function"],
+                "line": record["line"],
+                "message": record["message"],
+            }
+            channel._log_buffer.append(entry)
+            if len(channel._log_buffer) > channel._log_buffer_max:
+                channel._log_buffer = channel._log_buffer[-channel._log_buffer_max:]
+
+            # Schedule async writes to log SSE clients
+            if channel._log_clients:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.call_soon_threadsafe(
+                        asyncio.ensure_future,
+                        channel._broadcast_log(entry),
+                    )
+                except RuntimeError:
+                    pass  # No event loop running
+
+        logger.add(_sink, level="DEBUG", format="{message}")
+
+    async def _broadcast_log(self, entry: dict[str, Any]) -> None:
+        """Send a log entry to all connected log SSE clients."""
+        if not self._log_clients:
+            return
+        payload = json.dumps(entry)
+        data = f"data: {payload}\n\n".encode()
+        stale: list[web.StreamResponse] = []
+        for client in list(self._log_clients):
+            try:
+                await client.write(data)
+            except Exception:
+                stale.append(client)
+        for client in stale:
+            if client in self._log_clients:
+                self._log_clients.remove(client)
+
+    async def _handle_log_stream(self, request: web.Request) -> web.StreamResponse:
+        """SSE endpoint for streaming logs."""
+        resp = web.StreamResponse()
+        resp.content_type = "text/event-stream"
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["Connection"] = "keep-alive"
+        resp.headers["X-Accel-Buffering"] = "no"
+        await resp.prepare(request)
+
+        # Send recent log buffer first
+        for entry in self._log_buffer[-100:]:
+            payload = json.dumps(entry)
+            try:
+                await resp.write(f"data: {payload}\n\n".encode())
+            except Exception:
+                return resp
+
+        self._log_clients.append(resp)
+        try:
+            while resp.task is not None and not resp.task.done():
+                await asyncio.sleep(10)
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        finally:
+            if resp in self._log_clients:
+                self._log_clients.remove(resp)
+        return resp
+
+    async def _handle_log_buffer(self, request: web.Request) -> web.Response:
+        """Return recent log entries as JSON."""
+        limit = int(request.query.get("limit", "200"))
+        return web.json_response(self._log_buffer[-limit:])
 
     @staticmethod
     def _default_title_for_session(session: Session) -> str:
@@ -643,6 +733,8 @@ class OpenCodeChannel(BaseChannel):
         app.router.add_post("/permission/{requestID}/reply", self._handle_permission_reply_v2)
         app.router.add_get("/question", self._handle_stub_list)
         app.router.add_post("/log", self._handle_stub_ok)
+        app.router.add_get("/log/stream", self._handle_log_stream)
+        app.router.add_get("/log/buffer", self._handle_log_buffer)
         app.router.add_post("/instance/dispose", self._handle_stub_ok)
         app.router.add_post("/global/dispose", self._handle_stub_ok)
 

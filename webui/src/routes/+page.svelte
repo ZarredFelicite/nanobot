@@ -5,6 +5,7 @@
   import Composer from '$lib/components/Composer.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import SessionSidebar from '$lib/components/SessionSidebar.svelte';
+  import LogViewer from '$lib/components/LogViewer.svelte';
   import { abortSession, createSession, deleteSession, getMessages, getProviders, getStatuses, listSessions, patchSession, sendMessage } from '$lib/api';
   import type { MessageInfo, MessagePart, MessageWithParts, ProviderInfo, SessionInfo, SessionStatus, SseEvent } from '$lib/types';
 
@@ -25,6 +26,7 @@
   let sseDisconnected = $state(false);
   let editingTitle = $state(false);
   let titleDraft = $state('');
+  let logsOpen = $state(false);
 
   let stream: EventSource | null = null;
   let chatLogEl: HTMLElement | undefined = $state();
@@ -508,6 +510,16 @@
               <span class="status-badge idle">Idle</span>
             {/if}
           {/if}
+          <button
+            class="log-toggle"
+            class:active={logsOpen}
+            onclick={() => logsOpen = !logsOpen}
+            title="Toggle logs"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 19h16M4 15h16M4 11h10M4 7h6" />
+            </svg>
+          </button>
         </div>
       </div>
       {#if contextInfo?.usagePercent != null}
@@ -578,6 +590,8 @@
           </button>
         {/if}
       </div>
+
+      <LogViewer open={logsOpen} onToggle={() => logsOpen = false} />
 
       <div class="composer-panel">
         <Composer
@@ -880,6 +894,24 @@
     font-weight: 600;
     outline: none;
     width: 100%;
+  }
+
+  .log-toggle {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 0.3rem;
+    color: var(--muted);
+    padding: 0.2rem 0.35rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    transition: color 150ms, border-color 150ms;
+  }
+
+  .log-toggle:hover,
+  .log-toggle.active {
+    color: var(--accent);
+    border-color: var(--accent);
   }
 
   .sse-pill {

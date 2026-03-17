@@ -21,7 +21,7 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
   // Network-only for SSE and API calls — pass through without caching
-  const apiPrefixes = ['/event', '/session', '/provider', '/config', '/command', '/agent'];
+  const apiPrefixes = ['/event', '/session', '/provider', '/config', '/command', '/agent', '/log'];
   if (apiPrefixes.some((p) => url.pathname.startsWith(p))) {
     event.respondWith(fetch(event.request));
     return;
