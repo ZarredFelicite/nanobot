@@ -894,8 +894,7 @@ class OpenCodeChannel(BaseChannel):
         try:
             await resp.write(f"data: {payload}\n\n".encode())
             return True
-        except (ConnectionResetError, ConnectionAbortedError, RuntimeError) as exc:
-            logger.debug("OpenCode SSE write failed for {}: {}", event_type, exc)
+        except (ConnectionResetError, ConnectionAbortedError, RuntimeError):
             if resp in self._sse_clients:
                 self._sse_clients.remove(resp)
             return False
