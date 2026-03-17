@@ -415,6 +415,10 @@
     if (!chatLogEl) return;
     chatLogEl.scrollTop = chatLogEl.scrollHeight;
     showScrollButton = false;
+    // Double-tap: content may reflow after initial layout (markdown, images).
+    requestAnimationFrame(() => {
+      if (chatLogEl) chatLogEl.scrollTop = chatLogEl.scrollHeight;
+    });
   }
 
   function autoScroll(): void {
