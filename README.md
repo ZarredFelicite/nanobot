@@ -26,6 +26,7 @@ Compared with upstream, the biggest differences are:
 
 - `subconscious` memory: the fork adds a structured markdown memory layer on top of upstream's `MEMORY.md`/`HISTORY.md` flow. Conversation turns are buffered in the background, durable facts are extracted into hierarchical notes, `qmd` is used for semantic retrieval, explicit recall is exposed through `memory_search`, and relevant memories can be classifier-gated and auto-injected into the current user turn without destabilizing the system prompt
 - shared-session UX: CLI can attach to a running gateway over a Unix socket, and sessions can mirror across channels
+- distributed node mode: remote machines connect to the gateway over WebSocket for remote shell execution and chat routing
 - OpenCode integration: HTTP+SSE backend for the OpenCode TUI, with session APIs, streaming, permissions, revert/unrevert, and compaction hooks
 - coding-agent workflow upgrades: Pi subagent delegation, richer context/token tracking, and more aggressive session compaction behavior
 - OWASP-style prompt-injection hardening: explicit user/untrusted-content boundaries, remote-content sanitization for web/email/memory flows, and final-output leakage blocking
@@ -195,6 +196,16 @@ That's it! You have a working AI assistant in 2 minutes.
 
 Connect nanobot to your favorite chat platform.
 
+## Web UI
+
+This fork also includes an experimental SvelteKit web UI in `webui/` for browsing OpenCode-backed sessions in the browser.
+
+- start nanobot with the OpenCode channel enabled
+- run `npm install` in `webui/`
+- launch it with `npm run dev` for standalone frontend development
+- run `npm run build` in `webui/` to let the OpenCode gateway serve the browser UI at `/`
+- set `NANOBOT_BASE_URL` if nanobot is not listening on `http://127.0.0.1:4096`
+
 | Channel | What you need |
 |---------|---------------|
 | **Telegram** | Bot token from @BotFather |
@@ -206,6 +217,7 @@ Connect nanobot to your favorite chat platform.
 | **Slack** | Bot token + App-Level token |
 | **Email** | IMAP/SMTP credentials |
 | **QQ** | App ID + App Secret |
+| **Node** | Gateway URL + token (distributed mode) |
 
 <details>
 <summary><b>Telegram</b> (Recommended)</summary>
@@ -665,6 +677,75 @@ nanobot gateway
 
 </details>
 
+<details>
+<summary><b>Node Mode (Distributed)</b></summary>
+
+Connect remote machines (Raspberry Pis, servers, dev boxes) to a central nanobot gateway over WebSocket. Enables two capabilities:
+
+1. **Remote Execution**: The gateway agent dispatches shell commands to nodes via the `remote_exec` tool
+2. **Node as Channel**: Users on node machines run `nanobot node` to chat with the gateway agent
+
+**1. Generate a token on the gateway**
+
+```bash
+nanobot node-token homelab --name "Home Server"
+# Prints: nb_node_a1b2c3...
+```
+
+**2. Enable the node gateway** (merge into `~/.nanobot/config.json`):
+
+```json
+{
+  "gateway": {
+    "nodes": {
+      "enabled": true
+    }
+  },
+  "channels": {
+    "opencode": {
+      "enabled": true
+    }
+  }
+}
+```
+
+**3. Start the gateway**
+
+```bash
+nanobot gateway
+# Logs: ✓ Node gateway enabled on /ws/node
+```
+
+**4. Connect a node** (on the remote machine):
+
+```bash
+nanobot node --gateway ws://gateway-ip:4096/ws/node --id homelab --token nb_node_a1b2c3...
+```
+
+Or configure in `~/.nanobot/config.json` on the node machine:
+
+```json
+{
+  "node": {
+    "enabled": true,
+    "gatewayUrl": "ws://gateway-ip:4096/ws/node",
+    "nodeId": "homelab",
+    "token": "nb_node_a1b2c3..."
+  }
+}
+```
+
+Then just run `nanobot node`.
+
+**5. Use it**
+
+- Send a message to the gateway: *"run `uname -a` on homelab"* — the agent uses the `remote_exec` tool
+- Type in the node REPL to chat with the gateway agent directly
+
+> Nodes connect outbound to the gateway (no port forwarding needed on the node side). Connections auto-reconnect with exponential backoff. Dangerous commands are blocked by the same safety guards as the local `exec` tool.
+
+</details>
+
 ## 🌐 Agent Social Network
 
 🐈 nanobot is capable of linking to the agent social network (agent community). **Just send one message and your nanobot joins automatically!**
@@ -923,6 +1004,9 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | `nanobot agent --no-markdown` | Show plain-text replies |
 | `nanobot agent --logs` | Show runtime logs during chat |
 | `nanobot gateway` | Start the gateway |
+| `nanobot node` | Connect as a remote node to a gateway |
+| `nanobot node-token <id>` | Generate auth token for a node |
+| `nanobot nodes` | List registered nodes |
 | `nanobot status` | Show status |
 | `nanobot provider login openai-codex` | OAuth login for providers |
 | `nanobot channels login` | Link WhatsApp (scan QR) |
@@ -1052,9 +1136,10 @@ nanobot/
 │   ├── memory.py   #    Persistent memory
 │   ├── skills.py   #    Skills loader
 │   ├── subagent.py #    Background task execution
-│   └── tools/      #    Built-in tools (incl. spawn)
+│   └── tools/      #    Built-in tools (incl. spawn, remote_exec)
 ├── skills/         # 🎯 Bundled skills (github, weather, tmux...)
 ├── channels/       # 📱 Chat channel integrations
+├── nodes/          # 🌐 Distributed node mode (gateway + client)
 ├── bus/            # 🚌 Message routing
 ├── cron/           # ⏰ Scheduled tasks
 ├── heartbeat/      # 💓 Proactive wake-up

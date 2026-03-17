@@ -21,7 +21,8 @@ The biggest differences are:
 5. Stronger heartbeat isolation and delivery rules.
 6. Pi subagent integration for delegating larger coding/research tasks to an external coding agent process.
 7. OWASP-style prompt-injection hardening for user input, remote content, memory recall, and final output.
-8. Extra implementation work around MCP cancellation, provider quirks, Telegram owner routing, active-config data paths, and token-aware session compaction.
+8. Distributed node mode where remote machines connect to the gateway over WebSocket for remote shell execution and chat routing.
+9. Extra implementation work around MCP cancellation, provider quirks, Telegram owner routing, active-config data paths, and token-aware session compaction.
 
 ## High-Level Product Positioning
 
@@ -541,7 +542,54 @@ Examples:
 
 This is not a user-facing feature in the same sense as memory or channels, but it is still a meaningful divergence in how the fork is meant to be developed and run.
 
-## 14. Test Coverage Added for Fork-Specific Behavior
+## 14. Distributed Node Mode for Multi-Machine Operation
+
+Primary files:
+
+- `nanobot/nodes/registry.py`
+- `nanobot/nodes/gateway_ws.py`
+- `nanobot/nodes/channel.py`
+- `nanobot/nodes/client.py`
+- `nanobot/agent/tools/remote_exec.py`
+- `nanobot/config/schema.py`
+- `nanobot/cli/commands.py`
+
+### What changed
+
+This fork adds an OpenClaw-inspired distributed mode where remote nanobot node instances connect to a gateway over WebSocket. This enables two capabilities:
+
+1. **Remote execution**: The gateway agent gets a `remote_exec` tool that dispatches shell commands to connected nodes.
+2. **Node as channel**: Users on node machines run `nanobot node` which routes their messages through the gateway agent — the gateway knows which node the message came from.
+
+### Architecture
+
+- Nodes connect outbound to the gateway (no port forwarding needed on the node side).
+- The gateway runs a WebSocket endpoint (`/ws/node`) on the OpenCode channel's aiohttp app.
+- A `NodeRegistry` manages token-based authentication, live WebSocket connections, and command dispatch via async futures.
+- Each connected node is registered as a dynamic channel (`node`) in the message bus.
+- The standard message bus flow handles routing: `NodeGatewayHandler` publishes `InboundMessage` to the bus, and `NodeChannel` routes `OutboundMessage` back over the correct node's WebSocket.
+
+### Token-based authentication
+
+Tokens are generated via `nanobot node-token <id>` and stored in `~/.nanobot/nodes.json`. The WebSocket handshake requires a valid `node_id` + `token` pair before any commands or messages are accepted.
+
+### Safety
+
+The `remote_exec` tool applies the same deny-pattern safety guards as the local `exec` tool on both the gateway side and the node client side. Dangerous commands like `rm -rf` are blocked before they ever reach the remote machine.
+
+### CLI commands
+
+Three new CLI commands:
+
+- `nanobot node-token <id>` — generate auth token
+- `nanobot nodes` — list registered nodes with online status
+- `nanobot node` — start a node client with interactive REPL and auto-reconnect
+
+### Why this differs from upstream
+
+Upstream nanobot has no distributed execution capability. This fork explicitly targets multi-machine personal setups (Raspberry Pis, servers, dev boxes) managed from a single gateway agent.
+
+## 15. Test Coverage Added for Fork-Specific Behavior
 
 Primary files:
 
@@ -569,7 +617,7 @@ The fork ships tests specifically for the new capabilities above, especially:
 
 That added test surface reflects how much the fork has moved beyond upstream's default shape.
 
-## 15. Backports and Hardening That Are Not Entirely Fork-Unique
+## 16. Backports and Hardening That Are Not Entirely Fork-Unique
 
 Not every diff in this fork is a brand-new product feature. Some are implementation variants, retained patches, or opinionated integrations layered onto concepts upstream also has.
 
@@ -581,7 +629,7 @@ Examples:
 
 So the most reliable way to read this document is: it describes the user-visible and architectural differences that currently exist in this fork, not a claim that every underlying idea originated only here.
 
-## 16. Features the Fork Explicitly Reframes or Replaces
+## 17. Features the Fork Explicitly Reframes or Replaces
 
 This fork does not just add features; it also changes how some upstream concepts are implemented.
 
@@ -592,8 +640,9 @@ This fork does not just add features; it also changes how some upstream concepts
 - **Cross-channel behavior**: sessions can be shared and mirrored instead of being mostly channel-local.
 - **Heartbeat**: isolated from memory and given its own execution model path.
 - **Client model**: OpenCode attachment turns nanobot into a backend service for an external TUI.
+- **Distributed execution**: node mode enables multi-machine operation from a single gateway, with remote shell execution and chat routing over WebSocket.
 
-## 17. Quick Checklist of the Biggest Feature Gaps vs Upstream
+## 18. Quick Checklist of the Biggest Feature Gaps vs Upstream
 
 If you need the shortest practical summary, the fork currently has these major capabilities that upstream nanobot does not have in the same integrated form:
 
@@ -608,6 +657,7 @@ If you need the shortest practical summary, the fork currently has these major c
 - Pi subagent delegation,
 - stronger MCP transport support,
 - more defensive provider compatibility handling,
+- distributed node mode with WebSocket-based remote execution and node-as-channel,
 - and multi-instance config/workspace path support.
 
 ## Reference: Main Fork-Changed Files
@@ -622,5 +672,7 @@ The largest code-level divergences from upstream are concentrated in:
 - `nanobot/channels/cli_socket.py`
 - `nanobot/config/schema.py`
 - `nanobot/providers/litellm_provider.py`
+- `nanobot/nodes/` (registry, gateway_ws, channel, client)
+- `nanobot/agent/tools/remote_exec.py`
 
 Supporting differences are spread across session management, filesystem tools, tests, and developer environment files.
