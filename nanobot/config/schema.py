@@ -206,6 +206,8 @@ class OpenCodeConfig(Base):
 
     enabled: bool = False
     port: int = 4096
+    web_ui_enabled: bool = True
+    web_ui_path: str = ""
 
 
 class OpenCodeThemeConfig(Base):
@@ -328,12 +330,29 @@ class HeartbeatConfig(Base):
     )  # Also send heartbeat to Telegram if no user messages for this long
 
 
+class NodesGatewayConfig(Base):
+    """Node gateway configuration for accepting remote node connections."""
+
+    enabled: bool = False
+    tokens_file: str = "~/.nanobot/nodes.json"  # Node registry file
+
+
+class NodeClientConfig(Base):
+    """Node client configuration for connecting to a gateway."""
+
+    enabled: bool = False
+    gateway_url: str = ""  # ws://gateway:4096/ws/node
+    node_id: str = ""  # This node's identifier
+    token: str = ""  # Auth token from gateway
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    nodes: NodesGatewayConfig = Field(default_factory=NodesGatewayConfig)
 
 
 class WebSearchConfig(Base):
@@ -413,6 +432,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    node: NodeClientConfig = Field(default_factory=NodeClientConfig)
 
     @property
     def workspace_path(self) -> Path:

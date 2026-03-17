@@ -193,6 +193,7 @@ class OpenCodeChannel(BaseChannel):
         tui_config: TUIConfig | None = None,
         permission_config: PermissionConfig | None = None,
         reload_callback: Callable[[], dict[str, Any]] | None = None,
+        extra_routes: list[tuple[str, Any]] | None = None,
     ):
         super().__init__(config, bus)
         self.session_manager = session_manager
@@ -202,6 +203,7 @@ class OpenCodeChannel(BaseChannel):
         self.tui_config = tui_config or TUIConfig()
         self.permission_config = permission_config
         self.reload_callback = reload_callback
+        self._extra_routes = extra_routes or []
         self.port = config.port
         self.web_ui_enabled = config.web_ui_enabled
         self.web_ui_path = config.web_ui_path
@@ -742,6 +744,10 @@ class OpenCodeChannel(BaseChannel):
         app.router.add_get("/push/vapid-key", self._handle_push_vapid_key)
         app.router.add_post("/push/subscribe", self._handle_push_subscribe)
         app.router.add_post("/push/unsubscribe", self._handle_push_unsubscribe)
+
+        # Extra routes (e.g. node gateway WebSocket)
+        for path, handler in self._extra_routes:
+            app.router.add_get(path, handler)
 
         # Browser UI (added last so API routes win)
         app.router.add_get("/", self._handle_web_ui)

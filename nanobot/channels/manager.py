@@ -23,11 +23,19 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(self, config: Config, bus: MessageBus, session_manager=None, agent_loop=None):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        session_manager=None,
+        agent_loop=None,
+        extra_routes: list[tuple[str, Any]] | None = None,
+    ):
         self.config = config
         self.bus = bus
         self.session_manager = session_manager
         self.agent_loop = agent_loop
+        self._extra_routes = extra_routes or []
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -172,6 +180,7 @@ class ChannelManager:
                     models_config=self.config.models,
                     tui_config=self.config.channels.tui,
                     permission_config=self.config.tools.permissions,
+                    extra_routes=self._extra_routes,
                 )
                 logger.info(
                     "OpenCode channel enabled on port {}", self.config.channels.opencode.port
@@ -285,6 +294,11 @@ class ChannelManager:
                 continue
             except asyncio.CancelledError:
                 break
+
+    def register_channel(self, name: str, channel: BaseChannel) -> None:
+        """Register a channel dynamically (e.g. node channel)."""
+        self.channels[name] = channel
+        logger.info("{} channel registered dynamically", name)
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

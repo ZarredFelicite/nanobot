@@ -348,6 +348,19 @@ def gateway(
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
+    # Node gateway setup
+    node_registry = None
+    extra_routes: list[tuple[str, Any]] = []
+    if config.gateway.nodes.enabled:
+        from nanobot.nodes.registry import NodeRegistry
+        from nanobot.nodes.gateway_ws import NodeGatewayHandler
+
+        tokens_path = Path(config.gateway.nodes.tokens_file).expanduser()
+        node_registry = NodeRegistry(tokens_path)
+        node_ws_handler = NodeGatewayHandler(node_registry, bus)
+        extra_routes.append(("/ws/node", node_ws_handler.handle))
+        console.print("[green]✓[/green] Node gateway enabled on /ws/node")
+
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
@@ -370,6 +383,7 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         subconscious_config=config.tools.subconscious,
+        node_registry=node_registry,
     )
 
     # Set cron callback (needs agent)
@@ -417,7 +431,16 @@ def gateway(
     cron.on_job = on_cron_job
 
     # Create channel manager
-    channels = ChannelManager(config, bus, session_manager=session_manager, agent_loop=agent)
+    channels = ChannelManager(
+        config, bus, session_manager=session_manager, agent_loop=agent, extra_routes=extra_routes
+    )
+
+    # Register node channel if nodes gateway is enabled
+    if node_registry is not None:
+        from nanobot.nodes.channel import NodeChannel
+
+        node_channel = NodeChannel(node_registry, bus)
+        channels.register_channel("node", node_channel)
 
     def _reload_runtime_config() -> dict[str, object]:
         reloaded = load_config(config_path)
@@ -1910,6 +1933,156 @@ def _login_github_copilot() -> None:
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
+
+
+# ============================================================================
+# Node Commands
+# ============================================================================
+
+
+@app.command()
+def node_token(
+    node_id: str = typer.Argument(..., help="Node identifier"),
+    name: str = typer.Option("", "--name", "-n", help="Display name for the node"),
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Generate an authentication token for a node."""
+    from nanobot.config.loader import load_config, set_config_path
+    from nanobot.nodes.registry import NodeRegistry
+
+    if config_path is not None:
+        config_path = config_path.expanduser()
+        set_config_path(config_path)
+
+    config = load_config(config_path)
+    tokens_path = Path(config.gateway.nodes.tokens_file).expanduser()
+    registry = NodeRegistry(tokens_path)
+    token = registry.generate_token(node_id, name or node_id)
+    console.print(f"[green]Token generated for node '{node_id}':[/green]")
+    console.print(token)
+
+
+@app.command()
+def nodes(
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """List registered nodes."""
+    from nanobot.config.loader import load_config, set_config_path
+    from nanobot.nodes.registry import NodeRegistry
+
+    if config_path is not None:
+        config_path = config_path.expanduser()
+        set_config_path(config_path)
+
+    config = load_config(config_path)
+    tokens_path = Path(config.gateway.nodes.tokens_file).expanduser()
+    registry = NodeRegistry(tokens_path)
+
+    node_list = registry.list_nodes()
+    if not node_list:
+        console.print("[yellow]No nodes registered. Use 'nanobot node-token <id>' to create one.[/yellow]")
+        return
+
+    table = Table(title="Registered Nodes")
+    table.add_column("Node ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Created")
+    table.add_column("Status")
+
+    for n in node_list:
+        status = "[green]online[/green]" if n["online"] else "[dim]offline[/dim]"
+        table.add_row(n["node_id"], n["name"], n["created_at"][:19], status)
+
+    console.print(table)
+
+
+@app.command()
+def node(
+    gateway_url: str = typer.Option("", "--gateway", "-g", help="Gateway WebSocket URL"),
+    node_id: str = typer.Option("", "--id", "-i", help="This node's identifier"),
+    token: str = typer.Option("", "--token", "-t", help="Auth token"),
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Start a node client with interactive REPL."""
+    from nanobot.config.loader import load_config, set_config_path
+    from nanobot.nodes.client import NodeClient
+
+    if config_path is not None:
+        config_path = config_path.expanduser()
+        set_config_path(config_path)
+
+    config = load_config(config_path)
+
+    # CLI flags override config values
+    gw_url = gateway_url or config.node.gateway_url
+    nid = node_id or config.node.node_id
+    tok = token or config.node.token
+
+    if not gw_url:
+        console.print("[red]Error: gateway URL required (--gateway or config node.gatewayUrl)[/red]")
+        raise typer.Exit(1)
+    if not nid:
+        console.print("[red]Error: node ID required (--id or config node.nodeId)[/red]")
+        raise typer.Exit(1)
+    if not tok:
+        console.print("[red]Error: token required (--token or config node.token)[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Starting node '{nid}' → {gw_url}")
+
+    # Response handler: print agent responses
+    def on_response(_msg_id: str, content: str) -> None:
+        console.print()
+        try:
+            md = Markdown(content)
+            console.print(md)
+        except Exception:
+            console.print(content)
+
+    client = NodeClient(
+        gateway_url=gw_url,
+        node_id=nid,
+        token=tok,
+        on_response=on_response,
+    )
+
+    async def run():
+        # Run WS client and REPL concurrently
+        ws_task = asyncio.create_task(client.run())
+        repl_task = asyncio.create_task(_node_repl(client))
+        done, pending = await asyncio.wait(
+            [ws_task, repl_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    async def _node_repl(c: NodeClient) -> None:
+        """Simple REPL that reads input and sends messages to the gateway."""
+        # Give the WS connection a moment to establish
+        await asyncio.sleep(1)
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                line = await loop.run_in_executor(None, lambda: input("you> "))
+            except (EOFError, KeyboardInterrupt):
+                await c.stop()
+                break
+            line = line.strip()
+            if not line:
+                continue
+            if line.lower() in EXIT_COMMANDS:
+                await c.stop()
+                break
+            await c.send_message(line)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\nNode disconnected.")
 
 
 if __name__ == "__main__":

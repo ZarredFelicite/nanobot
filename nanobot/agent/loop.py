@@ -71,6 +71,7 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         subconscious_config: SubconsciousConfig | None = None,
+        node_registry: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -136,6 +137,7 @@ class AgentLoop:
         self._permission_callback: Callable[..., Awaitable[str]] | None = None
         self._require_approval: list[str] = []  # Tool names that need user approval
         self._session_auto_approve: dict[str, set[str]] = {}  # session_key -> auto-approved tools
+        self._node_registry = node_registry
         self._owner_message_target = self._resolve_owner_message_target(channels_config)
         self._register_default_tools()
 
@@ -199,6 +201,10 @@ class AgentLoop:
 
             self.tools.register(MemoryRecallTool(self._subconscious))
         self.tools.register(SubagentTool(workspace=self.workspace))
+        if self._node_registry:
+            from nanobot.agent.tools.remote_exec import RemoteExecTool
+
+            self.tools.register(RemoteExecTool(self._node_registry))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
