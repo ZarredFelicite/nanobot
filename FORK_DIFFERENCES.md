@@ -15,7 +15,7 @@ Compared with upstream nanobot, this fork is much more opinionated around a sing
 The biggest differences are:
 
 1. A new hierarchical "subconscious" memory system backed by local markdown notes and `qmd` semantic search.
-2. A Unix-socket CLI client mode so `nanobot agent` can attach to a running gateway instead of always running standalone.
+2. A pi-tui terminal UI that `nanobot agent` always launches, connecting to the local gateway or a remote gateway on node machines.
 3. Cross-channel session mirroring so CLI, Telegram, and other channels can share one live conversation.
 4. A full OpenCode TUI HTTP+SSE backend, including session management, streaming, permissions, revert/unrevert, fork, and context reporting.
 5. Stronger heartbeat isolation and delivery rules.
@@ -158,34 +158,38 @@ That means it can:
 
 This fork should not be described as "upstream used memU" based on the current upstream tree. The observable upstream baseline is the built-in two-file `MEMORY.md`/`HISTORY.md` system. The fork's real difference is that it adds and prioritizes `subconscious` + `qmd` while still retaining the older memory files as compatibility/fallback pieces.
 
-## 2. CLI Can Attach to a Running Gateway via Unix Socket
+## 2. CLI Launches TUI Connected to Local or Remote Gateway
 
 Primary files:
 
-- `nanobot/channels/cli_socket.py`
 - `nanobot/cli/commands.py`
+- `nanobot/channels/opencode.py`
 - `nanobot/channels/manager.py`
 - `nanobot/config/schema.py`
+- `tui/` (pi-tui TypeScript TUI)
 
 ### What changed
 
-Upstream CLI usage is primarily a direct local agent invocation. This fork adds a Unix domain socket channel so `nanobot agent` can operate as a thin client for an already-running gateway.
+Upstream CLI usage is primarily a direct local agent invocation. This fork ships a pi-tui-based terminal UI and makes `nanobot agent` always launch it, connecting to the appropriate gateway.
 
 ### Fork behavior
 
-- `nanobot agent` checks for a running local gateway socket.
-- If the socket is available, the CLI sends messages to the gateway instead of starting a separate standalone agent loop.
-- If no gateway is reachable, the CLI falls back to standalone behavior.
+- `nanobot agent` (no `-m` flag) launches the pi-tui TUI.
+- On a node machine (where `node.enabled` is true and a node bridge socket exists), the TUI connects to the remote gateway's HTTP API, with host/port extracted from `node.gatewayUrl`.
+- On a local gateway machine, the TUI connects to `localhost` on the OpenCode channel port.
+- With `-m`, the agent runs in standalone mode for single-shot messages.
+- There is no separate Python-based interactive REPL — all interactive sessions go through the pi-tui.
 
 ### Why this matters
 
-This gives the fork a shared-session model across interfaces. A single gateway can own the real session state while the CLI acts like another frontend.
+This gives the fork a unified TUI experience across local and remote setups. A user on a remote node gets the same full-featured interface as someone on the gateway machine, with sessions, streaming, permissions, and all OpenCode API features.
 
 ### Important comparison note
 
 Upstream already supports `--config` and `--workspace` on the CLI. The fork-specific difference is not the existence of those flags; it is that the fork combines them with:
 
-- gateway client mode over a Unix socket,
+- a dedicated TUI that connects to the gateway HTTP API,
+- node-aware gateway discovery from `node.gatewayUrl`,
 - shared default-session behavior through `agents.defaults.session`,
 - and active-config-derived data/workspace path behavior.
 
@@ -583,7 +587,7 @@ Three new CLI commands:
 
 - `nanobot node-token <id>` — generate auth token
 - `nanobot nodes` — list registered nodes with online status
-- `nanobot node` — start a node client with interactive REPL and auto-reconnect
+- `nanobot node` — start a node client with auto-reconnect (creates a CLI socket bridge so `nanobot agent` can launch the TUI connected to the remote gateway)
 
 ### Why this differs from upstream
 
@@ -636,7 +640,7 @@ This fork does not just add features; it also changes how some upstream concepts
 ### Replaced or substantially reframed
 
 - **Memory**: upstream two-file memory is extended with a structured `subconscious` + `qmd` layer, and recall/injection behavior changes significantly when that layer is enabled.
-- **CLI mode**: no longer just local direct chat; can act as a gateway client.
+- **CLI mode**: no longer just local direct chat; always launches the pi-tui TUI connected to a local or remote gateway.
 - **Cross-channel behavior**: sessions can be shared and mirrored instead of being mostly channel-local.
 - **Heartbeat**: isolated from memory and given its own execution model path.
 - **Client model**: OpenCode attachment turns nanobot into a backend service for an external TUI.
@@ -648,7 +652,7 @@ If you need the shortest practical summary, the fork currently has these major c
 
 - subconscious memory with `qmd` semantic retrieval,
 - `memory_search` recall tool,
-- Unix-socket CLI gateway client mode,
+- pi-tui TUI with local and remote gateway connectivity,
 - shared-session cross-channel mirroring,
 - OpenCode TUI HTTP+SSE backend,
 - OpenCode-compatible permissions/revert/fork/summarize flows,

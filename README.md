@@ -25,7 +25,7 @@ This repository is a personal fork of upstream `HKUDS/nanobot` with a stronger f
 Compared with upstream, the biggest differences are:
 
 - `subconscious` memory: the fork adds a structured markdown memory layer on top of upstream's `MEMORY.md`/`HISTORY.md` flow. Conversation turns are buffered in the background, durable facts are extracted into hierarchical notes, `qmd` is used for semantic retrieval, explicit recall is exposed through `memory_search`, and relevant memories can be classifier-gated and auto-injected into the current user turn without destabilizing the system prompt
-- shared-session UX: CLI can attach to a running gateway over a Unix socket, and sessions can mirror across channels
+- shared-session UX: `nanobot agent` launches the pi-tui TUI, connecting to a local gateway or a remote gateway (on nodes), and sessions can mirror across channels
 - distributed node mode: remote machines connect to the gateway over WebSocket for remote shell execution and chat routing
 - OpenCode integration: HTTP+SSE backend for the OpenCode TUI, with session APIs, streaming, permissions, revert/unrevert, and compaction hooks
 - coding-agent workflow upgrades: Pi subagent delegation, richer context/token tracking, and more aggressive session compaction behavior
@@ -740,7 +740,7 @@ Then just run `nanobot node`.
 **5. Use it**
 
 - Send a message to the gateway: *"run `uname -a` on homelab"* — the agent uses the `remote_exec` tool
-- Type in the node REPL to chat with the gateway agent directly
+- Run `nanobot agent` on the node to open the TUI connected to the remote gateway
 
 > Nodes connect outbound to the gateway (no port forwarding needed on the node side). Connections auto-reconnect with exponential backoff. Dangerous commands are blocked by the same safety guards as the local `exec` tool.
 
