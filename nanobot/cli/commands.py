@@ -132,7 +132,7 @@ def _resolve_external_tui_binary() -> str | None:
     return shutil.which("nanobot-tui")
 
 
-def _launch_external_tui(port: int) -> None:
+def _launch_external_tui(port: int, host: str = "127.0.0.1") -> None:
     """Replace the current process with the external nanobot TUI."""
     tui_binary = _resolve_external_tui_binary()
     if not tui_binary:
@@ -142,7 +142,7 @@ def _launch_external_tui(port: int) -> None:
         )
         raise typer.Exit(1)
 
-    os.execvp(tui_binary, [tui_binary, "--port", str(port)])
+    os.execvp(tui_binary, [tui_binary, "--host", host, "--port", str(port)])
 
 
 async def _read_interactive_input_async() -> str:
@@ -914,11 +914,24 @@ def agent(
     config = _load_runtime_config(config_path, workspace, announce=True)
     sync_workspace_templates(config.workspace_path)
 
-    # --- Gateway client mode: connect to running gateway if available ---
+    # --- Node mode: if a node bridge is running, launch TUI pointed at the remote gateway ---
     socket_path = Path(config.channels.cli_socket.socket_path).expanduser()
+    if (
+        not message
+        and config.node.enabled
+        and config.node.gateway_url
+        and config.channels.cli_socket.enabled
+        and socket_path.exists()
+    ):
+        from urllib.parse import urlparse
 
-    # Only launch external TUI if no CLI socket bridge is available (i.e., not on a node)
-    if not message and not (config.channels.cli_socket.enabled and socket_path.exists()):
+        parsed = urlparse(config.node.gateway_url)
+        gw_host = parsed.hostname or "127.0.0.1"
+        gw_port = parsed.port or 4096
+        _launch_external_tui(gw_port, host=gw_host)
+
+    # --- Gateway client mode: connect to running gateway if available ---
+    if not message:
         _launch_external_tui(config.channels.opencode.port)
     if config.channels.cli_socket.enabled and socket_path.exists():
         # Determine session override for gateway mode
