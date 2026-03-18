@@ -914,11 +914,12 @@ def agent(
     config = _load_runtime_config(config_path, workspace, announce=True)
     sync_workspace_templates(config.workspace_path)
 
-    if not message:
-        _launch_external_tui(config.channels.opencode.port)
-
     # --- Gateway client mode: connect to running gateway if available ---
     socket_path = Path(config.channels.cli_socket.socket_path).expanduser()
+
+    # Only launch external TUI if no CLI socket bridge is available (i.e., not on a node)
+    if not message and not (config.channels.cli_socket.enabled and socket_path.exists()):
+        _launch_external_tui(config.channels.opencode.port)
     if config.channels.cli_socket.enabled and socket_path.exists():
         # Determine session override for gateway mode
         # If user kept the default session_id, use the gateway's default_session (omit field)
