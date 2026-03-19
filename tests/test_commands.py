@@ -343,13 +343,12 @@ def test_reload_config_command_handles_http_error():
 def test_collect_configured_models_includes_decision_models_and_ignores_alias_targets():
     config = Config()
     config.agents.defaults.model = "openrouter/minimax/minimax-m2.5"
-    config.models.primary = "openrouter/minimax/minimax-m2.5"
     config.models.fallbacks = [
         "openai-codex/gpt-5.3-codex",
         "anthropic/claude-sonnet-4-20250514",
     ]
     config.tools.subconscious.classifier_model = "openrouter/google/gemini-2.0-flash-lite-001"
-    config.gateway.heartbeat.decide_model = "openai/gpt-5-mini"
+    config.gateway.heartbeat.subagent_model = "openai/gpt-5-mini"
     config.models.aliases = {
         "fast": "openrouter/minimax/minimax-m2.5",
         "smart": "anthropic/claude-sonnet-4-20250514",
@@ -364,10 +363,10 @@ def test_collect_configured_models_includes_decision_models_and_ignores_alias_ta
         "openrouter/google/gemini-2.0-flash-lite-001",
         "openai/gpt-5-mini",
     ]
-    assert models[0].sources == ["default", "primary"]
+    assert models[0].sources == ["default"]
     assert models[1].auth_mode == "oauth"
     assert models[3].sources == ["subconscious-decision"]
-    assert models[4].sources == ["heartbeat-decision"]
+    assert models[4].sources == ["heartbeat-subagent"]
 
 
 def test_models_list_command_renders_configured_models():

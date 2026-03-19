@@ -522,7 +522,7 @@ class AgentLoop:
                             "Stopping heartbeat tool loop after {} repeated identical tool-call batches",
                             repeated_tool_batch_count,
                         )
-                        final_content = "HEARTBEAT_OK (stopped repeated identical tool call loop)"
+                        final_content = "HEARTBEAT_OK"
                         break
 
                 if on_progress:
@@ -923,39 +923,16 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        is_heartbeat = key == "heartbeat"
+        is_heartbeat = key.startswith("heartbeat")
 
         if is_heartbeat:
             if "title" not in session.metadata:
                 session.metadata["title"] = "Heartbeat"
-            # Keep last 5 user/assistant exchanges for context on recent heartbeats,
-            # but strip tool_calls/tool messages that incompatible models reject.
-            _HB_KEEP = 5
-            raw = session.get_history(max_messages=self.memory_window)
-            pairs: list[dict] = []
-            for m in raw:
-                role = m.get("role")
-                if role == "user":
-                    pairs.append(m)
-                elif role == "assistant" and m.get("content") and not m.get("tool_calls"):
-                    pairs.append(m)
-                # skip tool / tool_calls-only assistant messages
-            # Take last N pairs (each pair = user + assistant)
-            assistant_count = sum(1 for m in pairs if m.get("role") == "assistant")
-            if assistant_count > _HB_KEEP:
-                trim = assistant_count - _HB_KEEP
-                trimmed: list[dict] = []
-                seen = 0
-                for m in pairs:
-                    if m.get("role") == "assistant":
-                        seen += 1
-                        if seen <= trim:
-                            continue
-                    elif seen < trim:
-                        continue
-                    trimmed.append(m)
-                pairs = trimmed
-            history = pairs
+            # Fresh context each tick — no history.  The heartbeat state file
+            # (`memory/heartbeat-state.json`) carries all inter-tick state.
+            # Keeping prior turns caused the model to skip checks ("already
+            # checked 30 min ago"), producing bare HEARTBEAT_OK responses.
+            history: list[dict] = []
         else:
             history = session.get_history(max_messages=self.memory_window)
         relevant_memories: str | None = None
@@ -1135,6 +1112,11 @@ class AgentLoop:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
 
+        # Throwaway subagent session — don't persist anything
+        if session.key == "heartbeat:sub":
+            return
+
+        is_heartbeat = session.key == "heartbeat"
         saved_entries: list[dict[str, Any]] = []
 
         for m in messages[skip:]:
@@ -1142,6 +1124,10 @@ class AgentLoop:
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
+            # Heartbeat main session: only keep assistant text replies (no tool calls,
+            # no user prompts, no tool results).  The rich prompt is rebuilt each tick.
+            if is_heartbeat and (role != "assistant" or not content or entry.get("tool_calls")):
+                continue
             if (
                 role == "tool"
                 and isinstance(content, str)
@@ -1204,7 +1190,7 @@ class AgentLoop:
         session.updated_at = datetime.now()
 
         # Feed new messages to subconscious for extraction (skip heartbeat/system tasks)
-        if self._subconscious and session.key != "heartbeat":
+        if self._subconscious and not session.key.startswith("heartbeat"):
             self._subconscious.feed_messages(messages[skip:], session_key=session.key)
 
     async def _consolidate_memory(

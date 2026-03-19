@@ -279,7 +279,6 @@ class AgentsConfig(Base):
 class ModelsConfig(Base):
     """Optional model catalog for clients (e.g. OpenCode)."""
 
-    primary: str = ""
     fallbacks: list[str] = Field(default_factory=list)
     aliases: dict[str, str] = Field(default_factory=dict)
 
@@ -324,7 +323,7 @@ class HeartbeatConfig(Base):
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
     model: str | None = None  # Override model for heartbeat execution (must support tool use)
-    decide_model: str | None = None  # Cheap model for skip/run decision (defaults to agent model)
+    subagent_model: str | None = None  # Cheap model for monitoring subagent (defaults to heartbeat model)
     duplicate_to_telegram_after_inactive_s: int = (
         30 * 60
     )  # Also send heartbeat to Telegram if no user messages for this long

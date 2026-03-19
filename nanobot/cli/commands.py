@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from loguru import logger
 import typer
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
@@ -231,13 +232,18 @@ def onboard():
     )
 
 
-def _make_provider(config: Config):
+def _make_provider_for_model(config: Config, model: str):
+    """Create an LLM provider for a specific model (may differ from the default agent model)."""
+    return _make_provider(config, model_override=model)
+
+
+def _make_provider(config: Config, model_override: str | None = None):
     """Create the appropriate LLM provider from config."""
     from nanobot.providers.custom_provider import CustomProvider
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
-    model = config.agents.defaults.model
+    model = model_override or config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     if provider_name is None:
         console.print(f"[red]Error: Could not determine provider for model '{model}'.[/red]")
@@ -475,7 +481,7 @@ def gateway(
             key = item.get("key") or ""
             if not key or key in {"heartbeat"}:
                 continue
-            if key.startswith(("system:", "cron:")):
+            if key.startswith(("system:", "cron:", "node:")):
                 continue
             return key
 
@@ -486,7 +492,7 @@ def gateway(
         enabled = set(channels.enabled_channels)
         if ":" in session_key:
             channel, chat_id = session_key.split(":", 1)
-            if channel not in {"cli", "system"} and channel in enabled and chat_id:
+            if channel not in {"cli", "system", "node"} and channel in enabled and chat_id:
                 return channel, chat_id
         return _pick_heartbeat_target()
 
@@ -562,7 +568,7 @@ def gateway(
             if ":" not in key:
                 continue
             channel, chat_id = key.split(":", 1)
-            if channel in {"cli", "system"}:
+            if channel in {"cli", "system", "node"}:
                 continue
             if channel in enabled and chat_id:
                 return channel, chat_id
@@ -570,29 +576,184 @@ def gateway(
         return "cli", "direct"
 
     # Create heartbeat service
-    async def on_heartbeat_execute(tasks: str) -> str:
-        """Phase 2: execute heartbeat tasks through the full agent loop."""
+    hb_cfg = config.gateway.heartbeat
+
+    def _build_awareness_block() -> str:
+        """Build awareness context: current time, idle duration, last session info."""
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Australia/Melbourne"))
+        lines = [f"**Current time:** {now.strftime('%A %Y-%m-%d %H:%M %Z')}"]
+
+        last_user_at = _last_user_message_at()
+        if last_user_at:
+            idle_s = (datetime.now() - last_user_at).total_seconds()
+            if idle_s < 60:
+                idle_str = f"{int(idle_s)}s"
+            elif idle_s < 3600:
+                idle_str = f"{int(idle_s // 60)}m"
+            else:
+                idle_str = f"{idle_s / 3600:.1f}h"
+            lines.append(f"**User idle:** {idle_str}")
+        else:
+            lines.append("**User idle:** no messages recorded")
+
+        # Find last active session and recent exchange
+        for item in session_manager.list_sessions():
+            key = item.get("key") or ""
+            if not key or key.startswith(("heartbeat", "system:", "cron:")):
+                continue
+            session = session_manager.get_or_create(key)
+            lines.append(f"**Last active session:** {key}")
+            recent = []
+            for entry in reversed(session.messages):
+                role = entry.get("role")
+                content = entry.get("content")
+                if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                    snippet = content.strip()[:120]
+                    recent.append(f"  - {role}: {snippet}")
+                if len(recent) >= 3:
+                    break
+            if recent:
+                recent.reverse()
+                lines.append("**Last exchange:**")
+                lines.extend(recent)
+            break
+
+        return "\n".join(lines)
+
+    def _build_heartbeat_prompt(heartbeat_content: str, subagent_summary: str) -> str:
+        """Assemble the enriched prompt for the main heartbeat agent."""
+        workspace = config.workspace_path
+        sections: list[str] = []
+
+        # 1. HEARTBEAT.md instructions
+        sections.append("# Heartbeat Instructions\n\n" + heartbeat_content)
+
+        # 2. Subagent monitoring findings
+        sections.append("# Monitoring Findings (from subagent)\n\n" + (subagent_summary or "_No findings._"))
+
+        # 3. Awareness block
+        sections.append("# Awareness\n\n" + _build_awareness_block())
+
+        # 4. Personality files (SOUL.md, AGENTS.md)
+        for fname in ("SOUL.md", "AGENTS.md"):
+            fpath = workspace / fname
+            if fpath.exists():
+                try:
+                    sections.append(f"# {fname}\n\n" + fpath.read_text(encoding="utf-8").strip())
+                except Exception:
+                    pass
+
+        # 5. MEMORY.md + last 2 days of history
+        memory_dir = workspace / "memory"
+        memory_md = memory_dir / "MEMORY.md"
+        if memory_md.exists():
+            try:
+                sections.append("# Memory\n\n" + memory_md.read_text(encoding="utf-8").strip())
+            except Exception:
+                pass
+
+        history_dir = memory_dir / "history"
+        if history_dir.is_dir():
+            from datetime import timedelta
+            today = datetime.now().date()
+            history_files = sorted(history_dir.glob("*.md"), reverse=True)
+            for hf in history_files[:7]:  # scan up to 7 to find 2 days
+                try:
+                    date_part = hf.stem  # e.g. "2026-03-19"
+                    from datetime import date as date_cls
+                    file_date = date_cls.fromisoformat(date_part)
+                    if (today - file_date).days <= 2:
+                        content = hf.read_text(encoding="utf-8").strip()
+                        if content:
+                            sections.append(f"# History: {date_part}\n\n" + content)
+                except (ValueError, Exception):
+                    continue
+
+        # 6. Last 10 heartbeat assistant outputs
+        hb_session = session_manager.get_or_create("heartbeat")
+        recent_outputs = []
+        for entry in reversed(hb_session.messages):
+            if entry.get("role") == "assistant" and isinstance(entry.get("content"), str):
+                ts = entry.get("timestamp", "")
+                recent_outputs.append(f"[{ts}] {entry['content'][:200]}")
+            if len(recent_outputs) >= 10:
+                break
+        if recent_outputs:
+            recent_outputs.reverse()
+            sections.append("# Recent Heartbeat Outputs\n\n" + "\n\n---\n\n".join(recent_outputs))
+
+        return "\n\n---\n\n".join(sections)
+
+    async def on_heartbeat_tick(heartbeat_content: str) -> str:
+        """Orchestrate subagent monitoring + main agent decision."""
         main_session = _resolve_main_session_key()
         channel, chat_id = _pick_heartbeat_target_for_session(main_session)
 
         async def _silent(*_args, **_kwargs):
             pass
 
-        return await agent.process_direct(
-            tasks,
+        # Step 1: Clear subagent session and run monitoring checks
+        sub_session = session_manager.get_or_create("heartbeat:sub")
+        sub_session.messages.clear()
+        sub_session.last_consolidated = 0
+        session_manager.save(sub_session)
+
+        monitoring_prompt = (
+            "You are a monitoring subagent. Execute the checks described in the HEARTBEAT.md below.\n"
+            "Run each check (email, RSS, commodities, etc.) using the available tools.\n"
+            "After all checks, return a structured summary of your findings:\n"
+            "- For each check: what you found, whether anything is actionable\n"
+            "- Include raw data (email subjects, RSS headlines, commodity prices) so the main agent can decide\n"
+            "- If a check found nothing noteworthy, say so briefly\n\n"
+            "Do NOT send any messages to the user. Only return your findings summary.\n\n"
+            f"{heartbeat_content}"
+        )
+
+        subagent_model = hb_cfg.subagent_model or hb_cfg.model
+        logger.info("Heartbeat: running monitoring subagent (model={})", subagent_model)
+        subagent_summary = await agent.process_direct(
+            monitoring_prompt,
+            session_key="heartbeat:sub",
+            channel=channel,
+            chat_id=chat_id,
+            on_progress=_silent,
+            model=subagent_model,
+        )
+        logger.info("Heartbeat: subagent complete, summary length={}", len(subagent_summary))
+
+        # Step 2: Build enriched prompt and run main agent
+        enriched_prompt = _build_heartbeat_prompt(heartbeat_content, subagent_summary)
+
+        logger.info("Heartbeat: running main agent (model={})", hb_cfg.model or "default")
+        response = await agent.process_direct(
+            enriched_prompt,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
             model=hb_cfg.model,
         )
+        logger.info("Heartbeat: main agent complete, response length={}", len(response))
+        return response
+
+    def _is_heartbeat_silent(response: str) -> bool:
+        """Return True if the heartbeat response has nothing worth delivering."""
+        return not response or not response.strip()
 
     async def on_heartbeat_notify(response: str) -> None:
         """Save heartbeat output into main session and deliver to channels."""
         from nanobot.bus.events import OutboundMessage
 
+        silent = _is_heartbeat_silent(response)
+
         main_session = _resolve_main_session_key()
-        _append_heartbeat_to_main_session(main_session, response)
+        if not silent:
+            _append_heartbeat_to_main_session(main_session, response)
+
+        if silent:
+            logger.debug("Heartbeat: silent response, skipping channel delivery")
+            return
 
         channel, chat_id = _pick_heartbeat_target_for_session(main_session)
         await bus.publish_outbound(
@@ -621,17 +782,21 @@ def gateway(
                 )
             )
 
-    hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
-        provider=provider,
-        model=agent.model,
-        on_execute=on_heartbeat_execute,
+        on_tick=on_heartbeat_tick,
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
-        decide_model=hb_cfg.decide_model,
     )
+
+    # POST /heartbeat/trigger — manually fire a heartbeat tick
+    async def _handle_heartbeat_trigger(request):
+        from aiohttp import web as _web
+        asyncio.create_task(heartbeat._tick())
+        return _web.json_response({"ok": True, "message": "heartbeat triggered"})
+
+    extra_routes.append(("/heartbeat/trigger", _handle_heartbeat_trigger))
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")

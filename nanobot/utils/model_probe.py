@@ -62,10 +62,6 @@ def collect_configured_models(config: Config) -> list[ConfiguredModel]:
 
     _ensure(config.agents.defaults.model, "default")
 
-    primary = (config.models.primary or "").strip()
-    if primary:
-        _ensure(primary, "primary")
-
     for model in config.models.fallbacks:
         _ensure(model, "fallback")
 
@@ -73,9 +69,9 @@ def collect_configured_models(config: Config) -> list[ConfiguredModel]:
     if classifier_model:
         _ensure(classifier_model, "subconscious-decision")
 
-    decide_model = (config.gateway.heartbeat.decide_model or "").strip()
-    if decide_model:
-        _ensure(decide_model, "heartbeat-decision")
+    subagent_model = (config.gateway.heartbeat.subagent_model or "").strip()
+    if subagent_model:
+        _ensure(subagent_model, "heartbeat-subagent")
 
     return list(ordered.values())
 
