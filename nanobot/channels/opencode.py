@@ -466,22 +466,13 @@ class OpenCodeChannel(BaseChannel):
         """Collect configured model names in priority order."""
         ordered: list[str] = []
 
-        primary = (self.models_config.primary if self.models_config else "").strip()
-        if primary:
-            ordered.append(primary)
+        if self.agent_config and self.agent_config.model:
+            ordered.append(self.agent_config.model)
 
         if self.models_config:
             for model in self.models_config.fallbacks:
                 if isinstance(model, str) and model.strip() and model not in ordered:
                     ordered.append(model)
-
-        if (
-            not ordered
-            and self.agent_config
-            and self.agent_config.model
-            and self.agent_config.model not in ordered
-        ):
-            ordered.append(self.agent_config.model)
 
         if not ordered:
             ordered.append("default")
@@ -745,9 +736,9 @@ class OpenCodeChannel(BaseChannel):
         app.router.add_post("/push/subscribe", self._handle_push_subscribe)
         app.router.add_post("/push/unsubscribe", self._handle_push_unsubscribe)
 
-        # Extra routes (e.g. node gateway WebSocket)
+        # Extra routes (e.g. node gateway WebSocket, heartbeat trigger)
         for path, handler in self._extra_routes:
-            app.router.add_get(path, handler)
+            app.router.add_route("*", path, handler)
 
         # Browser UI (added last so API routes win)
         app.router.add_get("/", self._handle_web_ui)
@@ -2158,6 +2149,7 @@ class OpenCodeChannel(BaseChannel):
 
             if tool_calls:
                 merged = dict(entry)
+                all_tool_calls = list(tool_calls)
                 pre_tool_text = ""
                 post_tool_text = ""
                 if isinstance(content, str) and content.strip():
@@ -2167,12 +2159,26 @@ class OpenCodeChannel(BaseChannel):
                 j = i + 1
                 while j < len(messages) and messages[j].get("role") != "user":
                     candidate = messages[j]
-                    if candidate.get("role") == "assistant" and not candidate.get("tool_calls"):
+                    if candidate.get("role") == "assistant":
+                        extra_tc = candidate.get("tool_calls")
+                        if extra_tc:
+                            # Intermediate assistant turn with more tool calls — merge them in.
+                            all_tool_calls.extend(extra_tc)
+                            # Merge reasoning_content from intermediate turns.
+                            rc = candidate.get("reasoning_content", "")
+                            if isinstance(rc, str) and rc.strip():
+                                existing_rc = merged.get("reasoning_content", "")
+                                if existing_rc:
+                                    merged["reasoning_content"] = existing_rc + "\n\n" + rc.strip()
+                                else:
+                                    merged["reasoning_content"] = rc.strip()
+                            j += 1
+                            continue
+                        # Final assistant text (no tool calls).
                         c = candidate.get("content", "")
                         if isinstance(c, str) and c.strip():
                             post_tool_text = c.strip()
                             usage_source = candidate
-                        # Merge reasoning_content from follow-up if present.
                         rc = candidate.get("reasoning_content", "")
                         if isinstance(rc, str) and rc.strip():
                             existing_rc = merged.get("reasoning_content", "")
@@ -2183,6 +2189,7 @@ class OpenCodeChannel(BaseChannel):
                         j += 1
                         break
                     j += 1
+                merged["tool_calls"] = all_tool_calls
 
                 merged["pre_tool_content"] = pre_tool_text
                 merged["content"] = post_tool_text

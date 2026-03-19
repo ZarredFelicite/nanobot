@@ -8,7 +8,8 @@
 
   let { message }: Props = $props();
 
-  let collapsedTools = $state<Set<string>>(new Set());
+  // Track expanded tools — empty set means all collapsed by default
+  let expandedTools = $state<Set<string>>(new Set());
   let copied = $state(false);
 
   function copyMessage(): void {
@@ -35,17 +36,17 @@
   const contentParts = $derived(textParts.filter(p => p.phase !== 'thinking'));
 
   function toggleTool(id: string): void {
-    const next = new Set(collapsedTools);
+    const next = new Set(expandedTools);
     if (next.has(id)) {
       next.delete(id);
     } else {
       next.add(id);
     }
-    collapsedTools = next;
+    expandedTools = next;
   }
 
-  function isCollapsed(id: string): boolean {
-    return collapsedTools.has(id);
+  function isExpanded(id: string): boolean {
+    return expandedTools.has(id);
   }
 
   function toolStatusIcon(status: string): string {
@@ -54,6 +55,20 @@
       case 'error': return '✗';
       default: return '⋯';
     }
+  }
+
+  function toolSummary(part: ToolPart): string {
+    return part.state.title || '';
+  }
+
+  function toolCommand(part: ToolPart): string {
+    const input = part.state.input ?? {};
+    return input.command || input.filePath || input.pattern || input.query || input.url || '';
+  }
+
+  function toolOutputLineCount(part: ToolPart): number {
+    if (!part.state.output) return 0;
+    return part.state.output.split('\n').filter((l: string) => l.trim()).length;
   }
 </script>
 
@@ -131,19 +146,31 @@
           {#each toolParts as part (part.id)}
             <div class="tool-call" class:error={part.state.status === 'error'}>
               <button class="tool-header" onclick={() => toggleTool(part.id)}>
-                <span class="tool-status" class:running={part.state.status === 'running'} class:completed={part.state.status === 'completed'} class:error={part.state.status === 'error'}>
-                  {toolStatusIcon(part.state.status)}
-                </span>
-                <span class="tool-name">{part.tool}</span>
-                {#if part.state.title}
-                  <span class="tool-title">{part.state.title}</span>
-                {/if}
-                <svg class="chevron" class:open={!isCollapsed(part.id)} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                  <path d="M6 9l6 6 6-6" />
-                </svg>
+                <div class="tool-header-lines">
+                  <div class="tool-header-line1">
+                    <span class="tool-status" class:running={part.state.status === 'running'} class:completed={part.state.status === 'completed'} class:error={part.state.status === 'error'}>
+                      {toolStatusIcon(part.state.status)}
+                    </span>
+                    <span class="tool-name">{part.tool}</span>
+                    {#if toolSummary(part)}
+                      <span class="tool-title">- {toolSummary(part)}</span>
+                    {/if}
+                    {#if toolOutputLineCount(part) > 0}
+                      <span class="tool-lines">[{toolOutputLineCount(part)}]</span>
+                    {:else if part.state.status === 'error'}
+                      <span class="tool-lines tool-lines-error">[error]</span>
+                    {/if}
+                    <svg class="chevron" class:open={isExpanded(part.id)} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                      <path d="M6 9l6 6 6-6" />
+                    </svg>
+                  </div>
+                  {#if toolCommand(part)}
+                    <div class="tool-header-line2">{toolCommand(part)}</div>
+                  {/if}
+                </div>
               </button>
 
-              {#if !isCollapsed(part.id)}
+              {#if isExpanded(part.id)}
                 <div class="tool-body">
                   {#if Object.keys(part.state.input ?? {}).length}
                     <div class="tool-params">
@@ -370,9 +397,7 @@
   }
 
   .tool-header {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
+    display: block;
     width: 100%;
     padding: 0.45rem 0.65rem;
     background: none;
@@ -381,6 +406,28 @@
     cursor: pointer;
     font: inherit;
     text-align: left;
+  }
+
+  .tool-header-lines {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+
+  .tool-header-line1 {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .tool-header-line2 {
+    font-size: 0.72rem;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    color: var(--muted);
+    padding-left: 1.6rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .tool-header:hover {
@@ -422,6 +469,17 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  .tool-lines {
+    font-size: 0.7rem;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    flex-shrink: 0;
+  }
+
+  .tool-lines-error {
+    color: var(--danger);
   }
 
   .chevron {

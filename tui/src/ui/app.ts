@@ -7,6 +7,7 @@ import {
   Loader,
   Editor,
   matchesKey,
+  isKeyRepeat,
   Key,
   type Component,
   type OverlayHandle,
@@ -44,6 +45,7 @@ export class App {
   private editor: Editor;
   private statusLoader: Loader | null = null;
   private overlay: OverlayHandle | null = null;
+  private lastSelectTime = 0;
 
   private activeSessionId = "";
   private isBusy = false;
@@ -99,9 +101,47 @@ export class App {
         }
       }
 
-      if (matchesKey(data, Key.escape) && this.isBusy) {
-        this.client.abortSession(this.activeSessionId).catch(() => {});
+      if (matchesKey(data, Key.escape)) {
+        if (this.isBusy) {
+          this.client.abortSession(this.activeSessionId).catch(() => {});
+          return { consume: true };
+        }
+        // Clear block selection
+        this.chatLog.clearSelection();
         return { consume: true };
+      }
+
+      // Block selection: Shift+Up/Down to navigate tool blocks
+      // Throttle to one move per 500ms to prevent skipping
+      if (matchesKey(data, Key.shift("up"))) {
+        const now = Date.now();
+        if (now - this.lastSelectTime >= 200) {
+          this.lastSelectTime = now;
+          this.chatLog.selectPrevious();
+        }
+        return { consume: true };
+      }
+
+      if (matchesKey(data, Key.shift("down"))) {
+        const now = Date.now();
+        if (now - this.lastSelectTime >= 200) {
+          this.lastSelectTime = now;
+          this.chatLog.selectNext();
+        }
+        return { consume: true };
+      }
+
+      // Shift+Right to expand, Shift+Left to collapse selected block
+      if (matchesKey(data, Key.shift("right"))) {
+        if (this.chatLog.expandSelected()) {
+          return { consume: true };
+        }
+      }
+
+      if (matchesKey(data, Key.shift("left"))) {
+        if (this.chatLog.collapseSelected()) {
+          return { consume: true };
+        }
       }
 
       return undefined;

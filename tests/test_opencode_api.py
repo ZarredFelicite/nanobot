@@ -125,7 +125,6 @@ async def test_config_providers_uses_models_catalog(bus, session_manager, mock_a
             model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
         ),
         models_config=ModelsConfig(
-            primary="openrouter/minimax/minimax-m2.5",
             fallbacks=["openrouter/moonshotai/kimi-k2.5", "openrouter/z-ai/glm-5"],
         ),
     )
@@ -139,12 +138,13 @@ async def test_config_providers_uses_models_catalog(bus, session_manager, mock_a
         resp = await client.get("/config/providers")
         assert resp.status == 200
         data = await resp.json()
-        assert data["default"]["default"] == "openrouter/minimax/minimax-m2.5"
-        assert len(data["providers"]) == 1
-        models = data["providers"][0]["models"]
-        assert "minimax/minimax-m2.5" in models
-        assert "moonshotai/kimi-k2.5" in models
-        assert "z-ai/glm-5" in models
+        assert data["default"]["default"] == "anthropic/claude-sonnet-4-20250514"
+        assert len(data["providers"]) >= 1
+        all_models = []
+        for p in data["providers"]:
+            all_models.extend(p["models"])
+        assert "moonshotai/kimi-k2.5" in all_models
+        assert "z-ai/glm-5" in all_models
     finally:
         await client.close()
 
@@ -159,8 +159,7 @@ async def test_config_exposes_all_configured_providers(bus, session_manager, moc
             model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
         ),
         models_config=ModelsConfig(
-            primary="openrouter/minimax/minimax-m2.5",
-            fallbacks=["openai-codex/gpt-5.3-codex", "anthropic/claude-sonnet-4-20250514"],
+            fallbacks=["openai-codex/gpt-5.3-codex"],
         ),
     )
 
@@ -173,8 +172,7 @@ async def test_config_exposes_all_configured_providers(bus, session_manager, moc
         resp = await client.get("/config")
         assert resp.status == 200
         data = await resp.json()
-        assert data["model"] == "openrouter/minimax/minimax-m2.5"
-        assert "openrouter" in data["provider"]
+        assert data["model"] == "anthropic/claude-sonnet-4-20250514"
         assert "openai-codex" in data["provider"]
         assert "anthropic" in data["provider"]
     finally:
@@ -190,13 +188,12 @@ async def test_config_reload_updates_model_catalog(bus, session_manager, mock_ag
         agent_config=AgentDefaults(
             model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
         ),
-        models_config=ModelsConfig(primary="anthropic/claude-sonnet-4-20250514"),
+        models_config=ModelsConfig(),
     )
 
     def _reload() -> dict[str, object]:
         cfg = Config()
         cfg.agents.defaults.model = "openrouter/minimax/minimax-m2.5"
-        cfg.models.primary = "openrouter/minimax/minimax-m2.5"
         cfg.models.fallbacks = ["openai-codex/gpt-5.3-codex"]
         channel.apply_runtime_config(cfg)
         return {"configPath": "/tmp/config.json"}
@@ -234,7 +231,6 @@ async def test_reload_command_returns_assistant_message(bus, session_manager, mo
     def _reload() -> dict[str, object]:
         cfg = Config()
         cfg.agents.defaults.model = "openrouter/minimax/minimax-m2.5"
-        cfg.models.primary = "openrouter/minimax/minimax-m2.5"
         channel.apply_runtime_config(cfg)
         return {}
 
@@ -273,7 +269,6 @@ async def test_reload_command_accepts_slash_prefixed_name(bus, session_manager, 
     def _reload() -> dict[str, object]:
         cfg = Config()
         cfg.agents.defaults.model = "openrouter/minimax/minimax-m2.5"
-        cfg.models.primary = "openrouter/minimax/minimax-m2.5"
         channel.apply_runtime_config(cfg)
         return {}
 
@@ -1104,6 +1099,69 @@ async def test_health(client):
     assert resp.status == 200
     data = await resp.json()
     assert data["healthy"] is True
+
+
+async def test_web_ui_missing_build_returns_instructions(bus, session_manager, mock_agent_loop):
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0, web_ui_path="/tmp/does-not-exist"),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        resp = await client.get("/")
+        assert resp.status == 200
+        text = await resp.text()
+        assert "web UI not built" in text
+    finally:
+        await client.close()
+
+
+async def test_web_ui_serves_static_build(bus, session_manager, mock_agent_loop, tmp_path):
+    build_dir = tmp_path / "webui-build"
+    build_dir.mkdir()
+    (build_dir / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+    (build_dir / "_app").mkdir()
+    (build_dir / "_app" / "entry.js").write_text("console.log('ok')", encoding="utf-8")
+
+    channel = OpenCodeChannel(
+        config=OpenCodeConfig(enabled=True, port=0, web_ui_path=str(build_dir)),
+        bus=bus,
+        session_manager=session_manager,
+        agent_loop=mock_agent_loop,
+        agent_config=AgentDefaults(
+            model="anthropic/claude-sonnet-4-20250514", provider="anthropic"
+        ),
+    )
+
+    app = web.Application()
+    channel._register_routes(app)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        root_resp = await client.get("/")
+        assert root_resp.status == 200
+        assert "<html>ok</html>" == await root_resp.text()
+
+        route_resp = await client.get("/session-view")
+        assert route_resp.status == 200
+        assert "<html>ok</html>" == await route_resp.text()
+
+        asset_resp = await client.get("/_app/entry.js")
+        assert asset_resp.status == 200
+        assert "console.log('ok')" == await asset_resp.text()
+    finally:
+        await client.close()
 
 
 async def test_path(client):
