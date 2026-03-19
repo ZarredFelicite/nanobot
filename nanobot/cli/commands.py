@@ -621,13 +621,38 @@ def gateway(
 
         return "\n".join(lines)
 
+    def _split_heartbeat_sections(heartbeat_content: str) -> tuple[str, str]:
+        """Split HEARTBEAT.md into monitoring and heartbeat agent sections.
+
+        Returns (monitoring_section, heartbeat_section).  Falls back to the
+        full content for both if markers are missing.
+        """
+        import re
+        monitoring = heartbeat_content
+        heartbeat_agent = heartbeat_content
+
+        # Look for the two top-level headings
+        m_start = re.search(r"^# Monitoring Subagent\b", heartbeat_content, re.MULTILINE)
+        h_start = re.search(r"^# Heartbeat Agent\b", heartbeat_content, re.MULTILINE)
+
+        if m_start and h_start:
+            monitoring = heartbeat_content[m_start.start():h_start.start()].strip()
+            heartbeat_agent = heartbeat_content[h_start.start():].strip()
+        elif m_start:
+            monitoring = heartbeat_content[m_start.start():].strip()
+        elif h_start:
+            heartbeat_agent = heartbeat_content[h_start.start():].strip()
+
+        return monitoring, heartbeat_agent
+
     def _build_heartbeat_prompt(heartbeat_content: str, subagent_summary: str) -> str:
         """Assemble the enriched prompt for the main heartbeat agent."""
         workspace = config.workspace_path
         sections: list[str] = []
 
-        # 1. HEARTBEAT.md instructions
-        sections.append("# Heartbeat Instructions\n\n" + heartbeat_content)
+        # 1. Heartbeat agent instructions (only the heartbeat section, not monitoring)
+        _, heartbeat_section = _split_heartbeat_sections(heartbeat_content)
+        sections.append(heartbeat_section)
 
         # 2. Subagent monitoring findings
         sections.append("# Monitoring Findings (from subagent)\n\n" + (subagent_summary or "_No findings._"))
@@ -699,16 +724,8 @@ def gateway(
         sub_session.last_consolidated = 0
         session_manager.save(sub_session)
 
-        monitoring_prompt = (
-            "You are a monitoring subagent. Execute the checks described in the HEARTBEAT.md below.\n"
-            "Run each check (email, RSS, commodities, etc.) using the available tools.\n"
-            "After all checks, return a structured summary of your findings:\n"
-            "- For each check: what you found, whether anything is actionable\n"
-            "- Include raw data (email subjects, RSS headlines, commodity prices) so the main agent can decide\n"
-            "- If a check found nothing noteworthy, say so briefly\n\n"
-            "Do NOT send any messages to the user. Only return your findings summary.\n\n"
-            f"{heartbeat_content}"
-        )
+        monitoring_section, _ = _split_heartbeat_sections(heartbeat_content)
+        monitoring_prompt = monitoring_section
 
         subagent_model = hb_cfg.subagent_model or hb_cfg.model
         logger.info("Heartbeat: running monitoring subagent (model={})", subagent_model)
