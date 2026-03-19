@@ -725,17 +725,22 @@ def gateway(
         session_manager.save(sub_session)
 
         monitoring_section, _ = _split_heartbeat_sections(heartbeat_content)
-        monitoring_prompt = monitoring_section
 
         subagent_model = hb_cfg.subagent_model or hb_cfg.model
+        subagent_system = (
+            "You are a monitoring subagent that gathers data and returns structured findings. "
+            "You have tools for running shell commands, reading/writing files, and fetching web content. "
+            f"Your workspace is at: {config.workspace_path}"
+        )
         logger.info("Heartbeat: running monitoring subagent (model={})", subagent_model)
         subagent_summary = await agent.process_direct(
-            monitoring_prompt,
+            monitoring_section,
             session_key="heartbeat:sub",
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
             model=subagent_model,
+            system_prompt=subagent_system,
         )
         logger.info("Heartbeat: subagent complete, summary length={}", len(subagent_summary))
 

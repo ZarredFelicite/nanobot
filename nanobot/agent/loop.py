@@ -832,6 +832,7 @@ class AgentLoop:
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         model: str | None = None,
+        system_prompt: str | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -1049,6 +1050,10 @@ class AgentLoop:
             chat_id=msg.chat_id,
             relevant_memories=relevant_memories,
         )
+
+        # Override system prompt when caller provides one (e.g. heartbeat subagent)
+        if system_prompt is not None and initial_messages and initial_messages[0].get("role") == "system":
+            initial_messages[0] = {"role": "system", "content": system_prompt}
 
         async def _bus_progress(
             content: str,
@@ -1327,6 +1332,7 @@ class AgentLoop:
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         model: str | None = None,
+        system_prompt: str | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
@@ -1334,6 +1340,7 @@ class AgentLoop:
             await self._subconscious.initialize()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress, model=model
+            msg, session_key=session_key, on_progress=on_progress, model=model,
+            system_prompt=system_prompt,
         )
         return response.content if response else ""
