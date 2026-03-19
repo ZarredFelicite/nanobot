@@ -727,11 +727,7 @@ def gateway(
         monitoring_section, _ = _split_heartbeat_sections(heartbeat_content)
 
         subagent_model = hb_cfg.subagent_model or hb_cfg.model
-        subagent_system = (
-            "You are a monitoring subagent that gathers data and returns structured findings. "
-            "You have tools for running shell commands, reading/writing files, and fetching web content. "
-            f"Your workspace is at: {config.workspace_path}"
-        )
+        subagent_system = agent.context.build_system_prompt(exclude_bootstrap=["AGENTS.md"])
         logger.info("Heartbeat: running monitoring subagent (model={})", subagent_model)
         subagent_summary = await agent.process_direct(
             monitoring_section,

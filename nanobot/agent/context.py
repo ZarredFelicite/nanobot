@@ -25,11 +25,12 @@ class ContextBuilder:
     def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
+        exclude_bootstrap: list[str] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, and skills."""
         parts = [self._get_identity()]
 
-        bootstrap = self._load_bootstrap_files()
+        bootstrap = self._load_bootstrap_files(exclude=exclude_bootstrap)
         if bootstrap:
             parts.append(bootstrap)
 
@@ -97,11 +98,14 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
-    def _load_bootstrap_files(self) -> str:
+    def _load_bootstrap_files(self, exclude: list[str] | None = None) -> str:
         """Load all bootstrap files from workspace."""
         parts = []
+        skip = set(exclude or [])
 
         for filename in self.BOOTSTRAP_FILES:
+            if filename in skip:
+                continue
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
