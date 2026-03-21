@@ -169,9 +169,29 @@ def _build_tool_metadata(tool_name: str, tool_event: dict, tool_output: str = ""
         }
 
     if tool_name == "write_file":
+        before_lines = before.splitlines(keepends=True)
+        after_lines = after.splitlines(keepends=True)
+        unified = "".join(
+            difflib.unified_diff(
+                before_lines,
+                after_lines,
+                fromfile=file_path,
+                tofile=file_path,
+            )
+        )
+        additions = sum(1 for ln in after_lines if ln not in before_lines)
+        deletions = sum(1 for ln in before_lines if ln not in after_lines)
         return {
             "filepath": file_path,
             "exists": bool(before),
+            "diff": unified,
+            "filediff": {
+                "file": file_path,
+                "before": before,
+                "after": after,
+                "additions": additions,
+                "deletions": deletions,
+            },
         }
 
     return {}
@@ -2221,6 +2241,11 @@ class OpenCodeChannel(BaseChannel):
 
             if role == "user":
                 text = content if isinstance(content, str) else str(content)
+                # Strip prompt-injection wrapper for display
+                _BEGIN = "<BEGIN_USER_MESSAGE>"
+                _END = "<END_USER_MESSAGE>"
+                if _BEGIN in text and _END in text:
+                    text = text[text.index(_BEGIN) + len(_BEGIN):text.index(_END)].strip()
                 msg = {
                     "info": {
                         "id": msg_id,
@@ -2292,8 +2317,38 @@ class OpenCodeChannel(BaseChannel):
             if prev_user_created_ms is not None and created_assistant <= prev_user_created_ms:
                 created_assistant = prev_user_created_ms + 1
 
+            # Build parts in display order: thinking → pre-tool text → tools → final text
             parts: list[dict[str, Any]] = []
             part_idx = 0
+
+            if reasoning_text:
+                parts.append(
+                    {
+                        "id": f"{part_id}_{part_idx}",
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                        "type": "text",
+                        "text": reasoning_text,
+                        "time": {"start": created_assistant, "end": created_assistant},
+                        "phase": "thinking",
+                    }
+                )
+                part_idx += 1
+
+            if pre_tool_text:
+                parts.append(
+                    {
+                        "id": f"{part_id}_{part_idx}",
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                        "type": "text",
+                        "text": pre_tool_text,
+                        "time": {"start": created_assistant, "end": created_assistant},
+                        "phase": "thinking",
+                    }
+                )
+                part_idx += 1
+
             for tc in tool_calls:
                 tc_id = tc.get("id", "")
                 tc_func = tc.get("function", {})
@@ -2325,6 +2380,35 @@ class OpenCodeChannel(BaseChannel):
                 tc_metadata: dict[str, Any] = {}
                 if tc_name == "exec" and tc_output:
                     tc_metadata = {"output": tc_output}
+                elif tc_name == "edit_file" and tc_status == "completed":
+                    import difflib
+
+                    old_str = tc_input.get("old_text", "")
+                    new_str = tc_input.get("new_text", "")
+                    file_path = tc_input.get("path", "")
+                    if old_str or new_str:
+                        old_lines = old_str.splitlines(keepends=True)
+                        new_lines = new_str.splitlines(keepends=True)
+                        unified = "".join(
+                            difflib.unified_diff(
+                                old_lines,
+                                new_lines,
+                                fromfile=file_path,
+                                tofile=file_path,
+                            )
+                        )
+                        additions = sum(1 for ln in new_lines if ln not in old_lines)
+                        deletions = sum(1 for ln in old_lines if ln not in new_lines)
+                        tc_metadata = {
+                            "diff": unified,
+                            "filediff": {
+                                "file": file_path,
+                                "before": old_str,
+                                "after": new_str,
+                                "additions": additions,
+                                "deletions": deletions,
+                            },
+                        }
 
                 if tc_status == "error":
                     tc_state: dict[str, Any] = {
@@ -2359,37 +2443,6 @@ class OpenCodeChannel(BaseChannel):
                         "callID": tc_id,
                         "tool": oc_name,
                         "state": tc_state,
-                    }
-                )
-                part_idx += 1
-
-            if reasoning_text:
-                parts.append(
-                    {
-                        "id": f"{part_id}_{part_idx}",
-                        "sessionID": session_id,
-                        "messageID": msg_id,
-                        "type": "text",
-                        "text": reasoning_text,
-                        "time": {"start": created_assistant, "end": created_assistant},
-                        "phase": "thinking",
-                    }
-                )
-                part_idx += 1
-
-            if pre_tool_text:
-                # When reasoning_content exists, pre_tool_text is the visible response
-                # before tool calls (not thinking). Otherwise it's legacy thinking text.
-                phase = "assistant" if reasoning_text else "thinking"
-                parts.append(
-                    {
-                        "id": f"{part_id}_{part_idx}",
-                        "sessionID": session_id,
-                        "messageID": msg_id,
-                        "type": "text",
-                        "text": pre_tool_text,
-                        "time": {"start": created_assistant, "end": created_assistant},
-                        "phase": phase,
                     }
                 )
                 part_idx += 1

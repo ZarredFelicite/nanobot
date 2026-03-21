@@ -8,8 +8,19 @@
 
   let { message }: Props = $props();
 
-  // Track expanded tools — empty set means all collapsed by default
+  // Track expanded tools — edit/write tools with diffs auto-expand
   let expandedTools = $state<Set<string>>(new Set());
+  let autoExpandedIds = $state<Set<string>>(new Set());
+
+  // Auto-expand tools that have diff metadata
+  $effect(() => {
+    for (const part of message.parts) {
+      if (part.type === 'tool' && !autoExpandedIds.has(part.id) && part.state.metadata?.filediff) {
+        autoExpandedIds = new Set([...autoExpandedIds, part.id]);
+        expandedTools = new Set([...expandedTools, part.id]);
+      }
+    }
+  });
   let copied = $state(false);
 
   function copyMessage(): void {
@@ -24,15 +35,10 @@
     message.parts.filter((part): part is TextPart => part.type === 'text')
   );
 
-  const toolParts = $derived(
-    message.parts.filter((part): part is ToolPart => part.type === 'tool')
-  );
-
   const isAssistant = $derived(message.info.role === 'assistant');
   const isUser = $derived(message.info.role === 'user');
   const isCompact = $derived(message.info.mode === 'compact');
 
-  const thinkingParts = $derived(textParts.filter(p => p.phase === 'thinking'));
   const contentParts = $derived(textParts.filter(p => p.phase !== 'thinking'));
 
   function toggleTool(id: string): void {
@@ -69,6 +75,73 @@
   function toolOutputLineCount(part: ToolPart): number {
     if (!part.state.output) return 0;
     return part.state.output.split('\n').filter((l: string) => l.trim()).length;
+  }
+
+  function wordCount(text: string): number {
+    return text.trim().split(/\s+/).length;
+  }
+
+  interface FileDiff {
+    file: string;
+    before: string;
+    after: string;
+    additions: number;
+    deletions: number;
+  }
+
+  interface DiffHunk {
+    header: string;
+    lines: { type: 'add' | 'del' | 'ctx'; num: number | null; text: string }[];
+  }
+
+  function getFileDiff(part: ToolPart): FileDiff | null {
+    const meta = part.state.metadata;
+    if (!meta || !meta.filediff) return null;
+    return meta.filediff as FileDiff;
+  }
+
+  function parseDiffHunks(part: ToolPart): DiffHunk[] {
+    const meta = part.state.metadata;
+    if (!meta || typeof meta.diff !== 'string') return [];
+    const raw = meta.diff as string;
+    const hunks: DiffHunk[] = [];
+    let current: DiffHunk | null = null;
+    let addLine = 0;
+    let delLine = 0;
+
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('@@')) {
+        const match = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        current = { header: line, lines: [] };
+        hunks.push(current);
+        delLine = match ? parseInt(match[1]) : 0;
+        addLine = match ? parseInt(match[2]) : 0;
+      } else if (current) {
+        if (line.startsWith('+')) {
+          current.lines.push({ type: 'add', num: addLine++, text: line.slice(1) });
+        } else if (line.startsWith('-')) {
+          current.lines.push({ type: 'del', num: delLine++, text: line.slice(1) });
+        } else if (!line.startsWith('\\')) {
+          current.lines.push({ type: 'ctx', num: addLine, text: line.startsWith(' ') ? line.slice(1) : line });
+          addLine++;
+          delLine++;
+        }
+      }
+    }
+    return hunks;
+  }
+
+  function hasDiff(part: ToolPart): boolean {
+    return !!(part.state.metadata?.filediff);
+  }
+
+  function diffSummary(part: ToolPart): string {
+    const fd = getFileDiff(part);
+    if (!fd) return '';
+    const parts: string[] = [];
+    if (fd.additions > 0) parts.push(`+${fd.additions}`);
+    if (fd.deletions > 0) parts.push(`-${fd.deletions}`);
+    return parts.join(' ');
   }
 </script>
 
@@ -120,58 +193,85 @@
     </div>
 
     <div class="content-stack">
-      {#if textParts.length === 0 && toolParts.length === 0}
+      {#if message.parts.length === 0}
         <p class="placeholder">Generating...</p>
       {/if}
 
-      {#if thinkingParts.length > 0}
-        <details class="thinking-block">
-          <summary>Thinking</summary>
-          <div class="thinking-content">
-            {#each thinkingParts as part (part.id)}
-              <pre>{part.text}</pre>
-            {/each}
+      {#each message.parts as part (part.id)}
+        {#if part.type === 'text' && part.phase === 'thinking'}
+          {#if wordCount(part.text) > 30}
+            <details class="thinking-block">
+              <summary>Thinking</summary>
+              <div class="thinking-content">{part.text}</div>
+            </details>
+          {:else}
+            <div class="thinking-inline">{part.text}</div>
+          {/if}
+        {:else if part.type === 'text'}
+          <div class="text-part">
+            {@html renderMarkdown(part.text)}
           </div>
-        </details>
-      {/if}
-
-      {#each contentParts as part (part.id)}
-        <div class="text-part">
-          {@html renderMarkdown(part.text)}
-        </div>
-      {/each}
-
-      {#if toolParts.length > 0}
-        <div class="tool-group">
-          {#each toolParts as part (part.id)}
-            <div class="tool-call" class:error={part.state.status === 'error'}>
-              <button class="tool-header" onclick={() => toggleTool(part.id)}>
-                <div class="tool-header-lines">
-                  <div class="tool-header-line1">
-                    <span class="tool-status" class:running={part.state.status === 'running'} class:completed={part.state.status === 'completed'} class:error={part.state.status === 'error'}>
-                      {toolStatusIcon(part.state.status)}
-                    </span>
-                    <span class="tool-name">{part.tool}</span>
-                    {#if toolSummary(part)}
-                      <span class="tool-title">- {toolSummary(part)}</span>
-                    {/if}
-                    {#if toolOutputLineCount(part) > 0}
-                      <span class="tool-lines">[{toolOutputLineCount(part)}]</span>
-                    {:else if part.state.status === 'error'}
-                      <span class="tool-lines tool-lines-error">[error]</span>
-                    {/if}
-                    <svg class="chevron" class:open={isExpanded(part.id)} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                      <path d="M6 9l6 6 6-6" />
-                    </svg>
-                  </div>
-                  {#if toolCommand(part)}
-                    <div class="tool-header-line2">{toolCommand(part)}</div>
+        {:else if part.type === 'tool'}
+          <div class="tool-call" class:error={part.state.status === 'error'}>
+            <button class="tool-header" onclick={() => toggleTool(part.id)}>
+              <div class="tool-header-lines">
+                <div class="tool-header-line1">
+                  <span class="tool-status" class:running={part.state.status === 'running'} class:completed={part.state.status === 'completed'} class:error={part.state.status === 'error'}>
+                    {toolStatusIcon(part.state.status)}
+                  </span>
+                  <span class="tool-name">{part.tool}</span>
+                  {#if toolSummary(part)}
+                    <span class="tool-title">- {toolSummary(part)}</span>
                   {/if}
+                  {#if hasDiff(part)}
+                    <span class="diff-stats">
+                      {#if getFileDiff(part)?.additions}<span class="diff-add">+{getFileDiff(part)?.additions}</span>{/if}
+                      {#if getFileDiff(part)?.deletions}<span class="diff-del">-{getFileDiff(part)?.deletions}</span>{/if}
+                    </span>
+                  {:else if toolOutputLineCount(part) > 0}
+                    <span class="tool-lines">[{toolOutputLineCount(part)}]</span>
+                  {:else if part.state.status === 'error'}
+                    <span class="tool-lines tool-lines-error">[error]</span>
+                  {/if}
+                  <svg class="chevron" class:open={isExpanded(part.id)} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                    <path d="M6 9l6 6 6-6" />
+                  </svg>
                 </div>
-              </button>
+                {#if toolCommand(part)}
+                  <div class="tool-header-line2">{toolCommand(part)}</div>
+                {/if}
+              </div>
+            </button>
 
-              {#if isExpanded(part.id)}
-                <div class="tool-body">
+            {#if isExpanded(part.id)}
+              <div class="tool-body">
+                {#if hasDiff(part)}
+                  <!-- Diff viewer for edit/write tools -->
+                  <div class="diff-viewer">
+                    <div class="diff-file-header">
+                      <span class="diff-file-path">{getFileDiff(part)?.file}</span>
+                      <span class="diff-file-stats">
+                        {#if getFileDiff(part)?.additions}<span class="diff-add">+{getFileDiff(part)?.additions}</span>{/if}
+                        {#if getFileDiff(part)?.deletions}<span class="diff-del">-{getFileDiff(part)?.deletions}</span>{/if}
+                      </span>
+                    </div>
+                    {#each parseDiffHunks(part) as hunk}
+                      <div class="diff-hunk">
+                        <div class="diff-hunk-header">{hunk.header}</div>
+                        {#each hunk.lines as line}
+                          <div class="diff-line" class:diff-line-add={line.type === 'add'} class:diff-line-del={line.type === 'del'} class:diff-line-ctx={line.type === 'ctx'}>
+                            <span class="diff-line-num">{line.num ?? ''}</span>
+                            <span class="diff-line-marker">{line.type === 'add' ? '+' : line.type === 'del' ? '-' : ' '}</span>
+                            <span class="diff-line-text">{line.text}</span>
+                          </div>
+                        {/each}
+                      </div>
+                    {/each}
+                  </div>
+                  {#if part.state.error}
+                    <pre class="tool-output tool-error">{part.state.error}</pre>
+                  {/if}
+                {:else}
                   {#if Object.keys(part.state.input ?? {}).length}
                     <div class="tool-params">
                       {#each Object.entries(part.state.input) as [key, value]}
@@ -188,12 +288,12 @@
                   {:else if part.state.error}
                     <pre class="tool-output tool-error">{part.state.error}</pre>
                   {/if}
-                </div>
-              {/if}
-            </div>
-          {/each}
-        </div>
-      {/if}
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      {/each}
     </div>
   {/if}
 </article>
@@ -349,40 +449,34 @@
   }
 
   .thinking-block {
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    border-radius: 0.5rem;
-    background: rgba(255, 255, 255, 0.02);
+    border-radius: 0.35rem;
     overflow: hidden;
   }
 
   .thinking-block summary {
-    padding: 0.4rem 0.7rem;
-    font-size: 0.75rem;
+    padding: 0.2rem 0;
+    font-size: 0.78rem;
     color: var(--muted);
+    opacity: 0.5;
     cursor: pointer;
     user-select: none;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
   }
 
   .thinking-content {
-    padding: 0 0.7rem 0.5rem;
-    opacity: 0.6;
-  }
-
-  .thinking-content pre {
-    margin: 0;
+    padding: 0 0 0.3rem;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--muted);
+    opacity: 0.5;
     white-space: pre-wrap;
     word-break: break-word;
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-    font-size: 0.78rem;
-    line-height: 1.5;
   }
 
-  .tool-group {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
+  .thinking-inline {
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--muted);
+    opacity: 0.5;
   }
 
   .tool-call {
@@ -480,6 +574,135 @@
 
   .tool-lines-error {
     color: var(--danger);
+  }
+
+  .diff-stats {
+    display: inline-flex;
+    gap: 0.35rem;
+    font-size: 0.7rem;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    flex-shrink: 0;
+  }
+
+  .diff-add {
+    color: #4ade80;
+  }
+
+  .diff-del {
+    color: #f87171;
+  }
+
+  /* Diff viewer */
+  .diff-viewer {
+    margin-top: 0.4rem;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 0.4rem;
+    overflow: hidden;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.75rem;
+    line-height: 1.55;
+  }
+
+  .diff-file-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.35rem 0.65rem;
+    background: rgba(255, 255, 255, 0.03);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  .diff-file-path {
+    color: var(--text);
+    font-size: 0.72rem;
+    font-weight: 500;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .diff-file-stats {
+    display: flex;
+    gap: 0.4rem;
+    font-size: 0.7rem;
+    flex-shrink: 0;
+  }
+
+  .diff-hunk {
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
+  }
+
+  .diff-hunk:first-child {
+    border-top: none;
+  }
+
+  .diff-hunk-header {
+    padding: 0.2rem 0.65rem;
+    color: rgba(148, 163, 184, 0.6);
+    background: rgba(255, 255, 255, 0.015);
+    font-size: 0.68rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .diff-line {
+    display: flex;
+    white-space: pre;
+    min-height: 1.55em;
+  }
+
+  .diff-line-num {
+    width: 3.2rem;
+    flex-shrink: 0;
+    text-align: right;
+    padding-right: 0.5rem;
+    color: rgba(148, 163, 184, 0.3);
+    user-select: none;
+  }
+
+  .diff-line-marker {
+    width: 1.2rem;
+    flex-shrink: 0;
+    text-align: center;
+    user-select: none;
+  }
+
+  .diff-line-text {
+    flex: 1;
+    min-width: 0;
+    padding-right: 0.5rem;
+  }
+
+  .diff-line-add {
+    background: rgba(74, 222, 128, 0.08);
+  }
+
+  .diff-line-add .diff-line-marker,
+  .diff-line-add .diff-line-text {
+    color: #4ade80;
+  }
+
+  .diff-line-del {
+    background: rgba(248, 113, 113, 0.08);
+  }
+
+  .diff-line-del .diff-line-marker,
+  .diff-line-del .diff-line-text {
+    color: #f87171;
+  }
+
+  .diff-line-ctx {
+    background: transparent;
+  }
+
+  .diff-line-ctx .diff-line-text {
+    color: var(--muted);
+  }
+
+  .diff-line-ctx .diff-line-marker {
+    color: transparent;
   }
 
   .chevron {
