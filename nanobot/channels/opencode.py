@@ -1795,6 +1795,13 @@ class OpenCodeChannel(BaseChannel):
             "template": "/help",
             "hints": [],
         },
+        {
+            "name": "clean",
+            "description": "Redact secrets (passwords, keys, tokens) from session history",
+            "source": "command",
+            "template": "/clean",
+            "hints": [],
+        },
     ]
 
     _COMMANDS_BY_NAME = {c["name"]: c for c in _COMMANDS}
@@ -1817,6 +1824,9 @@ class OpenCodeChannel(BaseChannel):
 
         if normalized_command_name == "reload-config":
             return await self._handle_reload_command(session_id)
+
+        if normalized_command_name == "clean":
+            return await self._handle_clean_command(session_id, body)
 
         # Resolve template — substitute $ARGUMENTS if present
         template = cmd["template"]
@@ -1948,7 +1958,8 @@ class OpenCodeChannel(BaseChannel):
             self.session_manager.save(session)
 
         now_ms = self._epoch_ms(time.time())
-        provider_name, model_id = self._parse_model()
+        reload_model = self._session_model(session)
+        provider_name, model_id = self._split_model(reload_model)
         display_idx = max(0, self._display_count(session, session_id) - 1)
         msg_id, part_id = self._ids_for_index(session_id, display_idx)
         asst_msg = {
@@ -1985,6 +1996,179 @@ class OpenCodeChannel(BaseChannel):
             {"sessionID": session_id, "status": {"type": "idle"}},
         )
         return web.json_response({"info": asst_msg, "parts": [asst_part]}, status=status)
+
+    async def _handle_clean_command(
+        self, session_id: str, body: dict[str, Any] | None = None,
+    ) -> web.Response:
+        """Use the session's selected model to find and redact secrets in message history."""
+        session, key = self._find_session(session_id)
+        if not session:
+            return web.json_response({"error": "not found"}, status=404)
+        if not self.agent_loop:
+            return web.json_response({"error": "no agent"}, status=500)
+
+        active_model = self._session_model(session, body)
+
+        # Build a compact text representation of the session for the LLM to scan
+        scan_lines: list[str] = []
+        for i, m in enumerate(session.messages):
+            role = m.get("role", "unknown")
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    c.get("text", "") for c in content if isinstance(c, dict)
+                )
+            if not isinstance(content, str) or not content.strip():
+                continue
+            scan_lines.append(f"[msg {i}] ({role}): {content[:2000]}")
+
+        if not scan_lines:
+            return await self._send_clean_result(session, session_id, "No messages to scan.", 0)
+
+        scan_text = "\n".join(scan_lines)
+
+        # Ask the LLM to identify secret values
+        prompt = (
+            "You are a security auditor. Scan the following conversation messages "
+            "and identify ALL secret values that should be redacted. Secrets include: "
+            "passwords, Wi-Fi PSKs, API keys, tokens, private keys, connection strings, "
+            "and any other credentials or sensitive values.\n\n"
+            "For each secret found, output ONLY a JSON array of objects with:\n"
+            '- "value": the exact secret string to redact (must match verbatim)\n'
+            '- "label": a short description (e.g. "Wi-Fi password", "API key")\n\n'
+            "If no secrets are found, output an empty array: []\n\n"
+            "IMPORTANT: Output ONLY the JSON array, no markdown fences, no explanation.\n\n"
+            "Messages:\n" + scan_text
+        )
+
+        provider = self.agent_loop.provider
+        if active_model.startswith(("openai-codex/", "openai_codex/")):
+            if self.agent_loop._codex_provider is None:
+                from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+                self.agent_loop._codex_provider = OpenAICodexProvider(default_model=active_model)
+            provider = self.agent_loop._codex_provider
+
+        await self._broadcast_sse(
+            "session.status",
+            {"sessionID": session_id, "status": {"type": "busy", "message": "Scanning for secrets..."}},
+        )
+
+        try:
+            response = await provider.chat(
+                messages=[
+                    {"role": "system", "content": "You are a security auditor. Output only valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                model=active_model,
+                max_tokens=2048,
+                temperature=0.0,
+            )
+        except Exception as e:
+            logger.exception("Clean command LLM call failed")
+            return await self._send_clean_result(session, session_id, f"Error scanning: {e}", 0)
+
+        # Parse the LLM response
+        raw = (response.content or "").strip()
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3].strip()
+
+        try:
+            secrets = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Clean command: could not parse LLM response as JSON: {}", raw[:200])
+            return await self._send_clean_result(
+                session, session_id,
+                f"Could not parse secret scan results. Raw response:\n{raw[:500]}",
+                0,
+            )
+
+        if not isinstance(secrets, list) or not secrets:
+            return await self._send_clean_result(session, session_id, "No secrets found.", 0)
+
+        # Redact secrets in all session messages
+        redact_count = 0
+        for secret_entry in secrets:
+            if not isinstance(secret_entry, dict):
+                continue
+            value = secret_entry.get("value", "")
+            label = secret_entry.get("label", "secret")
+            if not isinstance(value, str) or len(value) < 4:
+                continue
+            redacted = f"[REDACTED:{label}]"
+            for m in session.messages:
+                content = m.get("content")
+                if isinstance(content, str) and value in content:
+                    m["content"] = content.replace(value, redacted)
+                    redact_count += 1
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            if value in part["text"]:
+                                part["text"] = part["text"].replace(value, redacted)
+                                redact_count += 1
+
+        if self.session_manager:
+            self.session_manager.save(session)
+
+        labels = [s.get("label", "?") for s in secrets if isinstance(s, dict)]
+        summary = (
+            f"Redacted {len(secrets)} secret(s) across {redact_count} message(s): "
+            + ", ".join(labels)
+        )
+        return await self._send_clean_result(session, session_id, summary, len(secrets))
+
+    async def _send_clean_result(
+        self, session: Session, session_id: str, text: str, secrets_found: int,
+    ) -> web.Response:
+        """Emit SSE events for /clean result and return response."""
+        session.add_message("assistant", text)
+        if self.session_manager:
+            self.session_manager.save(session)
+
+        now_ms = self._epoch_ms(time.time())
+        clean_model = self._session_model(session)
+        provider_name, model_id = self._split_model(clean_model)
+        display_idx = max(0, self._display_count(session, session_id) - 1)
+        msg_id, part_id = self._ids_for_index(session_id, display_idx)
+
+        asst_msg = {
+            "id": msg_id,
+            "sessionID": session_id,
+            "role": "assistant",
+            "time": {"created": now_ms, "completed": now_ms},
+            "modelID": model_id,
+            "providerID": provider_name,
+            "mode": "default",
+            "agent": "default",
+            "path": {"cwd": str(self.agent_loop.workspace), "root": ""}
+            if self.agent_loop
+            else {"cwd": "", "root": ""},
+            "cost": 0,
+            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        }
+        asst_part = {
+            "id": part_id,
+            "sessionID": session_id,
+            "messageID": msg_id,
+            "type": "text",
+            "text": text,
+            "time": {"created": now_ms},
+        }
+
+        await self._broadcast_sse("message.updated", {"info": asst_msg})
+        await self._broadcast_sse("message.part.updated", {"part": asst_part})
+        await self._broadcast_sse(
+            "session.updated", {"info": self._session_to_info(session, session_id)}
+        )
+        await self._broadcast_sse(
+            "session.status",
+            {"sessionID": session_id, "status": {"type": "idle"}},
+        )
+
+        return web.json_response({"info": asst_msg, "parts": [asst_part]})
 
     # ------------------------------------------------------------------
     # Stub endpoints
@@ -2113,7 +2297,8 @@ class OpenCodeChannel(BaseChannel):
     def _messages_to_opencode(self, session: Session, session_id: str) -> list[dict[str, Any]]:
         """Convert nanobot message list to OpenCode MessageV2.WithParts format."""
         result = []
-        provider_name, model_id = self._parse_model()
+        session_model = self._session_model(session)
+        provider_name, model_id = self._split_model(session_model)
         messages = session.messages
 
         # Respect revert_point — hide messages at or beyond the cutoff
@@ -2484,6 +2669,13 @@ class OpenCodeChannel(BaseChannel):
             if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
                 tokens["reasoning"] = details["reasoning_tokens"]
 
+            # Use per-message model when stored (set by _save_turn), else session default
+            msg_model = m.get("model")
+            if isinstance(msg_model, str) and "/" in msg_model:
+                msg_provider, msg_model_id = self._split_model(msg_model)
+            else:
+                msg_provider, msg_model_id = provider_name, model_id
+
             msg = {
                 "info": {
                     "id": msg_id,
@@ -2491,8 +2683,8 @@ class OpenCodeChannel(BaseChannel):
                     "role": "assistant",
                     "time": {"created": created_assistant, "completed": created_assistant},
                     "parentID": prev_user_id or "",
-                    "modelID": model_id,
-                    "providerID": provider_name,
+                    "modelID": msg_model_id,
+                    "providerID": msg_provider,
                     "mode": "default",
                     "agent": "default",
                     "path": {
