@@ -449,6 +449,30 @@ class AgentLoop:
         usage["last"] = stats
         session.metadata["context_usage"] = usage
 
+    def get_provider_for_model(self, model: str) -> "LLMProvider":
+        """Return the appropriate provider for a given model string.
+
+        Uses the codex provider for openai-codex/* models and the default
+        litellm provider for everything else.  When the default provider
+        itself is a codex provider (because the default model is codex),
+        creates a litellm fallback for non-codex models.
+        """
+        if model.startswith(("openai-codex/", "openai_codex/")):
+            if self._codex_provider is None:
+                from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+                self._codex_provider = OpenAICodexProvider(default_model=model)
+            return self._codex_provider
+
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        if isinstance(self.provider, OpenAICodexProvider):
+            # Default provider is codex but the requested model is not —
+            # create a litellm provider that relies on env-var API keys.
+            if not hasattr(self, "_litellm_fallback") or self._litellm_fallback is None:
+                from nanobot.providers.litellm_provider import LiteLLMProvider
+                self._litellm_fallback = LiteLLMProvider(default_model=model)
+            return self._litellm_fallback
+        return self.provider
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -466,13 +490,7 @@ class AgentLoop:
         last_tool_batch_signature: str | None = None
         repeated_tool_batch_count = 0
         active_model = model or self.model
-        active_provider = self.provider
-        if active_model.startswith(("openai-codex/", "openai_codex/")):
-            if self._codex_provider is None:
-                from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-
-                self._codex_provider = OpenAICodexProvider(default_model=active_model)
-            active_provider = self._codex_provider
+        active_provider = self.get_provider_for_model(active_model)
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -522,18 +540,18 @@ class AgentLoop:
                             "Stopping heartbeat tool loop after {} repeated identical tool-call batches",
                             repeated_tool_batch_count,
                         )
-                        final_content = "HEARTBEAT_OK"
+                        final_content = ""
                         break
 
                 if on_progress:
-                    # Send reasoning_content first (as thinking), then content (as visible).
+                    # Send reasoning and pre-tool text as thinking, before tool calls.
                     if response.reasoning_content:
                         await on_progress(response.reasoning_content, is_reasoning=True)
                     clean = self._strip_think(response.content)
                     if parsed_markup_calls:
                         clean = None
                     if clean:
-                        await on_progress(clean)
+                        await on_progress(clean, is_reasoning=True)
                     await on_progress(self._tool_hint(effective_tool_calls), tool_hint=True)
 
                 tool_call_dicts = [
@@ -654,6 +672,12 @@ class AgentLoop:
                         ", ".join(validation.findings),
                     )
                     clean = validation.replacement
+                # Stream thinking and final text to on_progress
+                if on_progress:
+                    if response.reasoning_content:
+                        await on_progress(response.reasoning_content, is_reasoning=True)
+                    if clean:
+                        await on_progress(clean)
                 # Don't persist error responses to session history - they can
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
@@ -684,7 +708,6 @@ class AgentLoop:
         await self._connect_mcp()
         if self._subconscious:
             await self._subconscious.initialize()
-            self._subconscious.set_provider(self.provider)
             self._subconscious.start_background_task()
         logger.info("Agent loop started")
 
@@ -733,9 +756,6 @@ class AgentLoop:
         self.subagents.web_proxy = self.web_proxy
         self.subagents.exec_config = self.exec_config
         self.subagents.restrict_to_workspace = self.restrict_to_workspace
-
-        if self._subconscious:
-            self._subconscious.set_provider(provider)
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -1086,7 +1106,8 @@ class AgentLoop:
         )
 
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+            is_heartbeat = key.startswith("heartbeat") if key else False
+            final_content = "" if is_heartbeat else "I've completed processing but have no response to give."
 
         self._save_turn(session, all_msgs, 1 + len(history), usage=usage, model=active_model)
         self.sessions.save(session)
@@ -1149,6 +1170,13 @@ class AgentLoop:
                     mem_tag = ContextBuilder._MEMORY_CONTEXT_TAG
                     if mem_tag in content:
                         content = content[: content.index(mem_tag)].strip()
+                    # Strip prompt-injection wrapper so raw user text is stored
+                    _BEGIN = "<BEGIN_USER_MESSAGE>"
+                    _END = "<END_USER_MESSAGE>"
+                    if _BEGIN in content and _END in content:
+                        content = content[
+                            content.index(_BEGIN) + len(_BEGIN):content.index(_END)
+                        ].strip()
                     if not content:
                         continue
                     entry["content"] = content

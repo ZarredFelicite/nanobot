@@ -2007,7 +2007,13 @@ class OpenCodeChannel(BaseChannel):
         if not self.agent_loop:
             return web.json_response({"error": "no agent"}, status=500)
 
-        active_model = self._session_model(session, body)
+        # Don't pass body — use the session's stored model, not whatever the
+        # UI sends in the command payload (which may be the default/stale model).
+        active_model = self._session_model(session)
+        logger.info(
+            "Clean command: session={} model={} metadata_model={}",
+            session_id, active_model, session.metadata.get("model"),
+        )
 
         # Build a compact text representation of the session for the LLM to scan
         scan_lines: list[str] = []
@@ -2041,12 +2047,10 @@ class OpenCodeChannel(BaseChannel):
             "Messages:\n" + scan_text
         )
 
-        provider = self.agent_loop.provider
-        if active_model.startswith(("openai-codex/", "openai_codex/")):
-            if self.agent_loop._codex_provider is None:
-                from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-                self.agent_loop._codex_provider = OpenAICodexProvider(default_model=active_model)
-            provider = self.agent_loop._codex_provider
+        # Select the right provider for the active model.
+        # The default agent provider may be a codex provider (when the default
+        # model is openai-codex/*), so we need to pick correctly.
+        provider = self.agent_loop.get_provider_for_model(active_model)
 
         await self._broadcast_sse(
             "session.status",
@@ -2069,6 +2073,14 @@ class OpenCodeChannel(BaseChannel):
 
         # Parse the LLM response
         raw = (response.content or "").strip()
+
+        # Detect provider error responses before trying to parse JSON
+        if raw.startswith("Error calling"):
+            logger.warning("Clean command: provider error: {}", raw[:300])
+            return await self._send_clean_result(
+                session, session_id, f"LLM error: {raw[:500]}", 0,
+            )
+
         # Strip markdown fences if present
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
