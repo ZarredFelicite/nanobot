@@ -200,6 +200,9 @@ class AgentLoop:
             from nanobot.agent.tools.memory_recall import MemoryRecallTool
 
             self.tools.register(MemoryRecallTool(self._subconscious))
+        from nanobot.agent.tools.tasks import TaskTool
+
+        self.tools.register(TaskTool(workspace=self.workspace))
         self.tools.register(SubagentTool(workspace=self.workspace))
         if self._node_registry:
             from nanobot.agent.tools.remote_exec import RemoteExecTool
