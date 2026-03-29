@@ -573,6 +573,44 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
+                # Batched parallel + sequential tool execution
+                parallel_batch: list[ToolCallRequest] = []
+                max_parallel = getattr(self, "_max_parallel_tools", 8)
+                _sem = asyncio.Semaphore(max_parallel)
+
+                async def _exec_one(tc: ToolCallRequest) -> tuple[ToolCallRequest, str]:
+                    async with _sem:
+                        if on_progress:
+                            await on_progress(
+                                "",
+                                tool_event={
+                                    "type": "tool_start",
+                                    "call_id": tc.id,
+                                    "name": tc.name,
+                                    "input": tc.arguments,
+                                },
+                            )
+                        r = await self.tools.execute(tc.name, tc.arguments)
+                        return tc, r
+
+                async def _flush_parallel(batch: list[ToolCallRequest]) -> None:
+                    if not batch:
+                        return
+                    results = await asyncio.gather(*[_exec_one(tc) for tc in batch])
+                    for tc, result in results:
+                        tool_done_event: dict[str, Any] = {
+                            "type": "tool_done",
+                            "call_id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments,
+                            "output": result[:500] if isinstance(result, str) else str(result)[:500],
+                        }
+                        if on_progress:
+                            await on_progress("", tool_event=tool_done_event)
+                        messages = self.context.add_tool_result(
+                            messages, tc.id, tc.name, result
+                        )
+
                 for tool_call in effective_tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
@@ -585,6 +623,22 @@ class AgentLoop:
                         and tool_call.name
                         not in self._session_auto_approve.get(session_key or "", set())
                     )
+
+                    tool_obj = self.tools.get(tool_call.name)
+                    is_parallel_safe = (
+                        tool_obj is not None
+                        and tool_obj.parallel_safe
+                        and not needs_approval
+                    )
+
+                    if is_parallel_safe:
+                        parallel_batch.append(tool_call)
+                        continue
+
+                    # Flush any pending parallel batch before sequential execution
+                    await _flush_parallel(parallel_batch)
+                    parallel_batch = []
+
                     if needs_approval and self._permission_callback:
                         if on_progress:
                             await on_progress(
@@ -653,7 +707,6 @@ class AgentLoop:
                         "output": result[:500] if isinstance(result, str) else str(result)[:500],
                     }
                     if tool_call.name in ("write_file", "edit_file"):
-                        tool_obj = self.tools.get(tool_call.name)
                         if tool_obj and hasattr(tool_obj, "last_diff") and tool_obj.last_diff:
                             tool_done_event["diff"] = tool_obj.last_diff
                             tool_obj.last_diff = None
@@ -663,6 +716,9 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+
+                # Flush any remaining parallel batch
+                await _flush_parallel(parallel_batch)
             else:
                 clean = self._strip_think(response.content)
                 validation = validate_model_output(clean)
@@ -745,6 +801,7 @@ class AgentLoop:
         self.web_proxy = config.tools.web.proxy or None
         self.exec_config = config.tools.exec
         self.restrict_to_workspace = config.tools.restrict_to_workspace
+        self._max_parallel_tools = config.tools.max_parallel_tools
         self._mcp_servers = config.tools.mcp_servers
 
         self.subagents.provider = provider
@@ -1113,6 +1170,13 @@ class AgentLoop:
         self.sessions.save(session)
         self._last_llm_usage[key] = usage
 
+        # F1: Background memory nudge — periodic big-picture review
+        if self._subconscious and not is_heartbeat:
+            if self._subconscious.increment_nudge_counter():
+                self._subconscious.reset_nudge_counter()
+                snapshot = list(session.messages)
+                asyncio.create_task(self._subconscious.nudge_review(snapshot))
+
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
@@ -1256,8 +1320,16 @@ class AgentLoop:
                 len(old_messages), keep_count,
             )
 
-            # 1) Extract memories from the messages being compacted
-            extractable = [m for m in old_messages if m.get("role") in ("user", "assistant") and m.get("content")]
+            # 1) Prune tool output before extraction/summarization
+            pruned_messages = []
+            for m in old_messages:
+                if m.get("role") == "tool" and isinstance(m.get("content", ""), str) and len(m.get("content", "")) > 200:
+                    pruned_messages.append({**m, "content": m["content"][:200] + "\n[truncated]"})
+                else:
+                    pruned_messages.append(m)
+
+            # 2) Extract memories from the messages being compacted
+            extractable = [m for m in pruned_messages if m.get("role") in ("user", "assistant") and m.get("content")]
             if extractable:
                 try:
                     await self._subconscious._extract(extractable)
@@ -1265,31 +1337,64 @@ class AgentLoop:
                 except Exception:
                     logger.exception("Subconscious compaction: extraction failed, continuing with summarization")
 
-            # 2) Generate summary of compacted messages
+            # 3) Generate structured summary of compacted messages
+            _SUMMARY_TEMPLATE = """Summarize this conversation using this exact structure:
+
+### Goal
+What the user is trying to accomplish
+
+### Progress
+What has been done so far
+
+### Decisions
+Key decisions made during this session
+
+### Files Modified
+List of files created/edited/deleted with brief description
+
+### Next Steps
+What remains to be done
+
+### Critical Context
+Important details that must not be lost"""
+
             summary = ""
             if generate_summary and extractable and self._subconscious._provider:
                 conversation = "\n".join(
                     f"[{m['role']}]: {m['content']}" for m in extractable
                 )
+
+                # Check for previous running summary for iterative update
+                previous_summary = session.metadata.get("running_summary", "")
+
+                if previous_summary:
+                    user_content = (
+                        f"Here is the previous conversation summary:\n{previous_summary}\n\n"
+                        f"Here are new messages since that summary:\n{conversation}\n\n"
+                        f"Update the summary to incorporate new information. Merge, don't duplicate.\n"
+                        f"Use this structure:\n{_SUMMARY_TEMPLATE}"
+                    )
+                else:
+                    user_content = f"{_SUMMARY_TEMPLATE}\n\n## Conversation\n{conversation}"
+
                 try:
                     response = await self._subconscious._provider.chat(
                         messages=[
                             {
                                 "role": "system",
                                 "content": (
-                                    "Summarize this conversation comprehensively. Cover all topics "
-                                    "discussed, decisions made, problems solved, and outcomes reached. "
-                                    "Include enough detail that someone reading only this summary would "
-                                    "understand the full context of what happened. "
+                                    "Summarize this conversation using the provided structured template. "
                                     "Use [[Name]] wikilinks for people and entities."
                                 ),
                             },
-                            {"role": "user", "content": conversation},
+                            {"role": "user", "content": user_content},
                         ],
                         model=self._subconscious._config.extraction_model,
                     )
                     if response.content:
                         summary = response.content.strip()
+                        # Persist running summary for iterative updates
+                        session.metadata["running_summary"] = summary
                 except Exception:
                     logger.exception("Subconscious compaction: summarization failed")
 

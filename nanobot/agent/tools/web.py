@@ -49,6 +49,7 @@ class WebSearchTool(Tool):
     """Search the web using Brave Search API."""
 
     name = "web_search"
+    parallel_safe = True
     description = "Search the web. Returns titles, URLs, and snippets."
     parameters = {
         "type": "object",
@@ -117,6 +118,7 @@ class WebFetchTool(Tool):
     """Fetch and extract content from a URL using Readability."""
 
     name = "web_fetch"
+    parallel_safe = True
     description = "Fetch URL and extract readable content (HTML → markdown/text)."
     parameters = {
         "type": "object",

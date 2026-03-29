@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nanobot.agent.qmd import QMDClient
+from nanobot.security.prompt_injection import sanitize_untrusted_content
 from nanobot.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
@@ -110,11 +111,11 @@ class SubconsciousService:
         self._config = config
         self._workspace = workspace
         self._memory_dir = workspace / "memory"
-        self._provider: LLMProvider | None = None
         self._buffer: list[dict[str, str]] = []
         self._last_flush: float = time.monotonic()
         self._bg_task: asyncio.Task | None = None
         self._write_lock = asyncio.Lock()
+        self._nudge_counter: int = 0
 
         # Conversation buffer for history summarization (separate from extraction buffer)
         self._conversation_buffer: list[dict[str, str]] = []
@@ -126,8 +127,10 @@ class SubconsciousService:
             collection_path=self._memory_dir,
         )
 
-    def set_provider(self, provider: LLMProvider) -> None:
-        self._provider = provider
+        # Own LiteLLMProvider so model prefixes route to the correct backend
+        # (e.g. openrouter/ models don't get sent through the codex provider).
+        from nanobot.providers.litellm_provider import LiteLLMProvider
+        self._provider: LLMProvider = LiteLLMProvider(default_model=config.extraction_model)
 
     def _ensure_dirs(self) -> None:
         ensure_dir(self._memory_dir / "history")
@@ -182,6 +185,78 @@ class SubconsciousService:
         if len(self._buffer) >= self._config.batch_message_threshold:
             asyncio.create_task(self._flush())
 
+    def increment_nudge_counter(self) -> bool:
+        """Increment and return True if nudge should fire."""
+        self._nudge_counter += 1
+        return self._nudge_counter >= self._config.nudge_interval
+
+    def reset_nudge_counter(self) -> None:
+        self._nudge_counter = 0
+
+    async def nudge_review(self, conversation: list[dict]) -> None:
+        """Big-picture review of full conversation for memory extraction.
+
+        Uses the same extraction pipeline but with a broader prompt emphasizing
+        patterns, recurring themes, and cross-turn connections that incremental
+        extraction misses.
+        """
+        if not self._provider or not conversation:
+            return
+
+        # Filter to user/assistant messages with content
+        extractable = [
+            m for m in conversation
+            if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str) and m.get("content")
+        ]
+        if not extractable:
+            return
+
+        try:
+            existing = self._list_existing_notes()
+            conv_text = "\n\n".join(
+                f"[{m['role']}]: {sanitize_untrusted_content(m['content'])}"
+                for m in extractable
+            )
+
+            prompt = f"""Review this FULL conversation for big-picture patterns and facts that incremental extraction may have missed.
+
+Focus on:
+- Recurring themes, preferences, or habits across multiple turns
+- Evolving opinions or decisions that only become clear in context
+- Cross-turn connections (e.g. the user mentioned X earlier and then decided Y)
+- Relationships between entities that were mentioned in different parts of the conversation
+
+The bar is HIGH. Only create or update notes for genuinely persistent, important information.
+If a note already exists, use action="update" with COMPLETE content. Use [[Name]] wikilinks.
+
+## Existing Notes
+{existing or "(none yet)"}
+
+## Full Conversation
+{conv_text}"""
+
+            response = await self._provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a memory extraction agent performing a big-picture review. Analyze the full conversation for patterns and cross-turn connections. Call save_memories with any findings. Most reviews should produce 0-2 notes.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                tools=_EXTRACT_TOOL,
+                model=self._config.extraction_model,
+            )
+
+            if response.has_tool_calls:
+                args = response.tool_calls[0].arguments
+                if isinstance(args, str):
+                    args = json.loads(args)
+                if isinstance(args, dict):
+                    await self._write_memories(args)
+                    logger.info("Nudge review: wrote memories from big-picture analysis")
+        except Exception:
+            logger.exception("Nudge review failed")
+
     async def _flush(self) -> None:
         if not self._buffer or not self._provider:
             return
@@ -192,6 +267,8 @@ class SubconsciousService:
 
         try:
             await self._extract(batch)
+            # Organic extraction resets the nudge timer
+            self.reset_nudge_counter()
         except Exception:
             logger.exception("Subconscious extraction failed")
 
@@ -202,7 +279,13 @@ class SubconsciousService:
 
         # Build context: list existing files so the LLM knows what to update
         existing = self._list_existing_notes()
-        conversation = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
+        # Sanitize conversation content to prevent prompt injection from being
+        # persisted into memory notes (user input or tool output may contain
+        # injection attempts that the extraction LLM could follow).
+        conversation = "\n\n".join(
+            f"[{m['role']}]: {sanitize_untrusted_content(m['content'])}"
+            for m in messages
+        )
 
         prompt = f"""Extract ONLY genuinely important, persistent facts from this conversation. Be extremely selective.
 
@@ -296,6 +379,10 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
                 else:
                     content = item.get("content", "")
                     if content:
+                        # Sanitize extracted content before persisting — the
+                        # extraction LLM could have been tricked into passing
+                        # through injection payloads as "facts".
+                        content = sanitize_untrusted_content(content)
                         self._write_note(path, name, content)
                         notes_written += 1
 
@@ -546,7 +633,8 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
                 model=self._config.extraction_model,
             )
             if response.content:
-                output_file.write_text(f"# {label}\n\n{response.content}\n", encoding="utf-8")
+                clean_content = sanitize_untrusted_content(response.content)
+                output_file.write_text(f"# {label}\n\n{clean_content}\n", encoding="utf-8")
                 logger.info("Generated history summary: {}", output_file.name)
         except Exception:
             logger.exception("Failed to generate summary for {}", label)
@@ -562,7 +650,10 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
         self._last_message_time = 0.0
         self._conversation_session_key = ""
 
-        conversation = "\n".join(f"[{m['role']}]: {m['content']}" for m in batch)
+        conversation = "\n".join(
+            f"[{m['role']}]: {sanitize_untrusted_content(m['content'])}"
+            for m in batch
+        )
 
         try:
             response = await self._provider.chat(
@@ -576,7 +667,7 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
                 model=self._config.extraction_model,
             )
             if response.content:
-                summary = response.content.strip()
+                summary = sanitize_untrusted_content(response.content.strip())
                 self._append_history(summary, session_key=session_key)
                 if self._qmd.available:
                     await self._qmd.reindex()

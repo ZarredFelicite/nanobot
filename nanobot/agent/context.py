@@ -127,6 +127,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         relevant_memories: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
+        # Expand @-references in the user message before building content
+        from nanobot.agent.references import expand_references
+
+        current_message = expand_references(current_message, self.workspace)
+
         runtime_ctx = self._build_runtime_context(channel, chat_id)
         user_content = self._build_user_content(current_message, media)
 
@@ -230,6 +235,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         result: str,
     ) -> list[dict[str, Any]]:
         """Add a tool result to the message list."""
+        # Defense-in-depth: redact secrets before appending to messages
+        from nanobot.security.redact import redact_secrets
+
+        result = redact_secrets(result)
+
         if tool_name in {"web_search", "web_fetch", "memory_search"}:
             result = wrap_untrusted_content(result, source=f"{tool_name} tool output")
         messages.append(

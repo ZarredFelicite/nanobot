@@ -14,6 +14,7 @@ class MemoryRecallTool(Tool):
     """Search long-term memory for facts extracted from past conversations."""
 
     name = "memory_search"
+    parallel_safe = True
     description = (
         "Search your subconscious memory for relevant entities, preferences, decisions, "
         "and past events. Use when the user references prior interactions, people, projects, "

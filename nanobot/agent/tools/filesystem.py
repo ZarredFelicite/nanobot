@@ -35,6 +35,10 @@ class ReadFileTool(Tool):
         self._allowed_dir = allowed_dir
 
     @property
+    def parallel_safe(self) -> bool:
+        return True
+
+    @property
     def name(self) -> str:
         return "read_file"
 
@@ -257,6 +261,10 @@ class ListDirTool(Tool):
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+
+    @property
+    def parallel_safe(self) -> bool:
+        return True
 
     @property
     def name(self) -> str:

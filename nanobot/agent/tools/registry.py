@@ -48,6 +48,12 @@ class ToolRegistry:
             if errors:
                 return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
             result = await tool.execute(**params)
+
+            # Redact secrets from all tool output
+            if isinstance(result, str):
+                from nanobot.security.redact import redact_secrets
+                result = redact_secrets(result)
+
             if isinstance(result, str) and result.startswith("Error"):
                 return result + _HINT
             return result

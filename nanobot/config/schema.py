@@ -390,6 +390,7 @@ class SubconsciousConfig(Base):
     batch_time_threshold_s: int = 120  # Seconds before time-based flush
     compaction_enabled: bool = True  # Generate weekly/monthly history summaries
     qmd_collection_name: str = "nanobot-memory"
+    nudge_interval: int = 10  # Turns between background memory nudge reviews
 
 
 class PermissionConfig(Base):
@@ -417,6 +418,7 @@ class ToolsConfig(Base):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     subconscious: SubconsciousConfig = Field(default_factory=SubconsciousConfig)
+    max_parallel_tools: int = 8  # Max concurrent parallel-safe tool executions
     permissions: PermissionConfig = Field(default_factory=PermissionConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
