@@ -77,6 +77,7 @@ Your workspace is at: {workspace_path}
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 ## nanobot Guidelines
+- Each user and assistant message in history is prefixed with its timestamp (e.g. [2026-03-28 14:30]). If there is a large time gap since the last message, use memory_search to re-read relevant memories for fresh context before responding.
 - State intent before tool calls, but NEVER predict or claim results before receiving them.
 - Before modifying a file, read it first. Do not assume files or directories exist.
 - After writing or editing a file, re-read it if accuracy matters.
@@ -149,11 +150,58 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             else:
                 merged.append({"type": "text", "text": memory_block})
 
+        stamped = self._stamp_history(history)
+
         return [
             {"role": "system", "content": self.build_system_prompt(skill_names)},
-            *history,
+            *stamped,
             {"role": "user", "content": merged},
         ]
+
+    @staticmethod
+    def _stamp_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Prefix user and assistant messages in history with their stored timestamp.
+
+        This lets the model perceive time gaps between turns and decide whether
+        to re-read memory files for context after a long pause.
+        """
+        stamped: list[dict[str, Any]] = []
+        for msg in history:
+            ts = msg.get("timestamp")
+            role = msg.get("role")
+            if ts and role in ("user", "assistant"):
+                # Parse ISO timestamp to a compact human-readable form
+                try:
+                    dt = datetime.fromisoformat(ts)
+                    label = dt.strftime("[%Y-%m-%d %H:%M]")
+                except (ValueError, TypeError):
+                    label = None
+                if label:
+                    content = msg.get("content")
+                    entry = dict(msg)
+                    # Remove timestamp from the dict sent to the LLM
+                    entry.pop("timestamp", None)
+                    entry.pop("usage", None)
+                    entry.pop("model", None)
+                    if isinstance(content, str):
+                        entry["content"] = f"{label} {content}"
+                    elif isinstance(content, list):
+                        # Prepend timestamp as a text block
+                        entry["content"] = [{"type": "text", "text": label}] + list(content)
+                    stamped.append(entry)
+                else:
+                    stamped.append(msg)
+            else:
+                # Still strip metadata fields from non-stamped messages
+                if msg.get("timestamp") or msg.get("usage") or msg.get("model"):
+                    entry = dict(msg)
+                    entry.pop("timestamp", None)
+                    entry.pop("usage", None)
+                    entry.pop("model", None)
+                    stamped.append(entry)
+                else:
+                    stamped.append(msg)
+        return stamped
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
