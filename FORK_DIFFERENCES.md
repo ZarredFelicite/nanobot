@@ -14,15 +14,18 @@ Compared with upstream nanobot, this fork is much more opinionated around a sing
 
 The biggest differences are:
 
-1. A new hierarchical "subconscious" memory system backed by local markdown notes and `qmd` semantic search.
+1. A new hierarchical "subconscious" memory system backed by local markdown notes and `qmd` semantic search, with periodic background nudge reviews for cross-turn memory extraction.
 2. A pi-tui terminal UI that `nanobot agent` always launches, connecting to the local gateway or a remote gateway on node machines.
 3. Cross-channel session mirroring so CLI, Telegram, and other channels can share one live conversation.
 4. A full OpenCode TUI HTTP+SSE backend, including session management, streaming, permissions, revert/unrevert, fork, and context reporting.
 5. Stronger heartbeat isolation and delivery rules.
 6. Pi subagent integration for delegating larger coding/research tasks to an external coding agent process.
-7. OWASP-style prompt-injection hardening for user input, remote content, memory recall, and final output.
+7. OWASP-style prompt-injection hardening for user input, remote content, memory recall, and final output, plus a regex-based secret redaction pipeline applied at tool output and context builder levels.
 8. Distributed node mode where remote machines connect to the gateway over WebSocket for remote shell execution and chat routing.
-9. Extra implementation work around MCP cancellation, provider quirks, Telegram owner routing, active-config data paths, and token-aware session compaction.
+9. Parallel tool execution — read-only and network tools run concurrently via `asyncio.gather` with configurable semaphore limits.
+10. Context references — `@file:`, `@folder:`, `@url:`, `@diff`, `@staged`, `@git:N` expansion in user messages with security deny-list and token budget enforcement.
+11. Iterative context compression — structured summary templates, tool output pruning, and running summary updates on subsequent compactions.
+12. Extra implementation work around MCP cancellation, provider quirks, Telegram owner routing, active-config data paths, and token-aware session compaction.
 
 ## High-Level Product Positioning
 
@@ -650,7 +653,7 @@ This fork does not just add features; it also changes how some upstream concepts
 
 If you need the shortest practical summary, the fork currently has these major capabilities that upstream nanobot does not have in the same integrated form:
 
-- subconscious memory with `qmd` semantic retrieval,
+- subconscious memory with `qmd` semantic retrieval and periodic background nudge reviews,
 - `memory_search` recall tool,
 - pi-tui TUI with local and remote gateway connectivity,
 - shared-session cross-channel mirroring,
@@ -662,7 +665,142 @@ If you need the shortest practical summary, the fork currently has these major c
 - stronger MCP transport support,
 - more defensive provider compatibility handling,
 - distributed node mode with WebSocket-based remote execution and node-as-channel,
+- secret redaction pipeline for all tool output (API keys, DB URIs, auth headers, env secrets, private keys),
+- parallel tool execution for read-only and network tools with configurable concurrency,
+- context references (`@file:`, `@url:`, `@diff`, `@staged`, `@git:N`) with security deny-list,
+- iterative context compression with structured summaries and running summary updates,
 - and multi-instance config/workspace path support.
+
+## 19. Secret Redaction Pipeline
+
+Primary files:
+
+- `nanobot/security/redact.py`
+- `nanobot/agent/tools/registry.py`
+- `nanobot/agent/context.py`
+
+### What changed
+
+This fork adds a regex-based secret redaction pipeline that scans all tool output for credentials before they re-enter model context.
+
+### Pattern coverage
+
+The pipeline detects and replaces:
+
+- API keys: OpenAI (`sk-`), GitHub (`ghp_`), Google (`AIza`), Groq (`gsk_`), xAI (`xai-`), AWS (`AKIA`), GitLab (`glpat-`), NPM (`npm_`), PyPI (`pypi-`)
+- Telegram bot tokens
+- Database connection strings (PostgreSQL, MySQL, MongoDB, Redis)
+- Authorization headers (Bearer, Basic, Token)
+- JSON credential fields (password, api_key, secret, token, credential, auth)
+- Environment variable assignments containing SECRET, KEY, TOKEN, PASSWORD, or CREDENTIAL
+- Private key blocks (RSA, EC, OPENSSH, PGP, DSA)
+
+Each match is replaced with `[REDACTED:label]` to indicate what was redacted.
+
+### Dual enforcement
+
+Secret redaction runs at two layers for defense-in-depth:
+
+1. `ToolRegistry.execute()` — immediately after any tool returns its result
+2. `ContextBuilder.add_tool_result()` — before appending to the message list
+
+This ensures secrets from tool output never reach the model context regardless of the code path.
+
+## 20. Parallel Tool Execution
+
+Primary files:
+
+- `nanobot/agent/tools/base.py`
+- `nanobot/agent/loop.py`
+- `nanobot/config/schema.py`
+
+### What changed
+
+The fork adds a `parallel_safe` property to the base `Tool` class and replaces the sequential tool execution loop with batched parallel execution.
+
+### How it works
+
+- Each tool declares `parallel_safe = True` if it can safely run concurrently
+- Tools marked parallel-safe: `read_file`, `list_dir`, `web_search`, `web_fetch`, `memory_search`
+- When the agent loop processes tool calls, parallel-safe tools that don't need permission approval are batched and executed via `asyncio.gather`
+- A configurable semaphore (`tools.maxParallelTools`, default 8) limits maximum concurrency
+- Permission-requiring tools and write tools always execute sequentially
+- Results are collected in original tool-call order (gather preserves order)
+- Progress events (tool_start/tool_done) are still emitted per tool
+
+### Why this matters
+
+When the model requests multiple read-only operations in one turn (e.g. reading 5 files), they execute concurrently instead of sequentially. This reduces turn latency proportionally to the number of parallel-safe tools requested.
+
+## 21. Context References
+
+Primary files:
+
+- `nanobot/agent/references.py`
+- `nanobot/agent/context.py`
+
+### What changed
+
+This fork adds `@-reference` expansion in user messages, letting users inline file content, git state, and web content directly into their prompt.
+
+### Supported references
+
+| Pattern | Handler |
+|---------|---------|
+| `@file:path` | Read file relative to workspace |
+| `@folder:path/` | List directory (depth 1) |
+| `@url:https://...` | Fetch URL (10s timeout, 100KB max) |
+| `@diff` | `git diff` in workspace |
+| `@staged` | `git diff --staged` |
+| `@git:N` | `git log -N --oneline` (default 10, max 50) |
+
+### Security
+
+- Paths with `..` traversal outside workspace are blocked
+- Deny list: `.ssh/`, `.gnupg/`, `.env`, `*credentials*`, `*.pem`, `*_rsa`, `*_key`
+- No `file://` or `ftp://` URLs
+- All expanded content passes through `redact_secrets()`
+- Token budget: max 50% of `context_tokens`, estimated as `len//4`
+
+## 22. Background Memory Nudge
+
+Primary files:
+
+- `nanobot/agent/subconscious.py`
+- `nanobot/agent/loop.py`
+- `nanobot/config/schema.py`
+
+### What changed
+
+The fork adds a periodic big-picture memory review that fires every N turns (configurable via `tools.subconscious.nudgeInterval`, default 10).
+
+### How it works
+
+- A counter increments after each `_save_turn()` call in the agent loop
+- When the counter reaches the nudge interval, a background `asyncio.create_task` fires `nudge_review()` with a snapshot of the full session
+- The nudge review uses the same extraction pipeline but with a broader prompt emphasizing patterns, recurring themes, evolving preferences, and cross-turn connections that incremental extraction misses
+- The counter resets on organic extraction flushes (so active extraction conversations don't also trigger nudges)
+- The nudge runs in the background and does not block the user response
+
+### Why this matters
+
+Incremental extraction processes messages in small batches and may miss patterns that only emerge across a full conversation. The nudge review catches these cross-turn connections periodically.
+
+## 23. Iterative Context Compression
+
+Primary files:
+
+- `nanobot/agent/loop.py`
+
+### What changed
+
+The fork improves the existing consolidation/compaction flow with three changes:
+
+1. **Tool output pruning**: Before building the conversation string for summarization, tool messages longer than 200 chars are truncated. This prevents large tool outputs from dominating the summary.
+
+2. **Structured summary template**: The generic "summarize comprehensively" prompt is replaced with a structured template with sections for Goal, Progress, Decisions, Files Modified, Next Steps, and Critical Context.
+
+3. **Iterative update on subsequent compactions**: The running summary is stored in `session.metadata["running_summary"]`. On subsequent compactions, if a previous summary exists, the LLM is asked to merge new messages into the existing summary rather than regenerating from scratch. This preserves information across multiple compaction cycles.
 
 ## Reference: Main Fork-Changed Files
 
@@ -678,5 +816,7 @@ The largest code-level divergences from upstream are concentrated in:
 - `nanobot/providers/litellm_provider.py`
 - `nanobot/nodes/` (registry, gateway_ws, channel, client)
 - `nanobot/agent/tools/remote_exec.py`
+- `nanobot/security/redact.py`
+- `nanobot/agent/references.py`
 
 Supporting differences are spread across session management, filesystem tools, tests, and developer environment files.

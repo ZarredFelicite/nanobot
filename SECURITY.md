@@ -230,6 +230,7 @@ If you suspect a security breach:
 - Input length limits on HTTP requests
 - Prompt-injection detection for direct, encoded, typoglycemia, and remote-content attacks
 - Untrusted-content wrapping for user input, memory recall, web fetch/search output, and inbound email bodies
+- Secret redaction pipeline: regex-based detection of API keys (OpenAI, GitHub, Google, Groq, xAI, AWS, GitLab, NPM, PyPI), DB connection strings, auth headers, JSON credential fields, env variable assignments, private key blocks, and Telegram bot tokens — applied at both tool output and context builder levels
 
 ✅ **Authentication**
 - Allow-list based access control — in `v0.1.4.post3` and earlier empty means allow all; in newer versions empty means deny all (`["*"]` to explicitly allow all)
@@ -248,6 +249,8 @@ If you suspect a security breach:
 ✅ **Prompt/Output Hardening**
 - User-data vs instruction separation in prompt assembly
 - Sanitization of suspicious remote content before tool results are reintroduced into context
+- Automatic secret redaction on all tool output (defense-in-depth at both `ToolRegistry.execute()` and `ContextBuilder.add_tool_result()`)
+- Context reference expansion (`@file:`, `@url:`, etc.) applies redaction and blocks sensitive paths (`.ssh/`, `.gnupg/`, `.env`, `*credentials*`, `*.pem`)
 - Output validation that blocks obvious system-prompt and secret leakage
 
 ## Known Limitations
@@ -278,7 +281,7 @@ Before deploying nanobot:
 
 ## Updates
 
-**Last Updated**: 2026-03-15
+**Last Updated**: 2026-03-29
 
 For the latest security updates and announcements, check:
 - GitHub Security Advisories: https://github.com/HKUDS/nanobot/security/advisories

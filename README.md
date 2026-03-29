@@ -93,6 +93,7 @@ See `FORK_DIFFERENCES.md` for a detailed fork-vs-upstream comparison.
 - Prompt assembly separates system instructions from user data and recalled memory
 - Web search/fetch, memory recall, and inbound email content are reintroduced as untrusted blocks instead of raw instructions
 - Remote-content sanitization filters common prompt-injection patterns, encoded payloads, typoglycemia variants, scratchpad/tool-forging text, and HTML exfil markers
+- **Secret redaction pipeline**: regex-based detection of API keys, DB URIs, auth headers, env secrets, private keys, and more — applied at both the tool registry and context builder levels with `[REDACTED:label]` replacements
 - Final model responses are screened for system-prompt leakage and obvious secret disclosure
 - OWASP-style regression tests cover direct, encoded, typoglycemia, spacing/casing, HTML, and scratchpad injection examples
 
@@ -990,6 +991,7 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | Option | Default | Description |
 |--------|---------|-------------|
 | `tools.restrictToWorkspace` | `false` | When `true`, restricts **all** agent tools (shell, file read/write/edit, list) to the workspace directory. Prevents path traversal and out-of-scope access. |
+| `tools.maxParallelTools` | `8` | Maximum number of parallel-safe tools that can execute concurrently in a single turn. |
 | `tools.exec.pathAppend` | `""` | Extra directories to append to `PATH` when running shell commands (e.g. `/usr/sbin` for `ufw`). |
 | `channels.*.allowFrom` | `[]` (allow all) | Whitelist of user IDs. Empty = allow everyone; non-empty = only listed users can interact. |
 
@@ -1131,12 +1133,15 @@ If you edit the `.service` file itself, run `systemctl --user daemon-reload` bef
 ```
 nanobot/
 ├── agent/          # 🧠 Core agent logic
-│   ├── loop.py     #    Agent loop (LLM ↔ tool execution)
-│   ├── context.py  #    Prompt builder
-│   ├── memory.py   #    Persistent memory
+│   ├── loop.py     #    Agent loop (LLM ↔ tool execution, parallel tools)
+│   ├── context.py  #    Prompt builder (reference expansion, memory injection)
+│   ├── references.py #  @-reference expansion (@file, @diff, @url, etc.)
+│   ├── subconscious.py # Background memory extraction + nudge reviews
+│   ├── memory.py   #    Legacy persistent memory (fallback)
 │   ├── skills.py   #    Skills loader
 │   ├── subagent.py #    Background task execution
 │   └── tools/      #    Built-in tools (incl. spawn, remote_exec)
+├── security/       # 🔒 Security (prompt injection, secret redaction)
 ├── skills/         # 🎯 Bundled skills (github, weather, tmux...)
 ├── channels/       # 📱 Chat channel integrations
 ├── nodes/          # 🌐 Distributed node mode (gateway + client)

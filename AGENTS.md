@@ -52,12 +52,84 @@ Config:
 { "tools": { "subconscious": { "enabled": true, "extractionModel": "openai/gpt-5-mini", "classifierModel": "openrouter/google/gemini-2.0-flash-lite-001" } } }
 ```
 
+### Background Memory Nudge (F1)
+Periodic big-picture review fires every N turns (`nudgeInterval`, default 10). A counter increments after each `_save_turn()`. When it fires, `nudge_review()` runs in a background task with a full conversation snapshot, using a broader prompt to catch cross-turn patterns. Counter resets on organic extraction flushes.
+
+**Files**: `nanobot/agent/subconscious.py` (`increment_nudge_counter()`, `reset_nudge_counter()`, `nudge_review()`), `nanobot/agent/loop.py` (nudge trigger after `_save_turn()`), `nanobot/config/schema.py` (`nudge_interval` field)
+
 ### Removed
 - `nanobot/agent/memu_service.py` (MemUBridge)
 - `nanobot/agent/tools/memu_retrieve.py` (MemURetrieveTool)
 - `tests/test_memu_bridge.py`
 - `memu-py` optional dependency
 - qmd MCP server config (now invoked directly via CLI)
+
+---
+
+## 8. Secret Redaction Pipeline
+
+**Files**: `nanobot/security/redact.py`, `nanobot/agent/tools/registry.py`, `nanobot/agent/context.py`, `tests/test_redaction.py`
+
+Regex-based credential detection applied at two enforcement points for defense-in-depth:
+1. `ToolRegistry.execute()` — immediately after tool returns
+2. `ContextBuilder.add_tool_result()` — before appending to messages
+
+### Pattern Groups
+- API keys: OpenAI (`sk-`), GitHub (`ghp_`), Google (`AIza`), Groq (`gsk_`), xAI (`xai-`), AWS (`AKIA`), GitLab (`glpat-`), NPM (`npm_`), PyPI (`pypi-`)
+- Telegram bot tokens, DB connection strings, auth headers, JSON credential fields
+- ENV assignments with SECRET/KEY/TOKEN/PASSWORD/CREDENTIAL keywords
+- Private key blocks (RSA, EC, OPENSSH, PGP, DSA)
+
+Each match replaced with `[REDACTED:label]`.
+
+---
+
+## 9. Parallel Tool Execution
+
+**Files**: `nanobot/agent/tools/base.py`, `nanobot/agent/loop.py`, `nanobot/agent/tools/filesystem.py`, `nanobot/agent/tools/web.py`, `nanobot/agent/tools/memory_recall.py`, `nanobot/config/schema.py`, `tests/test_parallel_tools.py`
+
+Read-only and network tools run concurrently via `asyncio.gather` with configurable semaphore.
+
+### Architecture
+- `Tool.parallel_safe` property (default `False`) — overridden to `True` on `ReadFileTool`, `ListDirTool`, `WebSearchTool`, `WebFetchTool`, `MemoryRecallTool`
+- Agent loop batches parallel-safe tools that don't need permission, flushes via `asyncio.gather` before sequential tools
+- `ToolsConfig.max_parallel_tools` (default 8) — semaphore limit
+- Results collected in original tool-call order
+- Progress events still emitted per tool
+
+---
+
+## 10. Context References
+
+**Files**: `nanobot/agent/references.py`, `nanobot/agent/context.py`, `tests/test_references.py`
+
+`@-reference` expansion in user messages before LLM call.
+
+### Reference Types
+| Pattern | Handler |
+|---------|---------|
+| `@file:path` | Read file relative to workspace |
+| `@folder:path/` | List directory (depth 1) |
+| `@url:https://...` | Fetch URL (10s timeout, 100KB max) |
+| `@diff` | `git diff` in workspace |
+| `@staged` | `git diff --staged` |
+| `@git:N` | `git log -N --oneline` (default 10, max 50) |
+
+### Security
+- Path traversal blocked, deny list (`.ssh/`, `.gnupg/`, `.env`, `credentials`, `.pem`, `_rsa`, `_key`)
+- All expanded content passes through `redact_secrets()`
+- Token budget: max 50% of `context_tokens`
+
+---
+
+## 11. Iterative Context Compression
+
+**Files**: `nanobot/agent/loop.py` (`_consolidate_memory()`)
+
+Three improvements to the consolidation flow:
+1. **Tool output pruning**: tool messages > 200 chars truncated before summarization
+2. **Structured summary template**: Goal, Progress, Decisions, Files Modified, Next Steps, Critical Context
+3. **Iterative updates**: running summary stored in `session.metadata["running_summary"]`; subsequent compactions merge new messages into existing summary
 
 ---
 
@@ -237,6 +309,10 @@ The fork now applies OWASP-style prompt-injection defenses across user input, re
 | `tests/test_context_prompt_cache.py` | Memory injection via user message, system prompt stability |
 | `tests/test_prompt_injection.py` | OWASP-style prompt injection, sanitization, and leak-blocking checks |
 | `tests/test_loop_save_turn.py` | Turn saving, memory tag stripping |
+| `tests/test_redaction.py` | Secret pattern matching, false positives, multi-pattern |
+| `tests/test_parallel_tools.py` | parallel_safe property, concurrent execution, order preservation |
+| `tests/test_references.py` | Each ref type, security blocks, budget enforcement, redaction |
+| `tests/test_nudge.py` | Nudge counter mechanics, reset on organic flush |
 
 ---
 
@@ -245,9 +321,9 @@ The fork now applies OWASP-style prompt-injection defenses across user input, re
 High-impact OpenClaw features to implement in nanobot for a single-user, hackable setup:
 
 - [ ] Context budget visibility (`/context` + richer `/status`) — show system prompt size, injected file sizes, tool schema overhead, and session token usage
-- [ ] Manual + auto compaction (`/compact`, persisted summaries) — summarize older history into durable compact entries while keeping recent turns intact
-- [ ] Pre-compaction memory flush — run a silent memory-write reminder turn before compaction to reduce durable fact loss
-- [ ] Session pruning for tool output (TTL-aware) — trim or clear stale bulky tool results before model calls
+- [x] Manual + auto compaction (`/compact`, persisted summaries) — summarize older history into durable compact entries while keeping recent turns intact *(implemented with structured template + iterative updates)*
+- [x] Pre-compaction memory flush — run a silent memory-write reminder turn before compaction to reduce durable fact loss *(implemented as background nudge review)*
+- [x] Session pruning for tool output (TTL-aware) — trim or clear stale bulky tool results before model calls *(implemented as tool output pruning in consolidation)*
 - [ ] Queue modes + per-session concurrency controls — add `collect`, `steer`, `followup`, with debounce and overflow behavior
 - [ ] Model failover + credential/profile rotation — rotate credentials on transient failures with cooldowns, then fallback through model chains
 - [ ] Usage/cost telemetry in chat (`/usage`, `/status`) — add per-response token/cost footer and provider usage snapshot
