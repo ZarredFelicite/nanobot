@@ -1,41 +1,51 @@
 ---
 name: tasks
-description: Persistent task management with markdown notes — user todos and agent work tracking.
+description: Persistent task management using Obsidian Tasks Dataview format — user todos and agent work tracking.
 always: true
 ---
 
 # Task Management
 
-You have a built-in `tasks` tool for managing persistent tasks stored as markdown notes in `memory/tasks/`.
+You have a built-in `tasks` tool for managing persistent tasks stored as markdown checkboxes with Dataview inline fields in `memory/tasks/`.
 
 ## Task Format
 
-Each task is stored as a YAML frontmatter block within a group file:
+Tasks use the Obsidian Tasks Dataview format — single-line markdown checkboxes with `[field:: value]` inline fields:
 
 ```markdown
----
-title: Implement user authentication
-status: open
-priority: high
-created: 2026-03-29
-due: 2026-04-05
-tags: ["backend", "security"]
----
-
-Additional notes, context, or subtask details go here.
-Links to relevant files, decisions, or references.
+- [ ] Buy groceries  [priority:: high]  [due:: 2026-04-01]  [created:: 2026-03-30]
+- [x] Fix leaky faucet  [priority:: low]  [created:: 2026-03-27]  [completion:: 2026-03-28]
+- [/] Refactor auth module  [priority:: high]  [due:: 2026-04-01]
+- [-] Cancelled task  [cancelled:: 2026-03-29]
+- [?] Waiting on response  [due:: 2026-04-05]
 ```
 
-### Fields
+### Status Symbols
 
-| Field | Values | Required |
-|-------|--------|----------|
-| `title` | Free text | Yes |
-| `status` | `open`, `in-progress`, `done`, `blocked` | Yes (default: open) |
-| `priority` | `low`, `normal`, `high` | Yes (default: normal) |
-| `created` | `YYYY-MM-DD` | Auto-set |
-| `due` | `YYYY-MM-DD` | Optional |
-| `tags` | List of strings | Optional |
+| Symbol | Status | Description |
+|--------|--------|-------------|
+| `[ ]` | `todo` | Not started |
+| `[/]` | `in-progress` | Currently working on |
+| `[x]` | `done` | Completed |
+| `[-]` | `cancelled` | Won't do |
+| `[?]` | `blocked` | Waiting on something |
+
+### Inline Fields
+
+All fields use `[fieldName:: value]` syntax, separated by two spaces:
+
+| Field | Format | Notes |
+|-------|--------|-------|
+| `priority` | `lowest`, `low`, `medium`, `high`, `highest` | Omit for normal priority |
+| `created` | `YYYY-MM-DD` | Auto-set on creation |
+| `due` | `YYYY-MM-DD` | Deadline |
+| `scheduled` | `YYYY-MM-DD` | When to work on it |
+| `start` | `YYYY-MM-DD` | Cannot start before this |
+| `completion` | `YYYY-MM-DD` | Auto-set when completed |
+| `cancelled` | `YYYY-MM-DD` | Auto-set when cancelled |
+| `repeat` | Natural language | e.g. `every week on Monday` |
+| `id` | Alphanumeric | Unique task identifier |
+| `dependsOn` | Comma-separated IDs | Task dependencies |
 
 ## Task Groups
 
@@ -74,18 +84,19 @@ Tasks are organized into **group files** within `memory/tasks/`:
 - `group: "refactor"` — List a specific project's tasks
 
 ### `create` — Add a task
-- Requires `title`, optional `priority`, `due`, `tags`, `body`
+- Requires `title`, optional `priority`, `due`, `scheduled`, `start`
 - Specify `group` for project tasks (default: "tasks")
 
 ### `update` — Modify a task
-- Use `task_id` (title substring or slug) to identify the task
-- Can update `status`, `priority`, `due`, `title`, `body`, `tags`
+- Use `task_id` (title substring) to identify the task
+- Can update `status`, `priority`, `due`, `scheduled`, `start`, `title`
 
 ### `complete` — Mark a task done
-- Shorthand for setting status to "done"
+- Shorthand for setting status to "done" and adding completion date
 - For project groups: hints when all tasks are done (archive prompt)
 
-### `reopen` — Mark a completed task as open again
+### `reopen` — Mark a completed task as todo again
+- Removes the completion date
 
 ### `archive` — Archive completed work
 - For `tasks`: moves completed tasks to dated archive file
@@ -112,10 +123,18 @@ tasks(action="create", group="tasks", title="Update SSL certificates", due="2026
 
 When starting a complex refactor:
 ```
-tasks(action="create", group="auth-rewrite", title="Extract auth middleware", priority="high", body="Move from monolithic handler to standalone middleware module")
-tasks(action="create", group="auth-rewrite", title="Add JWT validation", body="Replace session tokens with JWT")
+tasks(action="create", group="auth-rewrite", title="Extract auth middleware", priority="high")
+tasks(action="create", group="auth-rewrite", title="Add JWT validation")
 tasks(action="create", group="auth-rewrite", title="Update tests for new auth flow")
 tasks(action="create", group="auth-rewrite", title="Update API documentation")
+```
+
+The resulting `auth-rewrite.md` file looks like:
+```markdown
+- [ ] Extract auth middleware  [priority:: high]  [created:: 2026-03-30]
+- [ ] Add JWT validation  [created:: 2026-03-30]
+- [ ] Update tests for new auth flow  [created:: 2026-03-30]
+- [ ] Update API documentation  [created:: 2026-03-30]
 ```
 
 As work progresses:

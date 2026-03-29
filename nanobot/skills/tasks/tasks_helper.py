@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI helper for nanobot task management.
+"""CLI helper for nanobot task management (Obsidian Tasks Dataview format).
 
 Standalone script to view and manage tasks from the command line,
 independent of the nanobot agent. Operates on the same markdown task
@@ -7,7 +7,7 @@ files in ~/.nanobot/workspace/memory/tasks/.
 
 Usage:
     tasks_helper.py list [GROUP]        List tasks (GROUP defaults to 'tasks', '*' for all)
-    tasks_helper.py add TITLE [--group GROUP] [--priority PRIO] [--due DATE] [--tags t1,t2]
+    tasks_helper.py add TITLE [--group GROUP] [--priority PRIO] [--due DATE]
     tasks_helper.py done TASK_ID [--group GROUP]
     tasks_helper.py reopen TASK_ID [--group GROUP]
     tasks_helper.py update TASK_ID [--group GROUP] [--status STATUS] [--priority PRIO] [--due DATE]
@@ -27,8 +27,16 @@ from pathlib import Path
 TASKS_DIR = Path.home() / ".nanobot" / "workspace" / "memory" / "tasks"
 ARCHIVE_DIR = TASKS_DIR / "archive"
 
-VALID_STATUSES = {"open", "in-progress", "done", "blocked"}
-VALID_PRIORITIES = {"low", "normal", "high"}
+VALID_STATUSES = {"todo", "in-progress", "done", "cancelled", "blocked"}
+VALID_PRIORITIES = {"lowest", "low", "medium", "high", "highest"}
+
+# Status symbols
+STATUS_SYMBOLS = {" ": "todo", "x": "done", "/": "in-progress", "-": "cancelled", "?": "blocked"}
+STATUS_TO_SYMBOL = {v: k for k, v in STATUS_SYMBOLS.items()}
+
+# Regexes
+TASK_RE = re.compile(r"^[-*+]\s+\[(.)\]\s+(.+)$")
+FIELD_RE = re.compile(r"\[(\w+)::\s*([^\]]*)\]")
 
 # ANSI colors
 C_RESET = "\033[0m"
@@ -38,20 +46,12 @@ C_GREEN = "\033[32m"
 C_YELLOW = "\033[33m"
 C_RED = "\033[31m"
 C_CYAN = "\033[36m"
-C_MAGENTA = "\033[35m"
 
 STATUS_COLORS = {
-    "open": C_CYAN,
-    "in-progress": C_YELLOW,
-    "done": C_GREEN,
-    "blocked": C_RED,
+    "todo": C_CYAN, "in-progress": C_YELLOW, "done": C_GREEN,
+    "cancelled": C_DIM, "blocked": C_RED,
 }
-
-PRIO_COLORS = {
-    "high": C_RED,
-    "normal": "",
-    "low": C_DIM,
-}
+PRIO_COLORS = {"highest": C_RED, "high": C_RED, "medium": C_YELLOW, "low": C_DIM, "lowest": C_DIM}
 
 
 def slugify(title: str) -> str:
@@ -61,68 +61,77 @@ def slugify(title: str) -> str:
     return slug.strip("-")[:80] or "untitled"
 
 
-def parse_yaml_block(frontmatter: str) -> dict:
-    task = {}
-    for line in frontmatter.split("\n"):
-        line = line.strip()
-        if ":" not in line:
-            continue
-        key, val = line.split(":", 1)
-        key, val = key.strip(), val.strip()
-        if not val:
-            continue
-        if val.startswith("["):
-            task[key] = re.findall(r'"([^"]*)"', val)
-        elif val in ("true", "false"):
-            task[key] = val == "true"
-        else:
-            task[key] = val.strip('"').strip("'")
+def parse_task_line(line: str) -> dict | None:
+    m = TASK_RE.match(line.strip())
+    if not m:
+        return None
+    symbol, rest = m.group(1), m.group(2)
+    status = STATUS_SYMBOLS.get(symbol, "todo")
+    fields = {}
+    for fm in FIELD_RE.finditer(rest):
+        fields[fm.group(1)] = fm.group(2).strip()
+    desc = FIELD_RE.sub("", rest).strip()
+    task = {"title": desc, "status": status}
+    task.update(fields)
     return task
 
 
-def parse_group(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    text = path.read_text()
-    tasks = []
-    for m in re.finditer(
-        r"^---\n(.*?)\n---\n?(.*?)(?=\n---\n|\Z)", text, re.DOTALL | re.MULTILINE
-    ):
-        frontmatter, body = m.group(1), m.group(2).strip()
-        if not any(":" in line for line in frontmatter.split("\n")):
-            continue
-        task = parse_yaml_block(frontmatter)
-        task["body"] = body
-        tasks.append(task)
-    return tasks
+def render_task_line(task: dict) -> str:
+    symbol = STATUS_TO_SYMBOL.get(task.get("status", "todo"), " ")
+    title = task.get("title", "untitled")
+    field_order = [
+        "priority", "created", "scheduled", "start", "due",
+        "completion", "cancelled", "repeat", "id", "dependsOn",
+    ]
+    fields = []
+    seen = set()
+    for key in field_order:
+        if key in task:
+            fields.append(f"[{key}:: {task[key]}]")
+            seen.add(key)
+    for key, val in task.items():
+        if key not in ("title", "status") and key not in seen:
+            fields.append(f"[{key}:: {val}]")
+    suffix = "  " + "  ".join(fields) if fields else ""
+    return f"- [{symbol}] {title}{suffix}"
 
 
-def render_task(task: dict) -> str:
-    lines = ["---"]
-    for k, v in task.items():
-        if k in ("body",):
-            continue
-        if isinstance(v, list):
-            items = ", ".join(f'"{i}"' for i in v)
-            lines.append(f"{k}: [{items}]")
-        elif isinstance(v, bool):
-            lines.append(f"{k}: {'true' if v else 'false'}")
-        else:
-            lines.append(f"{k}: {v}")
-    lines.append("---")
-    lines.append("")
-    if task.get("body"):
-        lines.append(task["body"])
+def parse_task_file(text: str) -> tuple[list[str], list[dict]]:
+    header, tasks = [], []
+    in_header = True
+    for line in text.split("\n"):
+        task = parse_task_line(line)
+        if task:
+            in_header = False
+            tasks.append(task)
+        elif in_header:
+            header.append(line)
+    return header, tasks
+
+
+def render_task_file(header: list[str], tasks: list[dict]) -> str:
+    lines = list(header)
+    if lines and lines[-1].strip():
+        lines.append("")
+    for task in tasks:
+        lines.append(render_task_line(task))
     return "\n".join(lines) + "\n"
 
 
-def save_group(group: str, tasks: list[dict]) -> None:
-    path = TASKS_DIR / f"{group}.md"
+def load_group(group: str) -> tuple[list[str], list[dict]]:
+    path = group_path(group)
+    if not path.exists():
+        return [], []
+    return parse_task_file(path.read_text())
+
+
+def save_group(group: str, tasks: list[dict], header: list[str] | None = None) -> None:
+    path = group_path(group)
     if not tasks:
         if path.exists():
             path.unlink()
         return
-    path.write_text("\n".join(render_task(t) for t in tasks))
+    path.write_text(render_task_file(header or [], tasks))
 
 
 def find_task(tasks: list[dict], tid: str) -> tuple[int, dict] | None:
@@ -161,7 +170,7 @@ def cmd_list(args: argparse.Namespace) -> None:
             return
         print(f"{C_BOLD}Task Groups:{C_RESET}")
         for f in files:
-            tasks = parse_group(f)
+            _, tasks = load_group(f.stem)
             open_c = sum(1 for t in tasks if t.get("status") != "done")
             done_c = sum(1 for t in tasks if t.get("status") == "done")
             print(f"  {C_CYAN}{f.stem}{C_RESET}  {open_c} open, {done_c} done")
@@ -170,58 +179,58 @@ def cmd_list(args: argparse.Namespace) -> None:
             print(f"\n  {C_DIM}Archived: {len(archived)} groups{C_RESET}")
         return
 
-    tasks = parse_group(group_path(group))
+    _, tasks = load_group(group)
     if not tasks:
         print(f"No tasks in '{group}'.")
         return
 
     print(f"{C_BOLD}Tasks in '{group}':{C_RESET}")
     for t in tasks:
-        status = t.get("status", "open")
-        prio = t.get("priority", "normal")
+        status = t.get("status", "todo")
+        prio = t.get("priority", "")
         title = t.get("title", "?")
         due = t.get("due", "")
-        due_str = f"  {C_DIM}due: {due}{C_RESET}" if due else ""
         slug = slugify(title)
-        print(f"  [{fmt_status(status)}] {title}  {C_DIM}({fmt_prio(prio)}){C_RESET}{due_str}  {C_DIM}id: {slug}{C_RESET}")
+        parts = [f"  [{fmt_status(status)}] {title}"]
+        if prio:
+            parts.append(f" {C_DIM}({fmt_prio(prio)}){C_RESET}")
+        if due:
+            parts.append(f"  {C_DIM}due: {due}{C_RESET}")
+        parts.append(f"  {C_DIM}id: {slug}{C_RESET}")
+        print("".join(parts))
 
 
 def cmd_add(args: argparse.Namespace) -> None:
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     group = args.group or "tasks"
-    tasks = parse_group(group_path(group))
+    header, tasks = load_group(group)
     slug = slugify(args.title)
     for t in tasks:
         if slugify(t.get("title", "")) == slug:
             print(f"Error: task '{args.title}' already exists in '{group}'", file=sys.stderr)
             sys.exit(1)
-    task = {
-        "title": args.title,
-        "status": "open",
-        "priority": args.priority or "normal",
-        "created": str(date.today()),
-    }
+    task = {"title": args.title, "status": "todo", "created": str(date.today())}
+    if args.priority:
+        task["priority"] = args.priority
     if args.due:
         task["due"] = args.due
-    if args.tags:
-        task["tags"] = [t.strip() for t in args.tags.split(",")]
-    task["body"] = ""
     tasks.append(task)
-    save_group(group, tasks)
+    save_group(group, tasks, header)
     print(f"Created '{args.title}' in '{group}'  {C_DIM}(id: {slug}){C_RESET}")
 
 
 def cmd_done(args: argparse.Namespace) -> None:
     group = args.group or "tasks"
-    tasks = parse_group(group_path(group))
+    header, tasks = load_group(group)
     result = find_task(tasks, args.task_id)
     if not result:
         print(f"Error: task '{args.task_id}' not found in '{group}'", file=sys.stderr)
         sys.exit(1)
     idx, task = result
     task["status"] = "done"
+    task["completion"] = str(date.today())
     tasks[idx] = task
-    save_group(group, tasks)
+    save_group(group, tasks, header)
     print(f"{C_GREEN}Completed:{C_RESET} {task.get('title')}")
     if group != "tasks" and all(t.get("status") == "done" for t in tasks):
         print(f"{C_YELLOW}All tasks in '{group}' done. Run: tasks_helper.py archive {group}{C_RESET}")
@@ -229,21 +238,22 @@ def cmd_done(args: argparse.Namespace) -> None:
 
 def cmd_reopen(args: argparse.Namespace) -> None:
     group = args.group or "tasks"
-    tasks = parse_group(group_path(group))
+    header, tasks = load_group(group)
     result = find_task(tasks, args.task_id)
     if not result:
         print(f"Error: task '{args.task_id}' not found in '{group}'", file=sys.stderr)
         sys.exit(1)
     idx, task = result
-    task["status"] = "open"
+    task["status"] = "todo"
+    task.pop("completion", None)
     tasks[idx] = task
-    save_group(group, tasks)
+    save_group(group, tasks, header)
     print(f"Reopened: {task.get('title')}")
 
 
 def cmd_update(args: argparse.Namespace) -> None:
     group = args.group or "tasks"
-    tasks = parse_group(group_path(group))
+    header, tasks = load_group(group)
     result = find_task(tasks, args.task_id)
     if not result:
         print(f"Error: task '{args.task_id}' not found in '{group}'", file=sys.stderr)
@@ -254,6 +264,8 @@ def cmd_update(args: argparse.Namespace) -> None:
             print(f"Error: invalid status '{args.status}'", file=sys.stderr)
             sys.exit(1)
         task["status"] = args.status
+        if args.status == "done":
+            task["completion"] = str(date.today())
     if args.priority:
         if args.priority not in VALID_PRIORITIES:
             print(f"Error: invalid priority '{args.priority}'", file=sys.stderr)
@@ -262,7 +274,7 @@ def cmd_update(args: argparse.Namespace) -> None:
     if args.due:
         task["due"] = args.due
     tasks[idx] = task
-    save_group(group, tasks)
+    save_group(group, tasks, header)
     print(f"Updated: {task.get('title')}")
 
 
@@ -271,7 +283,7 @@ def cmd_archive(args: argparse.Namespace) -> None:
     group = args.group or "tasks"
 
     if group == "tasks":
-        tasks = parse_group(group_path(group))
+        header, tasks = load_group(group)
         done = [t for t in tasks if t.get("status") == "done"]
         remaining = [t for t in tasks if t.get("status") != "done"]
         if not done:
@@ -279,8 +291,8 @@ def cmd_archive(args: argparse.Namespace) -> None:
             return
         archive_path = ARCHIVE_DIR / f"tasks-{date.today()}.md"
         existing = archive_path.read_text() if archive_path.exists() else ""
-        archive_path.write_text(existing + "\n".join(render_task(t) for t in done))
-        save_group(group, remaining)
+        archive_path.write_text(existing + render_task_file([], done))
+        save_group(group, remaining, header)
         print(f"Archived {len(done)} completed tasks.")
     else:
         src = group_path(group)
@@ -294,26 +306,31 @@ def cmd_archive(args: argparse.Namespace) -> None:
 
 def cmd_show(args: argparse.Namespace) -> None:
     group = args.group or "tasks"
-    tasks = parse_group(group_path(group))
+    _, tasks = load_group(group)
     result = find_task(tasks, args.task_id)
     if not result:
         print(f"Error: task '{args.task_id}' not found in '{group}'", file=sys.stderr)
         sys.exit(1)
     _, task = result
     print(f"{C_BOLD}{task.get('title', '?')}{C_RESET}")
-    print(f"  Status:   {fmt_status(task.get('status', 'open'))}")
-    print(f"  Priority: {fmt_prio(task.get('priority', 'normal'))}")
+    print(f"  Status:   {fmt_status(task.get('status', 'todo'))}")
+    if task.get("priority"):
+        print(f"  Priority: {fmt_prio(task['priority'])}")
     print(f"  Created:  {task.get('created', '?')}")
     if task.get("due"):
         print(f"  Due:      {task['due']}")
-    if task.get("tags"):
-        print(f"  Tags:     {', '.join(task['tags'])}")
-    if task.get("body"):
-        print(f"\n{task['body']}")
+    if task.get("scheduled"):
+        print(f"  Scheduled: {task['scheduled']}")
+    if task.get("start"):
+        print(f"  Start:    {task['start']}")
+    if task.get("completion"):
+        print(f"  Completed: {task['completion']}")
+    # Show the raw line
+    print(f"\n  {C_DIM}{render_task_line(task)}{C_RESET}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Nanobot task manager")
+    parser = argparse.ArgumentParser(description="Nanobot task manager (Dataview format)")
     sub = parser.add_subparsers(dest="command")
 
     p_list = sub.add_parser("list", aliases=["ls"], help="List tasks")
@@ -322,9 +339,8 @@ def main() -> None:
     p_add = sub.add_parser("add", help="Add a task")
     p_add.add_argument("title")
     p_add.add_argument("--group", "-g", default="tasks")
-    p_add.add_argument("--priority", "-p", choices=["low", "normal", "high"])
+    p_add.add_argument("--priority", "-p", choices=sorted(VALID_PRIORITIES))
     p_add.add_argument("--due", "-d")
-    p_add.add_argument("--tags", "-t")
 
     p_done = sub.add_parser("done", help="Mark a task done")
     p_done.add_argument("task_id")
