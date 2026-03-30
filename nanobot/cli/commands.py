@@ -239,45 +239,19 @@ def _make_provider_for_model(config: Config, model: str):
 
 def _make_provider(config: Config, model_override: str | None = None):
     """Create the appropriate LLM provider from config."""
-    from nanobot.providers.custom_provider import CustomProvider
-    from nanobot.providers.litellm_provider import LiteLLMProvider
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+    from nanobot.providers.factory import make_provider
 
     model = model_override or config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    if provider_name is None:
-        console.print(f"[red]Error: Could not determine provider for model '{model}'.[/red]")
+    try:
+        return make_provider(config, model_override=model)
+    except RuntimeError as exc:
+        msg = str(exc)
+        if msg.startswith("Could not determine provider"):
+            console.print(f"[red]Error: {msg}[/red]")
+        else:
+            console.print("[red]Error: No API key configured.[/red]")
+            console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
-    provider_name = str(provider_name)
-    p = config.get_provider(model)
-
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
-    from nanobot.providers.registry import find_by_name
-
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers section")
-        raise typer.Exit(1)
-
-    return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
-        extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
-    )
 
 
 def _load_runtime_config(
@@ -372,6 +346,7 @@ def gateway(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
@@ -581,6 +556,7 @@ def gateway(
     def _build_awareness_block() -> str:
         """Build awareness context: current time, idle duration, last session info."""
         from zoneinfo import ZoneInfo
+
         now = datetime.now(ZoneInfo("Australia/Melbourne"))
         lines = [f"**Current time:** {now.strftime('%A %Y-%m-%d %H:%M %Z')}"]
 
@@ -628,6 +604,7 @@ def gateway(
         full content for both if markers are missing.
         """
         import re
+
         monitoring = heartbeat_content
         heartbeat_agent = heartbeat_content
 
@@ -636,12 +613,12 @@ def gateway(
         h_start = re.search(r"^# Heartbeat Agent\b", heartbeat_content, re.MULTILINE)
 
         if m_start and h_start:
-            monitoring = heartbeat_content[m_start.start():h_start.start()].strip()
-            heartbeat_agent = heartbeat_content[h_start.start():].strip()
+            monitoring = heartbeat_content[m_start.start() : h_start.start()].strip()
+            heartbeat_agent = heartbeat_content[h_start.start() :].strip()
         elif m_start:
-            monitoring = heartbeat_content[m_start.start():].strip()
+            monitoring = heartbeat_content[m_start.start() :].strip()
         elif h_start:
-            heartbeat_agent = heartbeat_content[h_start.start():].strip()
+            heartbeat_agent = heartbeat_content[h_start.start() :].strip()
 
         return monitoring, heartbeat_agent
 
@@ -655,7 +632,9 @@ def gateway(
         sections.append(heartbeat_section)
 
         # 2. Subagent monitoring findings
-        sections.append("# Monitoring Findings (from subagent)\n\n" + (subagent_summary or "_No findings._"))
+        sections.append(
+            "# Monitoring Findings (from subagent)\n\n" + (subagent_summary or "_No findings._")
+        )
 
         # 3. Awareness block
         sections.append("# Awareness\n\n" + _build_awareness_block())
@@ -681,12 +660,14 @@ def gateway(
         history_dir = memory_dir / "history"
         if history_dir.is_dir():
             from datetime import timedelta
+
             today = datetime.now().date()
             history_files = sorted(history_dir.glob("*.md"), reverse=True)
             for hf in history_files[:7]:  # scan up to 7 to find 2 days
                 try:
                     date_part = hf.stem  # e.g. "2026-03-19"
                     from datetime import date as date_cls
+
                     file_date = date_cls.fromisoformat(date_part)
                     if (today - file_date).days <= 2:
                         content = hf.read_text(encoding="utf-8").strip()
@@ -818,6 +799,7 @@ def gateway(
     # POST /heartbeat/trigger — manually fire a heartbeat tick
     async def _handle_heartbeat_trigger(request):
         from aiohttp import web as _web
+
         asyncio.create_task(heartbeat._tick())
         return _web.json_response({"ok": True, "message": "heartbeat triggered"})
 
@@ -857,8 +839,6 @@ def gateway(
 # ============================================================================
 # Gateway Client Helpers
 # ============================================================================
-
-
 
 
 # ============================================================================
@@ -958,6 +938,7 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        config=config,
         model=config.agents.defaults.model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
@@ -1974,7 +1955,9 @@ def nodes(
 
     node_list = registry.list_nodes()
     if not node_list:
-        console.print("[yellow]No nodes registered. Use 'nanobot node-token <id>' to create one.[/yellow]")
+        console.print(
+            "[yellow]No nodes registered. Use 'nanobot node-token <id>' to create one.[/yellow]"
+        )
         return
 
     table = Table(title="Registered Nodes")
@@ -2013,7 +1996,9 @@ def node(
     tok = token or config.node.token
 
     if not gw_url:
-        console.print("[red]Error: gateway URL required (--gateway or config node.gatewayUrl)[/red]")
+        console.print(
+            "[red]Error: gateway URL required (--gateway or config node.gatewayUrl)[/red]"
+        )
         raise typer.Exit(1)
     if not nid:
         console.print("[red]Error: node ID required (--id or config node.nodeId)[/red]")

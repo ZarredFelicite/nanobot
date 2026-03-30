@@ -8,7 +8,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
@@ -107,8 +107,15 @@ class SubconsciousService:
 
     _HISTORY_IDLE_THRESHOLD_S = 1800  # 30 minutes
 
-    def __init__(self, workspace: Path, config: SubconsciousConfig):
+    def __init__(
+        self,
+        workspace: Path,
+        config: SubconsciousConfig,
+        provider_factory: Callable[[str], LLMProvider] | None = None,
+        fallback_models: list[str] | None = None,
+    ):
         self._config = config
+        self._fallback_models = fallback_models or []
         self._workspace = workspace
         self._memory_dir = workspace / "memory"
         self._buffer: list[dict[str, str]] = []
@@ -127,10 +134,58 @@ class SubconsciousService:
             collection_path=self._memory_dir,
         )
 
-        # Own LiteLLMProvider so model prefixes route to the correct backend
-        # (e.g. openrouter/ models don't get sent through the codex provider).
+        self._provider_factory = provider_factory or self._default_provider_factory
+        self._providers: dict[str, LLMProvider] = {
+            config.extraction_model: self._provider_factory(config.extraction_model)
+        }
+        self._provider: LLMProvider = self._providers[config.extraction_model]
+
+    @staticmethod
+    def _default_provider_factory(model: str) -> LLMProvider:
         from nanobot.providers.litellm_provider import LiteLLMProvider
-        self._provider: LLMProvider = LiteLLMProvider(default_model=config.extraction_model)
+
+        return LiteLLMProvider(default_model=model)
+
+    def _provider_for(self, model: str) -> LLMProvider:
+        provider = self._providers.get(model)
+        if provider is None:
+            provider = self._provider_factory(model)
+            self._providers[model] = provider
+        return provider
+
+    async def _chat_with_fallback(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        model: str,
+        tools: list[dict[str, Any]] | None = None,
+    ):
+        """Try primary model, then fallbacks on error. Returns LLMResponse."""
+        from nanobot.providers.base import LLMResponse
+
+        provider = self._provider_for(model)
+        response = await provider.chat(messages=messages, tools=tools, model=model)
+        if not response.is_error:
+            return response
+
+        fallbacks = [m for m in self._fallback_models if m != model]
+        if not fallbacks:
+            return response
+
+        logger.warning(
+            "Subconscious model {} failed: {}. Trying fallbacks...",
+            model,
+            (response.content or "")[:150],
+        )
+        for fb_model in fallbacks:
+            fb_provider = self._provider_for(fb_model)
+            fb_response = await fb_provider.chat(messages=messages, tools=tools, model=fb_model)
+            if not fb_response.is_error:
+                logger.info("Subconscious fallback model {} succeeded", fb_model)
+                return fb_response
+            logger.warning("Subconscious fallback {} failed: {}", fb_model, (fb_response.content or "")[:100])
+
+        return response  # All failed, return original error
 
     def _ensure_dirs(self) -> None:
         ensure_dir(self._memory_dir / "history")
@@ -140,7 +195,9 @@ class SubconsciousService:
         if self._qmd.available:
             await self._qmd.ensure_collection()
             await self._qmd.reindex()
-            logger.info("Subconscious initialized (qmd collection: {})", self._config.qmd_collection_name)
+            logger.info(
+                "Subconscious initialized (qmd collection: {})", self._config.qmd_collection_name
+            )
         else:
             logger.warning("qmd not available — subconscious recall will be limited")
 
@@ -205,8 +262,11 @@ class SubconsciousService:
 
         # Filter to user/assistant messages with content
         extractable = [
-            m for m in conversation
-            if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str) and m.get("content")
+            m
+            for m in conversation
+            if m.get("role") in ("user", "assistant")
+            and isinstance(m.get("content"), str)
+            and m.get("content")
         ]
         if not extractable:
             return
@@ -214,8 +274,7 @@ class SubconsciousService:
         try:
             existing = self._list_existing_notes()
             conv_text = "\n\n".join(
-                f"[{m['role']}]: {sanitize_untrusted_content(m['content'])}"
-                for m in extractable
+                f"[{m['role']}]: {sanitize_untrusted_content(m['content'])}" for m in extractable
             )
 
             prompt = f"""Review this FULL conversation for big-picture patterns and facts that incremental extraction may have missed.
@@ -235,7 +294,7 @@ If a note already exists, use action="update" with COMPLETE content. Use [[Name]
 ## Full Conversation
 {conv_text}"""
 
-            response = await self._provider.chat(
+            response = await self._chat_with_fallback(
                 messages=[
                     {
                         "role": "system",
@@ -287,8 +346,7 @@ If a note already exists, use action="update" with COMPLETE content. Use [[Name]
         # persisted into memory notes (user input or tool output may contain
         # injection attempts that the extraction LLM could follow).
         conversation = "\n\n".join(
-            f"[{m['role']}]: {sanitize_untrusted_content(m['content'])}"
-            for m in messages
+            f"[{m['role']}]: {sanitize_untrusted_content(m['content'])}" for m in messages
         )
 
         prompt = f"""Extract ONLY genuinely important, persistent facts from this conversation. Be extremely selective.
@@ -322,7 +380,7 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
 {conversation}"""
 
         try:
-            response = await self._provider.chat(
+            response = await self._chat_with_fallback(
                 messages=[
                     {
                         "role": "system",
@@ -446,12 +504,12 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
                 f.write(line)
 
     _CLASSIFIER_PROMPT = (
-        'You are a classifier. Given the last assistant message and the current user message, '
+        "You are a classifier. Given the last assistant message and the current user message, "
         'respond with ONLY "yes" or "no".\n'
         'Answer "yes" if retrieving the user\'s stored memories (preferences, past decisions, '
-        'people, projects) would help answer the current message.\n'
+        "people, projects) would help answer the current message.\n"
         'Answer "no" for greetings, simple questions, math, code syntax, or anything that '
-        'doesn\'t benefit from personal context.'
+        "doesn't benefit from personal context."
     )
 
     async def should_inject(self, user_message: str, prev_assistant: str | None = None) -> bool:
@@ -467,7 +525,7 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
         messages.append({"role": "user", "content": user_message})
 
         try:
-            response = await self._provider.chat(
+            response = await self._provider_for(self._config.classifier_model).chat(
                 messages=messages,
                 model=self._config.classifier_model,
                 max_tokens=5,
@@ -627,7 +685,7 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
             return
 
         try:
-            response = await self._provider.chat(
+            response = await self._chat_with_fallback(
                 messages=[
                     {
                         "role": "system",
@@ -662,12 +720,11 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
         self._conversation_session_key = ""
 
         conversation = "\n".join(
-            f"[{m['role']}]: {sanitize_untrusted_content(m['content'])}"
-            for m in batch
+            f"[{m['role']}]: {sanitize_untrusted_content(m['content'])}" for m in batch
         )
 
         try:
-            response = await self._provider.chat(
+            response = await self._chat_with_fallback(
                 messages=[
                     {
                         "role": "system",
@@ -685,7 +742,11 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
                 self._append_history(summary, session_key=session_key)
                 if self._qmd.available:
                     await self._qmd.reindex()
-                logger.info("Conversation summary written to history ({} messages, session={})", len(batch), session_key)
+                logger.info(
+                    "Conversation summary written to history ({} messages, session={})",
+                    len(batch),
+                    session_key,
+                )
         except Exception:
             logger.exception("Failed to summarize conversation for history")
 

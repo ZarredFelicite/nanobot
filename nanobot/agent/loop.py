@@ -48,12 +48,16 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 30_000
+    _LLM_RETRY_MAX_ATTEMPTS = 3
+    _LLM_RETRY_BASE_DELAY_S = 1.0
+    _LLM_RETRY_MAX_DELAY_S = 8.0
 
     def __init__(
         self,
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
+        config: Config | None = None,
         model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
@@ -76,6 +80,7 @@ class AgentLoop:
         from nanobot.config.schema import ExecToolConfig
 
         self.bus = bus
+        self._config = config
         self.channels_config = channels_config
         self.provider = provider
         self.workspace = workspace
@@ -116,7 +121,12 @@ class AgentLoop:
         if subconscious_config and subconscious_config.enabled:
             from nanobot.agent.subconscious import SubconsciousService
 
-            self._subconscious = SubconsciousService(workspace, subconscious_config)
+            self._subconscious = SubconsciousService(
+                workspace,
+                subconscious_config,
+                provider_factory=self._build_provider_for_model,
+                fallback_models=config.models.fallbacks if config else None,
+            )
 
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -252,7 +262,17 @@ class AgentLoop:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
 
         # Keys likely to be the most informative arg for display
-        _DESCRIPTIVE_KEYS = ("title", "query", "path", "file_path", "command", "content", "url", "name", "message")
+        _DESCRIPTIVE_KEYS = (
+            "title",
+            "query",
+            "path",
+            "file_path",
+            "command",
+            "content",
+            "url",
+            "name",
+            "message",
+        )
         # Keys that are structural/less informative
         _SKIP_KEYS = ("action", "type", "group", "status")
 
@@ -485,18 +505,212 @@ class AgentLoop:
         if model.startswith(("openai-codex/", "openai_codex/")):
             if self._codex_provider is None:
                 from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+
                 self._codex_provider = OpenAICodexProvider(default_model=model)
             return self._codex_provider
 
+        if self._config is not None:
+            return self._build_provider_for_model(model)
+
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+
         if isinstance(self.provider, OpenAICodexProvider):
             # Default provider is codex but the requested model is not —
             # create a litellm provider that relies on env-var API keys.
             if not hasattr(self, "_litellm_fallback") or self._litellm_fallback is None:
                 from nanobot.providers.litellm_provider import LiteLLMProvider
+
                 self._litellm_fallback = LiteLLMProvider(default_model=model)
             return self._litellm_fallback
         return self.provider
+
+    def _build_provider_for_model(self, model: str) -> "LLMProvider":
+        """Build a provider for a specific model using runtime config."""
+        if self._config is None:
+            return self.get_provider_for_model(model)
+
+        from nanobot.providers.factory import make_provider
+
+        return make_provider(self._config, model_override=model, current_provider=self.provider)
+
+    @classmethod
+    def _is_retryable_model_error(cls, content: str | None) -> bool:
+        """Return True for transient model/provider failures worth retrying."""
+        if not content:
+            return True
+
+        text = content.strip().lower()
+        if not text:
+            return True
+
+        retryable_markers = (
+            "timeout",
+            "timed out",
+            "readtimeout",
+            "connection reset",
+            "connection refused",
+            "connection aborted",
+            "connection error",
+            "remote connection failure",
+            "transport failure",
+            "temporarily unavailable",
+            "service unavailable",
+            "server error",
+            "internal server error",
+            "bad gateway",
+            "gateway timeout",
+            "rate limit",
+            "too many requests",
+            "overloaded",
+            "upstream connect error",
+            "network error",
+            "name or service not known",
+        )
+        if any(marker in text for marker in retryable_markers):
+            return True
+
+        ambiguous_prefixes = (
+            "error calling codex:",
+            "error calling llm:",
+        )
+        return any(text == prefix or text.endswith(prefix) for prefix in ambiguous_prefixes)
+
+    @classmethod
+    def _is_quota_error(cls, content: str | None) -> bool:
+        """Return True for quota/subscription exhaustion — should try next model, not retry."""
+        if not content:
+            return False
+        text = content.strip().lower()
+        quota_markers = (
+            "quota exceeded",
+            "usage quota",
+            "subscription",
+            "billing",
+            "insufficient_quota",
+            "exceeded your current quota",
+            "plan limit",
+            "spending limit",
+            "budget exceeded",
+        )
+        return any(marker in text for marker in quota_markers)
+
+    def _get_fallback_models(self, exclude_model: str) -> list[str]:
+        """Get fallback models from config, excluding the failed model."""
+        if self._config is None:
+            return []
+        fallbacks = self._config.models.fallbacks
+        return [m for m in fallbacks if m != exclude_model]
+
+    async def _chat_with_model_fallback(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        reasoning_effort: str | None,
+    ) -> tuple["LLMResponse", str, "LLMProvider"]:
+        """Try primary model, then fallback models on failure.
+
+        Returns (response, active_model, active_provider) so the caller can
+        update which model/provider to use for subsequent iterations.
+        """
+        provider = self.get_provider_for_model(model)
+
+        # Try primary model
+        response = await self._chat_with_retry(
+            provider,
+            messages=messages,
+            tools=tools,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+        )
+        if not response.is_error:
+            return response, model, provider
+
+        # Try fallback models
+        fallbacks = self._get_fallback_models(model)
+        if not fallbacks:
+            return response, model, provider
+
+        logger.warning(
+            "Primary model {} failed: {}. Trying {} fallback model(s)...",
+            model,
+            (response.content or "")[:200],
+            len(fallbacks),
+        )
+
+        for fb_model in fallbacks:
+            fb_provider = self.get_provider_for_model(fb_model)
+            fb_response = await self._chat_with_retry(
+                fb_provider,
+                messages=messages,
+                tools=tools,
+                model=fb_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+            )
+            if not fb_response.is_error:
+                logger.info("Fallback model {} succeeded", fb_model)
+                return fb_response, fb_model, fb_provider
+            logger.warning(
+                "Fallback model {} also failed: {}",
+                fb_model,
+                (fb_response.content or "")[:100],
+            )
+
+        # All fallbacks exhausted — return last error
+        logger.error("All fallback models exhausted")
+        return response, model, provider
+
+    async def _chat_with_retry(
+        self,
+        provider: "LLMProvider",
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        reasoning_effort: str | None,
+    ):
+        """Call provider.chat with exponential backoff for transient failures."""
+        delay = self._LLM_RETRY_BASE_DELAY_S
+        last_response = None
+
+        for attempt in range(1, self._LLM_RETRY_MAX_ATTEMPTS + 1):
+            response = await provider.chat(
+                messages=messages,
+                tools=tools,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+            )
+            last_response = response
+            if not response.is_error or attempt >= self._LLM_RETRY_MAX_ATTEMPTS:
+                return response
+            if self._is_quota_error(response.content):
+                return response  # Quota errors won't recover with retries
+            if not self._is_retryable_model_error(response.content):
+                return response
+
+            logger.warning(
+                "Transient LLM error on attempt {}/{} for model {}: {}. Retrying in {:.1f}s",
+                attempt,
+                self._LLM_RETRY_MAX_ATTEMPTS,
+                model,
+                (response.content or "")[:200],
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, self._LLM_RETRY_MAX_DELAY_S)
+
+        return last_response
 
     async def _run_agent_loop(
         self,
@@ -520,7 +734,7 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await active_provider.chat(
+            response, active_model, active_provider = await self._chat_with_model_fallback(
                 messages=messages,
                 tools=self.tools.get_definitions(),
                 model=active_model,
@@ -546,10 +760,7 @@ class AgentLoop:
                 # Safety: if the model emits the exact same tool-call batch
                 # repeatedly, stop early to avoid spinning forever.
                 batch_signature = json.dumps(
-                    [
-                        {"name": tc.name, "arguments": tc.arguments}
-                        for tc in effective_tool_calls
-                    ],
+                    [{"name": tc.name, "arguments": tc.arguments} for tc in effective_tool_calls],
                     ensure_ascii=False,
                     sort_keys=True,
                 )
@@ -563,7 +774,8 @@ class AgentLoop:
                 if repeated_tool_batch_count >= max_repeats:
                     logger.warning(
                         "Stopping tool loop after {} repeated identical tool-call batches (session={})",
-                        repeated_tool_batch_count, session_key,
+                        repeated_tool_batch_count,
+                        session_key,
                     )
                     final_content = response.content or ""
                     break
@@ -618,7 +830,9 @@ class AgentLoop:
                         r = await self.tools.execute(tc.name, tc.arguments)
                         return tc, r
 
-                async def _flush_parallel(batch: list[ToolCallRequest], msgs: list[dict]) -> list[dict]:
+                async def _flush_parallel(
+                    batch: list[ToolCallRequest], msgs: list[dict]
+                ) -> list[dict]:
                     if not batch:
                         return msgs
                     results = await asyncio.gather(*[_exec_one(tc) for tc in batch])
@@ -628,13 +842,13 @@ class AgentLoop:
                             "call_id": tc.id,
                             "name": tc.name,
                             "input": tc.arguments,
-                            "output": result[:500] if isinstance(result, str) else str(result)[:500],
+                            "output": result[:500]
+                            if isinstance(result, str)
+                            else str(result)[:500],
                         }
                         if on_progress:
                             await on_progress("", tool_event=tool_done_event)
-                        msgs = self.context.add_tool_result(
-                            msgs, tc.id, tc.name, result
-                        )
+                        msgs = self.context.add_tool_result(msgs, tc.id, tc.name, result)
                     return msgs
 
                 for tool_call in effective_tool_calls:
@@ -652,9 +866,7 @@ class AgentLoop:
 
                     tool_obj = self.tools.get(tool_call.name)
                     is_parallel_safe = (
-                        tool_obj is not None
-                        and tool_obj.parallel_safe
-                        and not needs_approval
+                        tool_obj is not None and tool_obj.parallel_safe and not needs_approval
                     )
 
                     if is_parallel_safe:
@@ -813,6 +1025,7 @@ class AgentLoop:
 
     def apply_runtime_config(self, config: "Config", provider: LLMProvider) -> None:
         """Apply a freshly loaded runtime config without restarting sessions."""
+        self._config = config
         self.channels_config = config.channels
         self.provider = provider
         self.model = config.agents.defaults.model
@@ -1155,7 +1368,11 @@ class AgentLoop:
         )
 
         # Override system prompt when caller provides one (e.g. heartbeat subagent)
-        if system_prompt is not None and initial_messages and initial_messages[0].get("role") == "system":
+        if (
+            system_prompt is not None
+            and initial_messages
+            and initial_messages[0].get("role") == "system"
+        ):
             initial_messages[0] = {"role": "system", "content": system_prompt}
 
         async def _bus_progress(
@@ -1190,7 +1407,9 @@ class AgentLoop:
 
         if final_content is None:
             is_heartbeat = key.startswith("heartbeat") if key else False
-            final_content = "" if is_heartbeat else "I've completed processing but have no response to give."
+            final_content = (
+                "" if is_heartbeat else "I've completed processing but have no response to give."
+            )
 
         self._save_turn(session, all_msgs, 1 + len(history), usage=usage, model=active_model)
         self.sessions.save(session)
@@ -1265,7 +1484,7 @@ class AgentLoop:
                     _END = "<END_USER_MESSAGE>"
                     if _BEGIN in content and _END in content:
                         content = content[
-                            content.index(_BEGIN) + len(_BEGIN):content.index(_END)
+                            content.index(_BEGIN) + len(_BEGIN) : content.index(_END)
                         ].strip()
                     if not content:
                         continue
@@ -1317,7 +1536,11 @@ class AgentLoop:
             self._subconscious.feed_messages(messages[skip:], session_key=session.key)
 
     async def _consolidate_memory(
-        self, session, archive_all: bool = False, *, generate_summary: bool = False,
+        self,
+        session,
+        archive_all: bool = False,
+        *,
+        generate_summary: bool = False,
     ) -> bool | str:
         """Consolidate session history: extract memories, summarize, then trim.
 
@@ -1337,31 +1560,49 @@ class AgentLoop:
                 keep_count = self.memory_window // 2
                 if len(session.messages) <= keep_count:
                     return True
-                old_messages = session.messages[session.last_consolidated : -keep_count] if keep_count else session.messages[session.last_consolidated :]
+                old_messages = (
+                    session.messages[session.last_consolidated : -keep_count]
+                    if keep_count
+                    else session.messages[session.last_consolidated :]
+                )
                 if not old_messages:
                     return True
 
             logger.info(
                 "Subconscious compaction: {} messages to compact, {} to keep",
-                len(old_messages), keep_count,
+                len(old_messages),
+                keep_count,
             )
 
             # 1) Prune tool output before extraction/summarization
             pruned_messages = []
             for m in old_messages:
-                if m.get("role") == "tool" and isinstance(m.get("content", ""), str) and len(m.get("content", "")) > 200:
+                if (
+                    m.get("role") == "tool"
+                    and isinstance(m.get("content", ""), str)
+                    and len(m.get("content", "")) > 200
+                ):
                     pruned_messages.append({**m, "content": m["content"][:200] + "\n[truncated]"})
                 else:
                     pruned_messages.append(m)
 
             # 2) Extract memories from the messages being compacted
-            extractable = [m for m in pruned_messages if m.get("role") in ("user", "assistant") and m.get("content")]
+            extractable = [
+                m
+                for m in pruned_messages
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ]
             if extractable:
                 try:
                     await self._subconscious._extract(extractable)
-                    logger.info("Subconscious compaction: extracted memories from {} messages", len(extractable))
+                    logger.info(
+                        "Subconscious compaction: extracted memories from {} messages",
+                        len(extractable),
+                    )
                 except Exception:
-                    logger.exception("Subconscious compaction: extraction failed, continuing with summarization")
+                    logger.exception(
+                        "Subconscious compaction: extraction failed, continuing with summarization"
+                    )
 
             # 3) Generate structured summary of compacted messages
             _SUMMARY_TEMPLATE = """Summarize this conversation using this exact structure:
@@ -1386,9 +1627,7 @@ Important details that must not be lost"""
 
             summary = ""
             if generate_summary and extractable and self._subconscious._provider:
-                conversation = "\n".join(
-                    f"[{m['role']}]: {m['content']}" for m in extractable
-                )
+                conversation = "\n".join(f"[{m['role']}]: {m['content']}" for m in extractable)
 
                 # Check for previous running summary for iterative update
                 previous_summary = session.metadata.get("running_summary", "")
@@ -1404,7 +1643,7 @@ Important details that must not be lost"""
                     user_content = f"{_SUMMARY_TEMPLATE}\n\n## Conversation\n{conversation}"
 
                 try:
-                    response = await self._subconscious._provider.chat(
+                    response = await self._subconscious._chat_with_fallback(
                         messages=[
                             {
                                 "role": "system",
@@ -1418,7 +1657,9 @@ Important details that must not be lost"""
                         model=self._subconscious._config.extraction_model,
                     )
                     if response.is_error:
-                        logger.error("Subconscious compaction: summarization LLM error: {}", response.content)
+                        logger.error(
+                            "Subconscious compaction: summarization LLM error: {}", response.content
+                        )
                     elif response.content:
                         summary = response.content.strip()
                         # Persist running summary for iterative updates
@@ -1428,19 +1669,26 @@ Important details that must not be lost"""
 
             # 3) Insert summary as system message in the session before the kept messages
             if summary:
-                insert_pos = len(session.messages) - keep_count if keep_count else len(session.messages)
-                session.messages.insert(insert_pos, {
-                    "role": "system",
-                    "content": f"[Compaction Summary]\n\n{summary}",
-                    "timestamp": datetime.now().isoformat(),
-                    "compact_event": True,
-                })
+                insert_pos = (
+                    len(session.messages) - keep_count if keep_count else len(session.messages)
+                )
+                session.messages.insert(
+                    insert_pos,
+                    {
+                        "role": "system",
+                        "content": f"[Compaction Summary]\n\n{summary}",
+                        "timestamp": datetime.now().isoformat(),
+                        "compact_event": True,
+                    },
+                )
                 logger.info("Subconscious compaction: summary inserted as system message")
 
             # 4) If summary was requested but failed, don't trim — we'd lose context
             #    without a summary to replace it. Return False so the caller knows.
             if generate_summary and not summary:
-                logger.warning("Subconscious compaction: summary generation failed, skipping trim to preserve context")
+                logger.warning(
+                    "Subconscious compaction: summary generation failed, skipping trim to preserve context"
+                )
                 return False
 
             # 5) Trim session — account for the inserted summary message
@@ -1476,7 +1724,9 @@ Important details that must not be lost"""
             async with lock:
                 before = session.last_consolidated
                 result = await self._consolidate_memory(
-                    session, archive_all=archive_all, generate_summary=True,
+                    session,
+                    archive_all=archive_all,
+                    generate_summary=True,
                 )
                 self.sessions.save(session)
                 summary = result if isinstance(result, str) else ""
@@ -1507,7 +1757,10 @@ Important details that must not be lost"""
             await self._subconscious.initialize()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress, model=model,
+            msg,
+            session_key=session_key,
+            on_progress=on_progress,
+            model=model,
             system_prompt=system_prompt,
         )
         return response.content if response else ""

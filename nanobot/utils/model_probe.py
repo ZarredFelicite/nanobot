@@ -117,42 +117,9 @@ def _resolve_auth_mode(config: Config, model: str, provider_name: str | None) ->
 
 def _make_provider_for_model(config: Config, model: str):
     """Create a provider instance for one specific model."""
-    from nanobot.providers.custom_provider import CustomProvider
-    from nanobot.providers.litellm_provider import LiteLLMProvider
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-    from nanobot.providers.registry import find_by_name
+    from nanobot.providers.factory import make_provider
 
-    provider_name = config.get_provider_name(model)
-    if provider_name is None:
-        raise RuntimeError(f"Could not determine provider for model '{model}'.")
-
-    provider_config = config.get_provider(model)
-
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
-
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=provider_config.api_key if provider_config else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
-    spec = find_by_name(provider_name)
-    if (
-        not model.startswith("bedrock/")
-        and not (provider_config and provider_config.api_key)
-        and not (spec and spec.is_oauth)
-    ):
-        raise RuntimeError(f"No credentials configured for model '{model}'.")
-
-    return LiteLLMProvider(
-        api_key=provider_config.api_key if provider_config else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
-        extra_headers=provider_config.extra_headers if provider_config else None,
-        provider_name=provider_name,
-    )
+    return make_provider(config, model_override=model)
 
 
 def _build_probe_messages(exact_text: str) -> list[dict[str, str]]:
