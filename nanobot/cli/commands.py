@@ -740,6 +740,13 @@ def gateway(
         )
         logger.info("Heartbeat: subagent complete, summary length={}", len(subagent_summary))
 
+        # Save subagent output to workspace for inspection
+        try:
+            monitoring_output_path = config.workspace_path / "heartbeat-monitoring.md"
+            monitoring_output_path.write_text(subagent_summary or "", encoding="utf-8")
+        except Exception as e:
+            logger.warning("Heartbeat: failed to save monitoring output: {}", e)
+
         # Step 2: Build enriched prompt and run main agent
         enriched_prompt = _build_heartbeat_prompt(heartbeat_content, subagent_summary)
 

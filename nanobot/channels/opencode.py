@@ -2000,137 +2000,42 @@ class OpenCodeChannel(BaseChannel):
     async def _handle_clean_command(
         self, session_id: str, body: dict[str, Any] | None = None,
     ) -> web.Response:
-        """Use the session's selected model to find and redact secrets in message history."""
+        """Redact secrets from session message history using regex patterns."""
+        from nanobot.security.redact import redact_secrets, has_secrets
+
         session, key = self._find_session(session_id)
         if not session:
             return web.json_response({"error": "not found"}, status=404)
-        if not self.agent_loop:
-            return web.json_response({"error": "no agent"}, status=500)
 
-        # Don't pass body — use the session's stored model, not whatever the
-        # UI sends in the command payload (which may be the default/stale model).
-        active_model = self._session_model(session)
-        logger.info(
-            "Clean command: session={} model={} metadata_model={}",
-            session_id, active_model, session.metadata.get("model"),
-        )
-
-        # Build a compact text representation of the session for the LLM to scan
-        scan_lines: list[str] = []
-        for i, m in enumerate(session.messages):
-            role = m.get("role", "unknown")
-            content = m.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    c.get("text", "") for c in content if isinstance(c, dict)
-                )
-            if not isinstance(content, str) or not content.strip():
-                continue
-            scan_lines.append(f"[msg {i}] ({role}): {content[:2000]}")
-
-        if not scan_lines:
-            return await self._send_clean_result(session, session_id, "No messages to scan.", 0)
-
-        scan_text = "\n".join(scan_lines)
-
-        # Ask the LLM to identify secret values
-        prompt = (
-            "You are a security auditor. Scan the following conversation messages "
-            "and identify ALL secret values that should be redacted. Secrets include: "
-            "passwords, Wi-Fi PSKs, API keys, tokens, private keys, connection strings, "
-            "and any other credentials or sensitive values.\n\n"
-            "For each secret found, output ONLY a JSON array of objects with:\n"
-            '- "value": the exact secret string to redact (must match verbatim)\n'
-            '- "label": a short description (e.g. "Wi-Fi password", "API key")\n\n'
-            "If no secrets are found, output an empty array: []\n\n"
-            "IMPORTANT: Output ONLY the JSON array, no markdown fences, no explanation.\n\n"
-            "Messages:\n" + scan_text
-        )
-
-        # Select the right provider for the active model.
-        # The default agent provider may be a codex provider (when the default
-        # model is openai-codex/*), so we need to pick correctly.
-        provider = self.agent_loop.get_provider_for_model(active_model)
+        logger.info("Clean command: session={}", session_id)
 
         await self._broadcast_sse(
             "session.status",
             {"sessionID": session_id, "status": {"type": "busy", "message": "Scanning for secrets..."}},
         )
 
-        try:
-            response = await provider.chat(
-                messages=[
-                    {"role": "system", "content": "You are a security auditor. Output only valid JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                model=active_model,
-                max_tokens=2048,
-                temperature=0.0,
-            )
-        except Exception as e:
-            logger.exception("Clean command LLM call failed")
-            return await self._send_clean_result(session, session_id, f"Error scanning: {e}", 0)
-
-        # Parse the LLM response
-        raw = (response.content or "").strip()
-
-        # Detect provider error responses before trying to parse JSON
-        if raw.startswith("Error calling"):
-            logger.warning("Clean command: provider error: {}", raw[:300])
-            return await self._send_clean_result(
-                session, session_id, f"LLM error: {raw[:500]}", 0,
-            )
-
-        # Strip markdown fences if present
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3].strip()
-
-        try:
-            secrets = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("Clean command: could not parse LLM response as JSON: {}", raw[:200])
-            return await self._send_clean_result(
-                session, session_id,
-                f"Could not parse secret scan results. Raw response:\n{raw[:500]}",
-                0,
-            )
-
-        if not isinstance(secrets, list) or not secrets:
-            return await self._send_clean_result(session, session_id, "No secrets found.", 0)
-
-        # Redact secrets in all session messages
+        # Apply regex-based redaction to all session messages
         redact_count = 0
-        for secret_entry in secrets:
-            if not isinstance(secret_entry, dict):
-                continue
-            value = secret_entry.get("value", "")
-            label = secret_entry.get("label", "secret")
-            if not isinstance(value, str) or len(value) < 4:
-                continue
-            redacted = f"[REDACTED:{label}]"
-            for m in session.messages:
-                content = m.get("content")
-                if isinstance(content, str) and value in content:
-                    m["content"] = content.replace(value, redacted)
-                    redact_count += 1
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and isinstance(part.get("text"), str):
-                            if value in part["text"]:
-                                part["text"] = part["text"].replace(value, redacted)
-                                redact_count += 1
+        for m in session.messages:
+            content = m.get("content")
+            if isinstance(content, str) and has_secrets(content):
+                m["content"] = redact_secrets(content)
+                redact_count += 1
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        if has_secrets(part["text"]):
+                            part["text"] = redact_secrets(part["text"])
+                            redact_count += 1
+
+        if redact_count == 0:
+            return await self._send_clean_result(session, session_id, "No secrets found.", 0)
 
         if self.session_manager:
             self.session_manager.save(session)
 
-        labels = [s.get("label", "?") for s in secrets if isinstance(s, dict)]
-        summary = (
-            f"Redacted {len(secrets)} secret(s) across {redact_count} message(s): "
-            + ", ".join(labels)
-        )
-        return await self._send_clean_result(session, session_id, summary, len(secrets))
+        summary = f"Redacted secrets in {redact_count} message(s)."
+        return await self._send_clean_result(session, session_id, summary, redact_count)
 
     async def _send_clean_result(
         self, session: Session, session_id: str, text: str, secrets_found: int,

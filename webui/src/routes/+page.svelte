@@ -673,7 +673,7 @@
   }
 
   .chat-header {
-    padding: 1rem 1.25rem;
+    padding: 1rem 1.25rem 1rem 2.75rem;
     border-bottom: 1px solid var(--border);
   }
 
@@ -700,6 +700,9 @@
 
   .status-group {
     flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
   }
 
   .status-badge {

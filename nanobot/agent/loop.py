@@ -251,12 +251,34 @@ class AgentLoop:
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
 
+        # Keys likely to be the most informative arg for display
+        _DESCRIPTIVE_KEYS = ("title", "query", "path", "file_path", "command", "content", "url", "name", "message")
+        # Keys that are structural/less informative
+        _SKIP_KEYS = ("action", "type", "group", "status")
+
         def _fmt(tc):
             args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
-            val = next(iter(args.values()), None) if isinstance(args, dict) else None
+            if not isinstance(args, dict):
+                return tc.name
+
+            # Pick the most descriptive string argument
+            val = None
+            for key in _DESCRIPTIVE_KEYS:
+                if key in args and isinstance(args[key], str):
+                    val = args[key]
+                    break
+            if val is None:
+                # Fall back to first string value that isn't structural
+                for k, v in args.items():
+                    if isinstance(v, str) and k not in _SKIP_KEYS:
+                        val = v
+                        break
+            if val is None:
+                val = next((v for v in args.values() if isinstance(v, str)), None)
+
             if not isinstance(val, str):
                 return tc.name
-            return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
+            return f'{tc.name}("{val[:60]}…")' if len(val) > 60 else f'{tc.name}("{val}")'
 
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
@@ -521,30 +543,30 @@ class AgentLoop:
             effective_tool_calls = response.tool_calls or parsed_markup_calls
 
             if effective_tool_calls:
-                # Heartbeat safety: if the model emits the exact same tool-call
-                # batch repeatedly, stop early to avoid spinning forever.
-                if session_key == "heartbeat":
-                    batch_signature = json.dumps(
-                        [
-                            {"name": tc.name, "arguments": tc.arguments}
-                            for tc in effective_tool_calls
-                        ],
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                    if batch_signature == last_tool_batch_signature:
-                        repeated_tool_batch_count += 1
-                    else:
-                        repeated_tool_batch_count = 1
-                        last_tool_batch_signature = batch_signature
+                # Safety: if the model emits the exact same tool-call batch
+                # repeatedly, stop early to avoid spinning forever.
+                batch_signature = json.dumps(
+                    [
+                        {"name": tc.name, "arguments": tc.arguments}
+                        for tc in effective_tool_calls
+                    ],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if batch_signature == last_tool_batch_signature:
+                    repeated_tool_batch_count += 1
+                else:
+                    repeated_tool_batch_count = 1
+                    last_tool_batch_signature = batch_signature
 
-                    if repeated_tool_batch_count >= 3:
-                        logger.warning(
-                            "Stopping heartbeat tool loop after {} repeated identical tool-call batches",
-                            repeated_tool_batch_count,
-                        )
-                        final_content = ""
-                        break
+                max_repeats = 3 if session_key == "heartbeat" else 4
+                if repeated_tool_batch_count >= max_repeats:
+                    logger.warning(
+                        "Stopping tool loop after {} repeated identical tool-call batches (session={})",
+                        repeated_tool_batch_count, session_key,
+                    )
+                    final_content = response.content or ""
+                    break
 
                 if on_progress:
                     # Send reasoning and pre-tool text as thinking, before tool calls.
@@ -596,9 +618,9 @@ class AgentLoop:
                         r = await self.tools.execute(tc.name, tc.arguments)
                         return tc, r
 
-                async def _flush_parallel(batch: list[ToolCallRequest]) -> None:
+                async def _flush_parallel(batch: list[ToolCallRequest], msgs: list[dict]) -> list[dict]:
                     if not batch:
-                        return
+                        return msgs
                     results = await asyncio.gather(*[_exec_one(tc) for tc in batch])
                     for tc, result in results:
                         tool_done_event: dict[str, Any] = {
@@ -610,9 +632,10 @@ class AgentLoop:
                         }
                         if on_progress:
                             await on_progress("", tool_event=tool_done_event)
-                        messages = self.context.add_tool_result(
-                            messages, tc.id, tc.name, result
+                        msgs = self.context.add_tool_result(
+                            msgs, tc.id, tc.name, result
                         )
+                    return msgs
 
                 for tool_call in effective_tool_calls:
                     tools_used.append(tool_call.name)
@@ -639,7 +662,7 @@ class AgentLoop:
                         continue
 
                     # Flush any pending parallel batch before sequential execution
-                    await _flush_parallel(parallel_batch)
+                    messages = await _flush_parallel(parallel_batch, messages)
                     parallel_batch = []
 
                     if needs_approval and self._permission_callback:
@@ -721,7 +744,7 @@ class AgentLoop:
                     )
 
                 # Flush any remaining parallel batch
-                await _flush_parallel(parallel_batch)
+                messages = await _flush_parallel(parallel_batch, messages)
             else:
                 clean = self._strip_think(response.content)
                 validation = validate_model_output(clean)
@@ -1394,7 +1417,9 @@ Important details that must not be lost"""
                         ],
                         model=self._subconscious._config.extraction_model,
                     )
-                    if response.content:
+                    if response.is_error:
+                        logger.error("Subconscious compaction: summarization LLM error: {}", response.content)
+                    elif response.content:
                         summary = response.content.strip()
                         # Persist running summary for iterative updates
                         session.metadata["running_summary"] = summary
@@ -1412,7 +1437,13 @@ Important details that must not be lost"""
                 })
                 logger.info("Subconscious compaction: summary inserted as system message")
 
-            # 4) Trim session — account for the inserted summary message
+            # 4) If summary was requested but failed, don't trim — we'd lose context
+            #    without a summary to replace it. Return False so the caller knows.
+            if generate_summary and not summary:
+                logger.warning("Subconscious compaction: summary generation failed, skipping trim to preserve context")
+                return False
+
+            # 5) Trim session — account for the inserted summary message
             if archive_all:
                 extra = 1 if summary else 0
                 session.last_consolidated = len(session.messages) - extra

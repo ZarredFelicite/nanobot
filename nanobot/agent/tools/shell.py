@@ -13,6 +13,8 @@ from nanobot.security.prompt_injection import wrap_untrusted_content
 class ExecTool(Tool):
     """Tool to execute shell commands."""
 
+    _MAX_TIMEOUT_S = 3600
+
     def __init__(
         self,
         timeout: int = 60,
@@ -65,17 +67,30 @@ class ExecTool(Tool):
                     "type": "string",
                     "description": "Optional working directory for the command",
                 },
+                "timeout": {
+                    "type": "integer",
+                    "description": (
+                        f"Optional timeout in seconds for this command "
+                        f"(default {self.timeout}, max {self._MAX_TIMEOUT_S})"
+                    ),
+                    "minimum": 1,
+                    "maximum": self._MAX_TIMEOUT_S,
+                },
             },
             "required": ["command", "description"],
         }
 
-    async def execute(
-        self, command: str, description: str = "", working_dir: str | None = None, **kwargs: Any
-    ) -> str:
+    async def execute(self, **kwargs: Any) -> str:
+        command = str(kwargs.get("command", ""))
+        description = str(kwargs.get("description", ""))
+        working_dir = kwargs.get("working_dir")
+        timeout = kwargs.get("timeout")
         cwd = working_dir or self.working_dir or os.getcwd()
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
+
+        effective_timeout = self.timeout if timeout is None else timeout
 
         env = os.environ.copy()
         if self.path_append:
@@ -91,7 +106,9 @@ class ExecTool(Tool):
             )
 
             try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout)
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=effective_timeout
+                )
             except asyncio.TimeoutError:
                 process.kill()
                 # Wait for the process to fully terminate so pipes are
@@ -100,7 +117,7 @@ class ExecTool(Tool):
                     await asyncio.wait_for(process.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
                     pass
-                return f"Error: Command timed out after {self.timeout} seconds"
+                return f"Error: Command timed out after {effective_timeout} seconds"
 
             output_parts = []
 

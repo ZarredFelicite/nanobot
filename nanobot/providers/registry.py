@@ -195,7 +195,9 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",
         strip_model_prefix=False,
-        model_overrides=(),
+        model_overrides=(
+            ("gpt-5", {"temperature": 1.0}),
+        ),
     ),
 
     # OpenAI Codex: uses OAuth, not API key.

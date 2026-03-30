@@ -247,6 +247,10 @@ If a note already exists, use action="update" with COMPLETE content. Use [[Name]
                 model=self._config.extraction_model,
             )
 
+            if response.is_error:
+                logger.error("Nudge review LLM error: {}", response.content)
+                return
+
             if response.has_tool_calls:
                 args = response.tool_calls[0].arguments
                 if isinstance(args, str):
@@ -329,6 +333,10 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
                 tools=_EXTRACT_TOOL,
                 model=self._config.extraction_model,
             )
+
+            if response.is_error:
+                logger.error("Subconscious extraction LLM error: {}", response.content)
+                return
 
             if not response.has_tool_calls:
                 logger.debug("Extraction LLM did not call save_memories, skipping")
@@ -632,6 +640,9 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
                 ],
                 model=self._config.extraction_model,
             )
+            if response.is_error:
+                logger.error("History summary LLM error: {}", response.content)
+                return
             if response.content:
                 clean_content = sanitize_untrusted_content(response.content)
                 output_file.write_text(f"# {label}\n\n{clean_content}\n", encoding="utf-8")
@@ -666,6 +677,9 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
                 ],
                 model=self._config.extraction_model,
             )
+            if response.is_error:
+                logger.error("Conversation summary LLM error: {}", response.content)
+                return
             if response.content:
                 summary = sanitize_untrusted_content(response.content.strip())
                 self._append_history(summary, session_key=session_key)

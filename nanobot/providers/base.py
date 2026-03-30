@@ -28,6 +28,11 @@ class LLMResponse:
         """Check if response contains tool calls."""
         return len(self.tool_calls) > 0
 
+    @property
+    def is_error(self) -> bool:
+        """Check if response represents an LLM error."""
+        return self.finish_reason == "error"
+
 
 class LLMProvider(ABC):
     """

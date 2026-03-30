@@ -118,6 +118,17 @@ def test_exec_matches_untrusted_program_anywhere_in_command() -> None:
     assert tool._command_matches_untrusted_program("git status") is False
 
 
+def test_exec_exposes_timeout_parameter() -> None:
+    tool = ExecTool(timeout=45)
+
+    timeout_schema = tool.parameters["properties"]["timeout"]
+
+    assert timeout_schema["type"] == "integer"
+    assert timeout_schema["minimum"] == 1
+    assert timeout_schema["maximum"] == tool._MAX_TIMEOUT_S
+    assert "default 45" in timeout_schema["description"]
+
+
 @pytest.mark.asyncio
 async def test_exec_wraps_output_for_untrusted_programs(tmp_path) -> None:
     tool = ExecTool(working_dir=str(tmp_path), untrusted_programs=["python"])
@@ -141,3 +152,16 @@ async def test_exec_keeps_trusted_output_plain(tmp_path) -> None:
     )
 
     assert result.strip() == "hello"
+
+
+@pytest.mark.asyncio
+async def test_exec_allows_per_command_timeout_override(tmp_path) -> None:
+    tool = ExecTool(working_dir=str(tmp_path), timeout=10)
+
+    result = await tool.execute(
+        command='python -c "import time; time.sleep(2)"',
+        description="sleep briefly",
+        timeout=1,
+    )
+
+    assert result == "Error: Command timed out after 1 seconds"
