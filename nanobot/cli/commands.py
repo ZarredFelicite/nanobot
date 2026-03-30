@@ -1978,6 +1978,7 @@ def node(
     gateway_url: str = typer.Option("", "--gateway", "-g", help="Gateway WebSocket URL"),
     node_id: str = typer.Option("", "--id", "-i", help="This node's identifier"),
     token: str = typer.Option("", "--token", "-t", help="Auth token"),
+    daemon: bool = typer.Option(False, "--daemon", "-d", help="Run without interactive REPL (for systemd/background)"),
     config_path: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
 ):
     """Start a node client with interactive REPL."""
@@ -2029,6 +2030,10 @@ def node(
     )
 
     async def run():
+        if daemon:
+            # Daemon mode: just run the WS client (no REPL)
+            await client.run()
+            return
         # Run WS client and REPL concurrently
         ws_task = asyncio.create_task(client.run())
         repl_task = asyncio.create_task(_node_repl(client))
