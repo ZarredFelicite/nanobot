@@ -339,6 +339,13 @@ def gateway(
         node_registry = NodeRegistry(tokens_path)
         node_ws_handler = NodeGatewayHandler(node_registry, bus)
         extra_routes.append(("/ws/node", node_ws_handler.handle))
+
+        async def _handle_nodes_status(request):
+            from aiohttp import web as _web
+            nodes = node_registry.list_nodes()
+            return _web.json_response({"nodes": nodes})
+
+        extra_routes.append(("/nodes", _handle_nodes_status))
         console.print("[green]✓[/green] Node gateway enabled on /ws/node")
 
     # Create agent with cron service
@@ -1953,7 +1960,22 @@ def nodes(
     tokens_path = Path(config.gateway.nodes.tokens_file).expanduser()
     registry = NodeRegistry(tokens_path)
 
+    # Try to query live gateway for real online status
+    import urllib.request, json as _json
+    live_online: set[str] = set()
+    try:
+        oc_port = config.channels.opencode.port
+        with urllib.request.urlopen(f"http://127.0.0.1:{oc_port}/nodes", timeout=2) as resp:
+            data = _json.loads(resp.read())
+            live_online = {n["node_id"] for n in data.get("nodes", []) if n.get("online")}
+    except Exception:
+        pass  # Fall back to disk-only status
+
     node_list = registry.list_nodes()
+    if live_online:
+        for n in node_list:
+            n["online"] = n["node_id"] in live_online
+
     if not node_list:
         console.print(
             "[yellow]No nodes registered. Use 'nanobot node-token <id>' to create one.[/yellow]"
