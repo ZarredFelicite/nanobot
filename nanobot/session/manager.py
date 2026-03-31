@@ -192,6 +192,21 @@ class SessionManager:
 
         self._cache[session.key] = session
 
+    def append_message(self, session: Session, msg: dict) -> None:
+        """Append a single message to the session file without a full rewrite.
+
+        Used for incremental crash-safe persistence during a turn. The full
+        save() call at turn end will rewrite the file cleanly from session.messages,
+        so any messages written here are only needed for crash recovery.
+        """
+        path = self._get_session_path(session.key)
+        if not path.exists():
+            # Create the file with metadata first, then the message will be appended below
+            self.save(session)
+            return
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)

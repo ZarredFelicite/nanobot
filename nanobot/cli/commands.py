@@ -1962,7 +1962,7 @@ def nodes(
 
     # Try to query live gateway for real online status
     import urllib.request, json as _json
-    live_online: set[str] = set()
+    live_online: set[str] | None = None
     try:
         oc_port = config.channels.opencode.port
         with urllib.request.urlopen(f"http://127.0.0.1:{oc_port}/nodes", timeout=2) as resp:
@@ -1972,7 +1972,7 @@ def nodes(
         pass  # Fall back to disk-only status
 
     node_list = registry.list_nodes()
-    if live_online:
+    if live_online is not None:
         for n in node_list:
             n["online"] = n["node_id"] in live_online
 

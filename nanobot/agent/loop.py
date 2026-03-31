@@ -719,6 +719,7 @@ class AgentLoop:
         model: str | None = None,
         session_key: str | None = None,
         require_approval: list[str] | None = None,
+        on_step: Callable[[list[dict]], Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict], dict[str, Any]]:
         """Run the agent loop. Returns (final_content, tools_used, messages, usage)."""
         messages = initial_messages
@@ -733,6 +734,7 @@ class AgentLoop:
 
         while iteration < self.max_iterations:
             iteration += 1
+            prev_len = len(messages)  # track messages added this iteration for on_step
 
             response, active_model, active_provider = await self._chat_with_model_fallback(
                 messages=messages,
@@ -957,6 +959,10 @@ class AgentLoop:
 
                 # Flush any remaining parallel batch
                 messages = await _flush_parallel(parallel_batch, messages)
+
+                # Checkpoint: persist messages added this iteration to disk
+                if on_step and len(messages) > prev_len:
+                    await on_step(messages[prev_len:])
             else:
                 clean = self._strip_think(response.content)
                 validation = validate_model_output(clean)
@@ -985,6 +991,10 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
                 final_content = clean
+
+                # Checkpoint: persist final assistant message to disk
+                if on_step and len(messages) > prev_len:
+                    await on_step(messages[prev_len:])
                 break
 
         if final_content is None and iteration >= self.max_iterations:
@@ -1397,16 +1407,32 @@ class AgentLoop:
                 )
             )
 
+        is_heartbeat = key.startswith("heartbeat") if key else False
+
+        # Checkpoint the user message immediately so it's on disk before any LLM call.
+        # This ensures a killed gateway leaves a recoverable session.
+        if not is_heartbeat and session.key != "heartbeat:sub" and initial_messages:
+            user_entry = self._clean_entry(initial_messages[-1], is_heartbeat=False)
+            if user_entry:
+                self.sessions.append_message(session, user_entry)
+
+        async def _on_step(new_msgs: list[dict]) -> None:
+            """Checkpoint new messages from one agent-loop iteration to disk."""
+            for m in new_msgs:
+                entry = self._clean_entry(m, is_heartbeat=is_heartbeat)
+                if entry:
+                    self.sessions.append_message(session, entry)
+
         final_content, _, all_msgs, usage = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             model=active_model,
             session_key=key,
             require_approval=self._require_approval or None,
+            on_step=_on_step if not is_heartbeat else None,
         )
 
         if final_content is None:
-            is_heartbeat = key.startswith("heartbeat") if key else False
             final_content = (
                 "" if is_heartbeat else "I've completed processing but have no response to give."
             )
@@ -1436,6 +1462,66 @@ class AgentLoop:
             session_key=key,
         )
 
+    def _clean_entry(self, m: dict, *, is_heartbeat: bool) -> dict | None:
+        """Clean a raw message dict for session persistence.
+
+        Returns the cleaned entry dict, or None if the entry should be skipped.
+        Does NOT mutate the input dict.
+        """
+        from datetime import datetime
+
+        entry = dict(m)
+        role, content = entry.get("role"), entry.get("content")
+        if role == "assistant" and not content and not entry.get("tool_calls"):
+            return None  # skip empty assistant messages
+        if is_heartbeat and (role != "assistant" or not content or entry.get("tool_calls")):
+            return None
+        if (
+            role == "tool"
+            and isinstance(content, str)
+            and len(content) > self._TOOL_RESULT_MAX_CHARS
+        ):
+            entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+        elif role == "user":
+            if isinstance(content, str):
+                if content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                    parts = content.split("\n\n", 1)
+                    content = parts[1].strip() if len(parts) > 1 else ""
+                mem_tag = ContextBuilder._MEMORY_CONTEXT_TAG
+                if mem_tag in content:
+                    content = content[: content.index(mem_tag)].strip()
+                _BEGIN = "<BEGIN_USER_MESSAGE>"
+                _END = "<END_USER_MESSAGE>"
+                if _BEGIN in content and _END in content:
+                    content = content[
+                        content.index(_BEGIN) + len(_BEGIN) : content.index(_END)
+                    ].strip()
+                if not content:
+                    return None
+                entry["content"] = content
+            if isinstance(content, list):
+                filtered = []
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    text = c.get("text", "") if c.get("type") == "text" else None
+                    if text is not None and (
+                        text.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
+                        or text.startswith(ContextBuilder._MEMORY_CONTEXT_TAG)
+                    ):
+                        continue
+                    if c.get("type") == "image_url" and c.get("image_url", {}).get(
+                        "url", ""
+                    ).startswith("data:image/"):
+                        filtered.append({"type": "text", "text": "[image]"})
+                    else:
+                        filtered.append(c)
+                if not filtered:
+                    return None
+                entry["content"] = filtered
+        entry.setdefault("timestamp", datetime.now().isoformat())
+        return entry
+
     def _save_turn(
         self,
         session: Session,
@@ -1455,61 +1541,9 @@ class AgentLoop:
         saved_entries: list[dict[str, Any]] = []
 
         for m in messages[skip:]:
-            entry = dict(m)
-            role, content = entry.get("role"), entry.get("content")
-            if role == "assistant" and not content and not entry.get("tool_calls"):
-                continue  # skip empty assistant messages — they poison session context
-            # Heartbeat main session: only keep assistant text replies (no tool calls,
-            # no user prompts, no tool results).  The rich prompt is rebuilt each tick.
-            if is_heartbeat and (role != "assistant" or not content or entry.get("tool_calls")):
+            entry = self._clean_entry(m, is_heartbeat=is_heartbeat)
+            if entry is None:
                 continue
-            if (
-                role == "tool"
-                and isinstance(content, str)
-                and len(content) > self._TOOL_RESULT_MAX_CHARS
-            ):
-                entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-            elif role == "user":
-                if isinstance(content, str):
-                    # Strip the runtime-context prefix
-                    if content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                        parts = content.split("\n\n", 1)
-                        content = parts[1].strip() if len(parts) > 1 else ""
-                    # Strip recalled memories suffix
-                    mem_tag = ContextBuilder._MEMORY_CONTEXT_TAG
-                    if mem_tag in content:
-                        content = content[: content.index(mem_tag)].strip()
-                    # Strip prompt-injection wrapper so raw user text is stored
-                    _BEGIN = "<BEGIN_USER_MESSAGE>"
-                    _END = "<END_USER_MESSAGE>"
-                    if _BEGIN in content and _END in content:
-                        content = content[
-                            content.index(_BEGIN) + len(_BEGIN) : content.index(_END)
-                        ].strip()
-                    if not content:
-                        continue
-                    entry["content"] = content
-                if isinstance(content, list):
-                    filtered = []
-                    for c in content:
-                        if not isinstance(c, dict):
-                            continue
-                        text = c.get("text", "") if c.get("type") == "text" else None
-                        if text is not None and (
-                            text.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
-                            or text.startswith(ContextBuilder._MEMORY_CONTEXT_TAG)
-                        ):
-                            continue
-                        if c.get("type") == "image_url" and c.get("image_url", {}).get(
-                            "url", ""
-                        ).startswith("data:image/"):
-                            filtered.append({"type": "text", "text": "[image]"})
-                        else:
-                            filtered.append(c)
-                    if not filtered:
-                        continue
-                    entry["content"] = filtered
-            entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
             saved_entries.append(entry)
 
