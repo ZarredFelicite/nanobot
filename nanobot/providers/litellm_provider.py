@@ -3,14 +3,18 @@
 import os
 import secrets
 import string
+import time
+from collections.abc import Awaitable, Callable
 from typing import Any
+
+import httpx
 
 import json_repair
 import litellm
 from litellm import acompletion
 from loguru import logger
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, ModelLimits, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
 
 # Standard chat-completion message keys.
@@ -19,6 +23,8 @@ _ALLOWED_MSG_KEYS = frozenset(
 )
 _ANTHROPIC_EXTRA_KEYS = frozenset({"thinking_blocks"})
 _ALNUM = string.ascii_letters + string.digits
+_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+_OPENROUTER_MODELS_TTL_S = 86400
 
 
 def _short_tool_id() -> str:
@@ -61,6 +67,8 @@ class LiteLLMProvider(LLMProvider):
 
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
+        self._model_limits_cache: dict[str, dict[str, Any]] = {}
+        self._model_limits_cache_ts = 0.0
 
     def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
         """Set environment variables based on detected provider."""
@@ -217,6 +225,95 @@ class LiteLLMProvider(LLMProvider):
             normalized.append(clean)
         return normalized
 
+    async def get_model_limits(self, model: str | None = None) -> ModelLimits | None:
+        original_model = model or self.default_model
+        if not original_model.startswith("openrouter/"):
+            return None
+
+        lookup_id = original_model.split("/", 1)[1]
+        catalog = await self._get_openrouter_models_catalog()
+        item = catalog.get(lookup_id)
+        if not item:
+            return None
+
+        context_tokens = item.get("context_length")
+        return ModelLimits(
+            context_tokens=int(context_tokens) if isinstance(context_tokens, int) else None,
+            max_output_tokens=None,
+            metadata={
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "top_provider": item.get("top_provider"),
+            },
+        )
+
+    async def _get_openrouter_models_catalog(self) -> dict[str, dict[str, Any]]:
+        now = time.time()
+        if self._model_limits_cache and (now - self._model_limits_cache_ts) < _OPENROUTER_MODELS_TTL_S:
+            return self._model_limits_cache
+
+        headers = {"accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        async with httpx.AsyncClient(timeout=30.0, verify=True) as client:
+            response = await client.get(_OPENROUTER_MODELS_URL, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+
+        models = data.get("data", []) if isinstance(data, dict) else []
+        self._model_limits_cache = {
+            m.get("id"): m for m in models if isinstance(m, dict) and isinstance(m.get("id"), str)
+        }
+        self._model_limits_cache_ts = time.time()
+        return self._model_limits_cache
+
+    def _build_request_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: int,
+        temperature: float,
+        reasoning_effort: str | None,
+    ) -> dict[str, Any]:
+        original_model = model or self.default_model
+        resolved_model = self._resolve_model(original_model)
+        extra_msg_keys = self._extra_msg_keys(original_model, resolved_model)
+
+        if self._supports_cache_control(original_model):
+            messages, tools = self._apply_cache_control(messages, tools)
+
+        max_tokens = max(1, max_tokens)
+        request_messages = self._sanitize_messages(
+            self._sanitize_empty_content(messages), extra_keys=extra_msg_keys
+        )
+
+        if resolved_model.startswith("openrouter/stepfun/"):
+            request_messages = self._normalize_stepfun_tool_messages(request_messages)
+
+        kwargs: dict[str, Any] = {
+            "model": resolved_model,
+            "messages": request_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        self._apply_model_overrides(resolved_model, kwargs)
+
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+            kwargs["drop_params"] = True
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        return kwargs
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -226,68 +323,10 @@ class LiteLLMProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
     ) -> LLMResponse:
-        """
-        Send a chat completion request via LiteLLM.
-
-        Args:
-            messages: List of message dicts with 'role' and 'content'.
-            tools: Optional list of tool definitions in OpenAI format.
-            model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
-            max_tokens: Maximum tokens in response.
-            temperature: Sampling temperature.
-
-        Returns:
-            LLMResponse with content and/or tool calls.
-        """
-        original_model = model or self.default_model
-        model = self._resolve_model(original_model)
-        extra_msg_keys = self._extra_msg_keys(original_model, model)
-
-        is_stepfun = "stepfun/" in original_model.lower() or "stepfun/" in model.lower()
-        if self._supports_cache_control(original_model):
-            messages, tools = self._apply_cache_control(messages, tools)
-
-        # Clamp max_tokens to at least 1 — negative or zero values cause
-        # LiteLLM to reject the request with "max_tokens must be at least 1".
-        max_tokens = max(1, max_tokens)
-
-        request_messages = self._sanitize_messages(
-            self._sanitize_empty_content(messages), extra_keys=extra_msg_keys
+        """Send a chat completion request via LiteLLM."""
+        kwargs = self._build_request_kwargs(
+            messages, tools, model, max_tokens, temperature, reasoning_effort
         )
-
-        if model.startswith("openrouter/stepfun/"):
-            request_messages = self._normalize_stepfun_tool_messages(request_messages)
-
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": request_messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-
-        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
-        self._apply_model_overrides(model, kwargs)
-
-        # Pass api_key directly — more reliable than env vars alone
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-
-        # Pass api_base for custom endpoints
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-
-        # Pass extra headers (e.g. APP-Code for AiHubMix)
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
-
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
-            kwargs["drop_params"] = True
-
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-
         try:
             response = await acompletion(**kwargs)
             return self._parse_response(response)
@@ -296,6 +335,181 @@ class LiteLLMProvider(LLMProvider):
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        if on_text_delta is None:
+            return await self.chat(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+            )
+
+        kwargs = self._build_request_kwargs(
+            messages, tools, model, max_tokens, temperature, reasoning_effort
+        )
+        kwargs["stream"] = True
+
+        try:
+            stream = await acompletion(**kwargs)
+            return await self._parse_stream(
+                stream,
+                fallback_kwargs={k: v for k, v in kwargs.items() if k != "stream"},
+                on_text_delta=on_text_delta,
+                on_reasoning_delta=on_reasoning_delta,
+            )
+        except Exception as e:
+            return LLMResponse(
+                content=f"Error calling LLM: {str(e)}",
+                finish_reason="error",
+            )
+
+    def _coerce_tool_calls(self, raw_tool_calls: list[Any]) -> list[ToolCallRequest]:
+        tool_calls = []
+        for tc in raw_tool_calls:
+            fn = getattr(tc, "function", None)
+            if fn is None:
+                continue
+            args = getattr(fn, "arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json_repair.loads(args)
+                except Exception:
+                    args = {}
+            parsed_args: dict[str, Any]
+            if isinstance(args, dict):
+                parsed_args = args
+            else:
+                parsed_args = {}
+            tool_calls.append(
+                ToolCallRequest(
+                    id=getattr(tc, "id", None) or _short_tool_id(),
+                    name=getattr(fn, "name", None),
+                    arguments=parsed_args,
+                )
+            )
+        return tool_calls
+
+    @staticmethod
+    def _delta_attr(obj: Any, key: str) -> Any:
+        if obj is None:
+            return None
+        value = getattr(obj, key, None)
+        if value is None and isinstance(obj, dict):
+            value = obj.get(key)
+        return value
+
+    @classmethod
+    def _extract_delta_text(cls, delta: Any) -> str:
+        content = cls._delta_attr(delta, "content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                else:
+                    text = getattr(item, "text", None)
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "".join(parts)
+        text = cls._delta_attr(delta, "text")
+        return text if isinstance(text, str) else ""
+
+    @classmethod
+    def _extract_delta_reasoning(cls, delta: Any) -> str:
+        for key in ("reasoning_content", "reasoning", "reasoning_text"):
+            value = cls._delta_attr(delta, key)
+            if isinstance(value, str):
+                return value
+            if isinstance(value, list):
+                parts: list[str] = []
+                for item in value:
+                    if isinstance(item, str):
+                        parts.append(item)
+                    elif isinstance(item, dict):
+                        text = item.get("text") or item.get("content")
+                        if isinstance(text, str):
+                            parts.append(text)
+                if parts:
+                    return "".join(parts)
+        return ""
+
+    async def _parse_stream(
+        self,
+        stream: Any,
+        *,
+        fallback_kwargs: dict[str, Any],
+        on_text_delta: Callable[[str], Awaitable[None]],
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None,
+    ) -> LLMResponse:
+        parts: list[str] = []
+        reasoning_parts: list[str] = []
+        raw_tool_calls: list[Any] = []
+        finish_reason = "stop"
+        usage: dict[str, int] = {}
+        streamed_content = False
+
+        async for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            for choice in choices:
+                delta = getattr(choice, "delta", None)
+                reasoning = self._extract_delta_reasoning(delta)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    if on_reasoning_delta:
+                        await on_reasoning_delta(reasoning)
+                text = self._extract_delta_text(delta)
+                if text:
+                    parts.append(text)
+                    await on_text_delta(text)
+                    streamed_content = True
+                delta_tool_calls = self._delta_attr(delta, "tool_calls")
+                if delta_tool_calls:
+                    raw_tool_calls = list(delta_tool_calls)
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage:
+                usage = {
+                    "prompt_tokens": getattr(chunk_usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(chunk_usage, "completion_tokens", 0),
+                    "total_tokens": getattr(chunk_usage, "total_tokens", 0),
+                }
+
+        content = "".join(parts) or None
+        tool_calls = self._coerce_tool_calls(raw_tool_calls)
+        reasoning_content = "".join(reasoning_parts) or None
+
+        if not content and not tool_calls and not reasoning_content:
+            fallback = await acompletion(**fallback_kwargs)
+            return self._parse_response(fallback)
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason or "stop",
+            usage=usage,
+            reasoning_content=reasoning_content,
+            streamed_content=streamed_content,
+        )
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
@@ -321,25 +535,7 @@ class LiteLLMProvider(LLMProvider):
                 len(raw_tool_calls),
             )
 
-        tool_calls = []
-        for tc in raw_tool_calls:
-            # Parse arguments from JSON string if needed
-            args = tc.function.arguments
-            if isinstance(args, str):
-                args = json_repair.loads(args)
-            parsed_args: dict[str, Any]
-            if isinstance(args, dict):
-                parsed_args = args
-            else:
-                parsed_args = {}
-
-            tool_calls.append(
-                ToolCallRequest(
-                    id=_short_tool_id(),
-                    name=tc.function.name,
-                    arguments=parsed_args,
-                )
-            )
+        tool_calls = self._coerce_tool_calls(raw_tool_calls)
 
         usage = {}
         if hasattr(response, "usage") and response.usage:

@@ -35,18 +35,38 @@ class ToolRegistry:
         """Get all tool definitions in OpenAI format."""
         return [tool.to_schema() for tool in self._tools.values()]
 
-    async def execute(self, name: str, params: dict[str, Any]) -> str:
+    async def execute(self, name: Any, params: dict[str, Any]) -> str:
         """Execute a tool by name with given parameters."""
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
+        _RETRY_VALID_TOOL_HINT = (
+            "\n\n[Your previous tool call was malformed or used an unknown tool. "
+            "Retry with a valid tool call using one of the available tool names exactly as defined. "
+            "Do not leave function.name empty or null.]"
+        )
 
-        tool = self._tools.get(name)
+        normalized_name = name.strip() if isinstance(name, str) else ""
+        tool = self._tools.get(normalized_name)
         if not tool:
-            return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
+            available = ', '.join(self.tool_names)
+            if not normalized_name:
+                return (
+                    "Error: Invalid tool call: function.name was empty or null. "
+                    f"Available tools: {available}."
+                    + _RETRY_VALID_TOOL_HINT
+                )
+            return (
+                f"Error: Tool '{normalized_name}' not found. Available: {available}."
+                + _RETRY_VALID_TOOL_HINT
+            )
 
         try:
             errors = tool.validate_params(params)
             if errors:
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
+                return (
+                    f"Error: Invalid parameters for tool '{normalized_name}': "
+                    + "; ".join(errors)
+                    + _HINT
+                )
             result = await tool.execute(**params)
 
             # Redact secrets from all tool output
@@ -58,7 +78,7 @@ class ToolRegistry:
                 return result + _HINT
             return result
         except Exception as e:
-            return f"Error executing {name}: {str(e)}" + _HINT
+            return f"Error executing {normalized_name or name}: {str(e)}" + _HINT
 
     @property
     def tool_names(self) -> list[str]:

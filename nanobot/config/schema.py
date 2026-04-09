@@ -323,7 +323,9 @@ class HeartbeatConfig(Base):
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
     model: str | None = None  # Override model for heartbeat execution (must support tool use)
-    subagent_model: str | None = None  # Cheap model for monitoring subagent (defaults to heartbeat model)
+    subagent_model: str | None = (
+        None  # Cheap model for monitoring subagent (defaults to heartbeat model)
+    )
     duplicate_to_telegram_after_inactive_s: int = (
         30 * 60
     )  # Also send heartbeat to Telegram if no user messages for this long
@@ -382,7 +384,7 @@ class SubconsciousConfig(Base):
     """Subconscious memory service configuration."""
 
     enabled: bool = False
-    extraction_model: str = "openai/gpt-5-mini"
+    extraction_model: str = "openai-codex/gpt-5.4-mini"
     classifier_model: str = "openrouter/google/gemini-2.0-flash-lite-001"
     auto_inject_budget: int = 1000  # Max tokens of memories to auto-inject per turn
     auto_inject_results: int = 5  # Max qmd results to consider for injection

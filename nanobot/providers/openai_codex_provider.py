@@ -5,16 +5,22 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
+from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator
 
 import httpx
 from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, ModelLimits, ToolCallRequest
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+DEFAULT_CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 DEFAULT_ORIGINATOR = "nanobot"
+DEFAULT_CODEX_CLIENT_VERSION = "0.118.0"
+MODELS_CACHE_TTL_S = 86400
+CLIENT_VERSION_TTL_S = 86400
 
 
 class OpenAICodexProvider(LLMProvider):
@@ -23,6 +29,12 @@ class OpenAICodexProvider(LLMProvider):
     def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
+        self._models_cache: dict[str, dict[str, Any]] = {}
+        self._models_cache_ts = 0.0
+        self._client_version = DEFAULT_CODEX_CLIENT_VERSION
+        self._client_version_ts = 0.0
+        self._models_lock = asyncio.Lock()
+        self._client_version_lock = asyncio.Lock()
 
     async def chat(
         self,
@@ -32,6 +44,27 @@ class OpenAICodexProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+    ) -> LLMResponse:
+        return await self.stream_chat(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            on_text_delta=None,
+        )
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
@@ -62,8 +95,8 @@ class OpenAICodexProvider(LLMProvider):
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(
-                    url, headers, body, verify=True
+                content, tool_calls, finish_reason, streamed_content = await _request_codex(
+                    url, headers, body, verify=True, on_text_delta=on_text_delta
                 )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
@@ -71,19 +104,128 @@ class OpenAICodexProvider(LLMProvider):
                 logger.warning(
                     "SSL certificate verification failed for Codex API; retrying with verify=False"
                 )
-                content, tool_calls, finish_reason = await _request_codex(
-                    url, headers, body, verify=False
+                content, tool_calls, finish_reason, streamed_content = await _request_codex(
+                    url, headers, body, verify=False, on_text_delta=on_text_delta
                 )
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
+                streamed_content=streamed_content,
             )
         except Exception as e:
             return LLMResponse(
                 content=f"Error calling Codex: {str(e)}",
                 finish_reason="error",
             )
+
+    async def get_model_limits(self, model: str | None = None) -> ModelLimits | None:
+        model = model or self.default_model
+        slug = _strip_model_prefix(model)
+        catalog = await self._get_models_catalog()
+        item = catalog.get(slug)
+        if not item:
+            return None
+
+        context_tokens = item.get("context_window")
+        max_output_tokens = None
+        for key in (
+            "max_output_tokens",
+            "max_completion_tokens",
+            "output_token_limit",
+            "completion_token_limit",
+        ):
+            value = item.get(key)
+            if isinstance(value, int) and value > 0:
+                max_output_tokens = value
+                break
+
+        return ModelLimits(
+            context_tokens=int(context_tokens) if isinstance(context_tokens, int) else None,
+            max_output_tokens=max_output_tokens,
+            metadata={
+                "client_version": self._client_version,
+                "slug": item.get("slug"),
+                "display_name": item.get("display_name"),
+                "truncation_policy": item.get("truncation_policy"),
+                "minimal_client_version": item.get("minimal_client_version"),
+            },
+        )
+
+    async def _get_models_catalog(self) -> dict[str, dict[str, Any]]:
+        now = time.time()
+        if self._models_cache and (now - self._models_cache_ts) < MODELS_CACHE_TTL_S:
+            return self._models_cache
+
+        async with self._models_lock:
+            now = time.time()
+            if self._models_cache and (now - self._models_cache_ts) < MODELS_CACHE_TTL_S:
+                return self._models_cache
+
+            client_version = await self._get_client_version()
+            token = await asyncio.to_thread(get_codex_token)
+            headers = _build_headers(token.account_id, token.access)
+            headers["accept"] = "application/json"
+            headers["User-Agent"] = f"codex-cli/{client_version}"
+            url = f"{DEFAULT_CODEX_MODELS_URL}?client_version={client_version}"
+
+            try:
+                async with httpx.AsyncClient(timeout=30.0, verify=True) as client:
+                    response = await client.get(url, headers=headers)
+                    response.raise_for_status()
+                    data = response.json()
+            except Exception:
+                if client_version != DEFAULT_CODEX_CLIENT_VERSION:
+                    logger.warning(
+                        "Codex model catalog lookup failed for client_version {}; retrying with {}",
+                        client_version,
+                        DEFAULT_CODEX_CLIENT_VERSION,
+                    )
+                    fallback_url = (
+                        f"{DEFAULT_CODEX_MODELS_URL}?client_version={DEFAULT_CODEX_CLIENT_VERSION}"
+                    )
+                    headers["User-Agent"] = f"codex-cli/{DEFAULT_CODEX_CLIENT_VERSION}"
+                    async with httpx.AsyncClient(timeout=30.0, verify=True) as client:
+                        response = await client.get(fallback_url, headers=headers)
+                        response.raise_for_status()
+                        data = response.json()
+                    self._client_version = DEFAULT_CODEX_CLIENT_VERSION
+                    self._client_version_ts = time.time()
+                else:
+                    raise
+
+            models = data.get("models", []) if isinstance(data, dict) else []
+            self._models_cache = {
+                m.get("slug"): m for m in models if isinstance(m, dict) and isinstance(m.get("slug"), str)
+            }
+            self._models_cache_ts = time.time()
+            return self._models_cache
+
+    async def _get_client_version(self) -> str:
+        now = time.time()
+        if self._client_version and (now - self._client_version_ts) < CLIENT_VERSION_TTL_S:
+            return self._client_version
+
+        async with self._client_version_lock:
+            now = time.time()
+            if self._client_version and (now - self._client_version_ts) < CLIENT_VERSION_TTL_S:
+                return self._client_version
+
+            version = DEFAULT_CODEX_CLIENT_VERSION
+            try:
+                async with httpx.AsyncClient(timeout=10.0, verify=True) as client:
+                    response = await client.get("https://registry.npmjs.org/@openai/codex/latest")
+                    response.raise_for_status()
+                    data = response.json()
+                candidate = data.get("version") if isinstance(data, dict) else None
+                if isinstance(candidate, str) and candidate.strip():
+                    version = candidate.strip()
+            except Exception:
+                logger.debug("Failed to fetch latest Codex client version; using {}", version)
+
+            self._client_version = version
+            self._client_version_ts = time.time()
+            return self._client_version
 
     def get_default_model(self) -> str:
         return self.default_model
@@ -112,7 +254,8 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
-) -> tuple[str, list[ToolCallRequest], str]:
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[ToolCallRequest], str, bool]:
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
@@ -120,7 +263,7 @@ async def _request_codex(
                 raise RuntimeError(
                     _friendly_error(response.status_code, text.decode("utf-8", "ignore"))
                 )
-            return await _consume_sse(response)
+            return await _consume_sse(response, on_text_delta=on_text_delta)
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -258,11 +401,15 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
         buffer.append(line)
 
 
-async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str]:
+async def _consume_sse(
+    response: httpx.Response,
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[ToolCallRequest], str, bool]:
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
     finish_reason = "stop"
+    streamed_content = False
 
     async for event in _iter_sse(response):
         event_type = event.get("type")
@@ -278,7 +425,13 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                     "arguments": item.get("arguments") or "",
                 }
         elif event_type == "response.output_text.delta":
-            content += event.get("delta") or ""
+            delta = event.get("delta") or ""
+            if not delta:
+                continue
+            content += delta
+            if on_text_delta:
+                await on_text_delta(delta)
+                streamed_content = True
         elif event_type == "response.function_call_arguments.delta":
             call_id = event.get("call_id")
             if call_id and call_id in tool_call_buffers:
@@ -312,7 +465,7 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
         elif event_type in {"error", "response.failed"}:
             raise RuntimeError("Codex response failed")
 
-    return content, tool_calls, finish_reason
+    return content, tool_calls, finish_reason, streamed_content
 
 
 _FINISH_REASON_MAP = {

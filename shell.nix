@@ -5,6 +5,8 @@ pkgs.mkShell {
     # Python 3.13
     python313
     python313Packages.pip
+    python313Packages.pytest
+    python313Packages.pytest-asyncio
 
     # Fast Python package manager
     uv

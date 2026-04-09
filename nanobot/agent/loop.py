@@ -92,6 +92,7 @@ class AgentLoop:
         self.context_tokens = max(4096, context_tokens)
         self.reserve_tokens_floor = max(0, reserve_tokens_floor)
         self.reasoning_effort = reasoning_effort
+        self._model_limit_cache: dict[str, dict[str, Any]] = {}
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
@@ -257,8 +258,46 @@ class AgentLoop:
             return None
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
 
-    @staticmethod
-    def _tool_hint(tool_calls: list) -> str:
+    _INVALID_TOOL_CALL_NAME = "invalid_tool_call"
+
+    @classmethod
+    def _normalize_tool_call_name(cls, name: Any) -> str:
+        """Return a safe printable tool name for malformed tool calls."""
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        return cls._INVALID_TOOL_CALL_NAME
+
+    @classmethod
+    def _messages_for_model(cls, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Strip synthetic malformed-tool placeholders before the next model call."""
+        cleaned: list[dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role")
+            if role == "tool" and msg.get("name") == cls._INVALID_TOOL_CALL_NAME:
+                continue
+            if role == "assistant" and msg.get("tool_calls"):
+                tool_calls = msg.get("tool_calls") or []
+                filtered_tool_calls = []
+                for tc in tool_calls:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    if fn.get("name") == cls._INVALID_TOOL_CALL_NAME:
+                        continue
+                    filtered_tool_calls.append(tc)
+                if len(filtered_tool_calls) != len(tool_calls):
+                    clean = dict(msg)
+                    if filtered_tool_calls:
+                        clean["tool_calls"] = filtered_tool_calls
+                    else:
+                        clean.pop("tool_calls", None)
+                        if not clean.get("content") and not clean.get("reasoning_content"):
+                            continue
+                    cleaned.append(clean)
+                    continue
+            cleaned.append(msg)
+        return cleaned
+
+    @classmethod
+    def _tool_hint(cls, tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
 
         # Keys likely to be the most informative arg for display
@@ -277,9 +316,10 @@ class AgentLoop:
         _SKIP_KEYS = ("action", "type", "group", "status")
 
         def _fmt(tc):
+            tc_name = cls._normalize_tool_call_name(getattr(tc, "name", None))
             args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
             if not isinstance(args, dict):
-                return tc.name
+                return tc_name
 
             # Pick the most descriptive string argument
             val = None
@@ -297,8 +337,8 @@ class AgentLoop:
                 val = next((v for v in args.values() if isinstance(v, str)), None)
 
             if not isinstance(val, str):
-                return tc.name
-            return f'{tc.name}("{val[:60]}…")' if len(val) > 60 else f'{tc.name}("{val}")'
+                return tc_name
+            return f'{tc_name}("{val[:60]}…")' if len(val) > 60 else f'{tc_name}("{val}")'
 
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
@@ -376,9 +416,41 @@ class AgentLoop:
         except Exception:
             return self._fallback_token_count(messages)
 
-    def _context_budget(self) -> int:
+    async def _refresh_model_limits(self, model: str) -> None:
+        """Fetch provider-reported limits for the active model when available."""
+        if not model:
+            return
+        if model in self._model_limit_cache:
+            return
+        try:
+            provider = self.get_provider_for_model(model)
+            getter = getattr(provider, "get_model_limits", None)
+            if not callable(getter):
+                self._model_limit_cache[model] = {}
+                return
+            limits = await getter(model)
+            if limits is None:
+                self._model_limit_cache[model] = {}
+                return
+            self._model_limit_cache[model] = {
+                "context_tokens": limits.context_tokens,
+                "max_output_tokens": limits.max_output_tokens,
+                "metadata": limits.metadata,
+            }
+        except Exception:
+            logger.exception("Failed to refresh model limits for {}", model)
+            self._model_limit_cache[model] = {}
+
+    def _effective_context_tokens(self, model: str | None = None) -> int:
+        cached = self._model_limit_cache.get(model or "", {})
+        value = cached.get("context_tokens") if isinstance(cached, dict) else None
+        if isinstance(value, int) and value > 0:
+            return max(4096, value)
+        return self.context_tokens
+
+    def _context_budget(self, model: str | None = None) -> int:
         """Maximum prompt tokens before compaction is required."""
-        return max(512, self.context_tokens - self.max_tokens - self.reserve_tokens_floor)
+        return max(512, self._effective_context_tokens(model) - self.reserve_tokens_floor)
 
     def _context_usage_breakdown(
         self, messages: list[dict[str, Any]], model: str
@@ -394,6 +466,77 @@ class AgentLoop:
         current = max(0, total - without_current)
         return {"system": system, "history": history, "current": current, "total": total}
 
+    def _should_background_compact(
+        self,
+        session: Session,
+        *,
+        channel: str,
+        chat_id: str,
+        model: str,
+    ) -> bool:
+        """Decide whether to proactively compact based on actual token usage."""
+        history = session.get_history(max_messages=max(self.memory_window, len(session.messages)))
+        if not history:
+            return False
+
+        probe = self.context.build_messages(
+            history=history,
+            current_message="",
+            channel=channel,
+            chat_id=chat_id,
+        )
+        usage = self._context_usage_breakdown(probe, model)
+        trigger_budget = max(512, int(self._context_budget(model) * 0.9))
+        should_compact = usage["total"] >= trigger_budget
+        if should_compact:
+            logger.info(
+                "Background compaction triggered by token usage for {}: total={} threshold={} history_messages={}",
+                session.key,
+                usage["total"],
+                trigger_budget,
+                len(history),
+            )
+        return should_compact
+
+    def _context_component_breakdown(
+        self,
+        history: list[dict[str, Any]],
+        current_message: str,
+        media: list[str] | None,
+        channel: str,
+        chat_id: str,
+        model: str,
+        relevant_memories: str | None = None,
+    ) -> dict[str, Any]:
+        """Estimate prompt token usage by major source category."""
+        preview = self.context.build_messages(
+            history=history,
+            current_message=current_message,
+            media=media if media else None,
+            channel=channel,
+            chat_id=chat_id,
+            relevant_memories=relevant_memories,
+        )
+        total = self._count_tokens(preview, model)
+        sections = self.context.build_system_prompt_sections()
+        system_prompt_tokens = self._count_tokens(
+            [{"role": "system", "content": sections.get("base", "")}], model
+        )
+        full_system_tokens = self._count_tokens(
+            [{"role": "system", "content": sections.get("full", "")}], model
+        )
+        skills_tokens = max(0, full_system_tokens - system_prompt_tokens)
+        tool_messages = [m for m in preview[1:-1] if m.get("role") == "tool"]
+        tool_output_tokens = self._count_tokens(tool_messages, model) if tool_messages else 0
+        messages_tokens = max(0, total - full_system_tokens - tool_output_tokens)
+        return {
+            "total": total,
+            "systemPrompt": system_prompt_tokens,
+            "skills": skills_tokens,
+            "toolOutputs": tool_output_tokens,
+            "messages": messages_tokens,
+        }
+
     def _trim_history_by_budget(
         self,
         history: list[dict[str, Any]],
@@ -406,7 +549,7 @@ class AgentLoop:
     ) -> list[dict[str, Any]]:
         """Trim oldest turns until prompt fits the token budget."""
         trimmed = list(history)
-        budget = self._context_budget()
+        budget = self._context_budget(model)
 
         while trimmed:
             candidate = self.context.build_messages(
@@ -425,6 +568,47 @@ class AgentLoop:
                 trimmed = trimmed[1:]
 
         return trimmed
+
+    def estimate_context_stats(
+        self,
+        session: Session,
+        *,
+        channel: str = "opencode",
+        chat_id: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Estimate current context usage for a session outside an active turn."""
+        active_model = model or session.metadata.get("model") or self.model
+        history = session.get_history(max_messages=max(self.memory_window, len(session.messages)))
+        preview = self.context.build_messages(
+            history=history,
+            current_message="",
+            channel=channel,
+            chat_id=chat_id or session.key,
+        )
+        final_usage = self._context_usage_breakdown(preview, active_model)
+        budget = self._context_budget(active_model)
+        return {
+            "model": active_model,
+            "budget": budget,
+            "contextTokens": self._effective_context_tokens(active_model),
+            "reserveTokensFloor": self.reserve_tokens_floor,
+            "initial": final_usage,
+            "final": final_usage,
+            "breakdown": self._context_component_breakdown(
+                history=history,
+                current_message="",
+                media=None,
+                channel=channel,
+                chat_id=chat_id or session.key,
+                model=active_model,
+                relevant_memories=None,
+            ),
+            "compactionPasses": 0,
+            "trimmedHistoryMessages": 0,
+            "withinBudget": final_usage["total"] <= budget,
+            "usagePercent": round((final_usage["total"] / budget) * 100, 2) if budget > 0 else 0.0,
+        }
 
     def get_last_context_stats(self, session_key: str) -> dict[str, Any] | None:
         """Get the most recent context usage stats for a session."""
@@ -610,6 +794,8 @@ class AgentLoop:
         temperature: float,
         max_tokens: int,
         reasoning_effort: str | None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple["LLMResponse", str, "LLMProvider"]:
         """Try primary model, then fallback models on failure.
 
@@ -627,6 +813,8 @@ class AgentLoop:
             temperature=temperature,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
+            on_text_delta=on_text_delta,
+            on_reasoning_delta=on_reasoning_delta,
         )
         if not response.is_error:
             return response, model, provider
@@ -653,6 +841,8 @@ class AgentLoop:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
+                on_text_delta=on_text_delta,
+                on_reasoning_delta=on_reasoning_delta,
             )
             if not fb_response.is_error:
                 logger.info("Fallback model {} succeeded", fb_model)
@@ -677,22 +867,38 @@ class AgentLoop:
         temperature: float,
         max_tokens: int,
         reasoning_effort: str | None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
     ):
         """Call provider.chat with exponential backoff for transient failures."""
         delay = self._LLM_RETRY_BASE_DELAY_S
         last_response = None
 
         for attempt in range(1, self._LLM_RETRY_MAX_ATTEMPTS + 1):
-            response = await provider.chat(
-                messages=messages,
-                tools=tools,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
-            )
+            if on_text_delta and provider.__class__.stream_chat is not LLMProvider.stream_chat:
+                response = await provider.stream_chat(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    on_text_delta=on_text_delta,
+                    on_reasoning_delta=on_reasoning_delta,
+                )
+            else:
+                response = await provider.chat(
+                    messages=messages,
+                    tools=tools,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
             last_response = response
             if not response.is_error or attempt >= self._LLM_RETRY_MAX_ATTEMPTS:
+                return response
+            if response.streamed_content:
                 return response
             if self._is_quota_error(response.content):
                 return response  # Quota errors won't recover with retries
@@ -736,13 +942,23 @@ class AgentLoop:
             iteration += 1
             prev_len = len(messages)  # track messages added this iteration for on_step
 
+            async def _on_text_delta(delta: str) -> None:
+                if on_progress:
+                    await on_progress(delta)
+
+            async def _on_reasoning_delta(delta: str) -> None:
+                if on_progress:
+                    await on_progress(delta, is_reasoning=True)
+
             response, active_model, active_provider = await self._chat_with_model_fallback(
-                messages=messages,
+                messages=self._messages_for_model(messages),
                 tools=self.tools.get_definitions(),
                 model=active_model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
+                on_text_delta=_on_text_delta if on_progress else None,
+                on_reasoning_delta=_on_reasoning_delta if on_progress else None,
             )
             if isinstance(response.usage, dict):
                 latest_usage = response.usage
@@ -753,16 +969,31 @@ class AgentLoop:
                 if parsed_markup_calls:
                     logger.warning(
                         "Provider returned pseudo-markup tool call(s); executing parsed calls: {}",
-                        ", ".join(tc.name for tc in parsed_markup_calls),
+                        ", ".join(self._normalize_tool_call_name(tc.name) for tc in parsed_markup_calls),
                     )
 
             effective_tool_calls = response.tool_calls or parsed_markup_calls
 
             if effective_tool_calls:
+                malformed_tool_calls = [
+                    tc for tc in effective_tool_calls
+                    if self._normalize_tool_call_name(tc.name) == self._INVALID_TOOL_CALL_NAME
+                ]
+                valid_tool_calls = [
+                    tc for tc in effective_tool_calls
+                    if self._normalize_tool_call_name(tc.name) != self._INVALID_TOOL_CALL_NAME
+                ]
+
                 # Safety: if the model emits the exact same tool-call batch
                 # repeatedly, stop early to avoid spinning forever.
                 batch_signature = json.dumps(
-                    [{"name": tc.name, "arguments": tc.arguments} for tc in effective_tool_calls],
+                    [
+                        {
+                            "name": self._normalize_tool_call_name(tc.name),
+                            "arguments": tc.arguments,
+                        }
+                        for tc in effective_tool_calls
+                    ],
                     ensure_ascii=False,
                     sort_keys=True,
                 )
@@ -772,7 +1003,7 @@ class AgentLoop:
                     repeated_tool_batch_count = 1
                     last_tool_batch_signature = batch_signature
 
-                max_repeats = 3 if session_key == "heartbeat" else 4
+                max_repeats = 1 if malformed_tool_calls and not valid_tool_calls else (3 if session_key == "heartbeat" else 4)
                 if repeated_tool_batch_count >= max_repeats:
                     logger.warning(
                         "Stopping tool loop after {} repeated identical tool-call batches (session={})",
@@ -789,16 +1020,25 @@ class AgentLoop:
                     clean = self._strip_think(response.content)
                     if parsed_markup_calls:
                         clean = None
-                    if clean:
+                    if clean and not response.streamed_content:
                         await on_progress(clean, is_reasoning=True)
                     await on_progress(self._tool_hint(effective_tool_calls), tool_hint=True)
+
+                if malformed_tool_calls:
+                    available_tools = ", ".join(self.tools.tool_names)
+                    retry_msg = (
+                        "Your last tool call was malformed because function.name was empty/null or invalid. "
+                        f"Retry immediately with a valid tool call using one of these exact tool names: {available_tools}. "
+                        "Do not call invalid_tool_call."
+                    )
+                    messages.append({"role": "user", "content": retry_msg})
 
                 tool_call_dicts = [
                     {
                         "id": tc.id,
                         "type": "function",
                         "function": {
-                            "name": tc.name,
+                            "name": self._normalize_tool_call_name(tc.name),
                             "arguments": json.dumps(tc.arguments, ensure_ascii=False),
                         },
                     }
@@ -819,17 +1059,18 @@ class AgentLoop:
 
                 async def _exec_one(tc: ToolCallRequest) -> tuple[ToolCallRequest, str]:
                     async with _sem:
+                        tc_name = self._normalize_tool_call_name(tc.name)
                         if on_progress:
                             await on_progress(
                                 "",
                                 tool_event={
                                     "type": "tool_start",
                                     "call_id": tc.id,
-                                    "name": tc.name,
+                                    "name": tc_name,
                                     "input": tc.arguments,
                                 },
                             )
-                        r = await self.tools.execute(tc.name, tc.arguments)
+                        r = await self.tools.execute(tc_name, tc.arguments)
                         return tc, r
 
                 async def _flush_parallel(
@@ -839,10 +1080,11 @@ class AgentLoop:
                         return msgs
                     results = await asyncio.gather(*[_exec_one(tc) for tc in batch])
                     for tc, result in results:
+                        tc_name = self._normalize_tool_call_name(tc.name)
                         tool_done_event: dict[str, Any] = {
                             "type": "tool_done",
                             "call_id": tc.id,
-                            "name": tc.name,
+                            "name": tc_name,
                             "input": tc.arguments,
                             "output": result[:500]
                             if isinstance(result, str)
@@ -850,23 +1092,23 @@ class AgentLoop:
                         }
                         if on_progress:
                             await on_progress("", tool_event=tool_done_event)
-                        msgs = self.context.add_tool_result(msgs, tc.id, tc.name, result)
+                        msgs = self.context.add_tool_result(msgs, tc.id, tc_name, result)
                     return msgs
 
                 for tool_call in effective_tool_calls:
-                    tools_used.append(tool_call.name)
+                    tool_name = self._normalize_tool_call_name(tool_call.name)
+                    tools_used.append(tool_name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                    logger.info("Tool call: {}({})", tool_name, args_str[:200])
 
                     # Permission check
                     needs_approval = (
                         require_approval
-                        and tool_call.name in require_approval
-                        and tool_call.name
-                        not in self._session_auto_approve.get(session_key or "", set())
+                        and tool_name in require_approval
+                        and tool_name not in self._session_auto_approve.get(session_key or "", set())
                     )
 
-                    tool_obj = self.tools.get(tool_call.name)
+                    tool_obj = self.tools.get(tool_name)
                     is_parallel_safe = (
                         tool_obj is not None and tool_obj.parallel_safe and not needs_approval
                     )
@@ -886,14 +1128,14 @@ class AgentLoop:
                                 tool_event={
                                     "type": "permission_asked",
                                     "call_id": tool_call.id,
-                                    "name": tool_call.name,
+                                    "name": tool_name,
                                     "input": tool_call.arguments,
                                 },
                             )
                         try:
                             reply = await asyncio.wait_for(
                                 self._permission_callback(
-                                    tool_call.name, tool_call.id, tool_call.arguments
+                                    tool_name, tool_call.id, tool_call.arguments
                                 ),
                                 timeout=300,
                             )
@@ -906,21 +1148,19 @@ class AgentLoop:
                                 tool_event={
                                     "type": "permission_replied",
                                     "call_id": tool_call.id,
-                                    "name": tool_call.name,
+                                    "name": tool_name,
                                     "reply": reply,
                                 },
                             )
 
                         if reply == "always" and session_key:
                             self._session_auto_approve.setdefault(session_key, set()).add(
-                                tool_call.name
+                                tool_name
                             )
                         if reply == "reject":
-                            result = (
-                                f"Error: Permission denied by user for tool '{tool_call.name}'."
-                            )
+                            result = f"Error: Permission denied by user for tool '{tool_name}'."
                             messages = self.context.add_tool_result(
-                                messages, tool_call.id, tool_call.name, result
+                                messages, tool_call.id, tool_name, result
                             )
                             continue
 
@@ -931,22 +1171,22 @@ class AgentLoop:
                             tool_event={
                                 "type": "tool_start",
                                 "call_id": tool_call.id,
-                                "name": tool_call.name,
+                                "name": tool_name,
                                 "input": tool_call.arguments,
                             },
                         )
 
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result = await self.tools.execute(tool_name, tool_call.arguments)
 
                     # Emit tool-done event (with diff metadata for file tools)
                     tool_done_event: dict[str, Any] = {
                         "type": "tool_done",
                         "call_id": tool_call.id,
-                        "name": tool_call.name,
+                        "name": tool_name,
                         "input": tool_call.arguments,
                         "output": result[:500] if isinstance(result, str) else str(result)[:500],
                     }
-                    if tool_call.name in ("write_file", "edit_file"):
+                    if tool_name in ("write_file", "edit_file"):
                         if tool_obj and hasattr(tool_obj, "last_diff") and tool_obj.last_diff:
                             tool_done_event["diff"] = tool_obj.last_diff
                             tool_obj.last_diff = None
@@ -954,7 +1194,7 @@ class AgentLoop:
                         await on_progress("", tool_event=tool_done_event)
 
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages, tool_call.id, tool_name, result
                     )
 
                 # Flush any remaining parallel batch
@@ -976,7 +1216,7 @@ class AgentLoop:
                 if on_progress:
                     if response.reasoning_content:
                         await on_progress(response.reasoning_content, is_reasoning=True)
-                    if clean:
+                    if clean and not response.streamed_content:
                         await on_progress(clean)
                 # Don't persist error responses to session history - they can
                 # poison the context and cause permanent 400 loops (#1303).
@@ -1169,6 +1409,7 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             active_model = model or self.model
+            await self._refresh_model_limits(active_model)
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
@@ -1206,6 +1447,7 @@ class AgentLoop:
 
         session = self.sessions.get_or_create(key)
         active_model = model or self.model
+        await self._refresh_model_limits(active_model)
 
         # Slash commands
         cmd = msg.content.strip().lower()
@@ -1227,15 +1469,23 @@ class AgentLoop:
                 session_key=key,
             )
 
-        unconsolidated = len(session.messages) - session.last_consolidated
-        if unconsolidated >= self.memory_window and session.key not in self._consolidating:
+        if (
+            session.key not in self._consolidating
+            and self._should_background_compact(
+                session,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                model=active_model,
+            )
+        ):
             self._consolidating.add(session.key)
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
 
             async def _consolidate_and_unlock():
                 try:
                     async with lock:
-                        await self._consolidate_memory(session)
+                        if await self._consolidate_memory(session, generate_summary=True):
+                            self.sessions.save(session)
                 finally:
                     self._consolidating.discard(session.key)
                     _task = asyncio.current_task()
@@ -1292,18 +1542,17 @@ class AgentLoop:
             usage = self._context_usage_breakdown(probe, active_model)
             if initial_usage is None:
                 initial_usage = usage
-            budget = self._context_budget()
+            budget = self._context_budget(active_model)
             logger.info(
-                "Context usage [{}]: total={} (system={}, history={}, current={}) / budget={} (ctx={}, reserve={}, max_out={})",
+                "Context usage [{}]: total={} (system={}, history={}, current={}) / budget={} (ctx={}, reserve={})",
                 active_model,
                 usage["total"],
                 usage["system"],
                 usage["history"],
                 usage["current"],
                 budget,
-                self.context_tokens,
+                self._effective_context_tokens(active_model),
                 self.reserve_tokens_floor,
-                self.max_tokens,
             )
 
             if usage["total"] <= budget:
@@ -1313,7 +1562,7 @@ class AgentLoop:
             self._consolidating.add(session.key)
             try:
                 async with lock:
-                    if not await self._consolidate_memory(session):
+                    if not await self._consolidate_memory(session, generate_summary=True):
                         break
                     self.sessions.save(session)
                     history = session.get_history(max_messages=self.memory_window)
@@ -1330,7 +1579,7 @@ class AgentLoop:
             chat_id=msg.chat_id,
             relevant_memories=relevant_memories,
         )
-        if self._count_tokens(preview, active_model) > self._context_budget() and history:
+        if self._count_tokens(preview, active_model) > self._context_budget(active_model) and history:
             before_trim = len(history)
             history = self._trim_history_by_budget(
                 history,
@@ -1352,15 +1601,23 @@ class AgentLoop:
             relevant_memories=relevant_memories,
         )
         final_usage = self._context_usage_breakdown(final_preview, active_model)
-        budget = self._context_budget()
+        budget = self._context_budget(active_model)
         self._last_context_stats[key] = {
             "model": active_model,
             "budget": budget,
-            "contextTokens": self.context_tokens,
+            "contextTokens": self._effective_context_tokens(active_model),
             "reserveTokensFloor": self.reserve_tokens_floor,
-            "maxOutputTokens": self.max_tokens,
             "initial": initial_usage or final_usage,
             "final": final_usage,
+            "breakdown": self._context_component_breakdown(
+                history=history,
+                current_message=msg.content,
+                media=msg.media,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                model=active_model,
+                relevant_memories=relevant_memories,
+            ),
             "compactionPasses": compaction_passes,
             "trimmedHistoryMessages": trimmed_history_messages,
             "withinBudget": final_usage["total"] <= budget,
@@ -1437,6 +1694,10 @@ class AgentLoop:
                 "" if is_heartbeat else "I've completed processing but have no response to give."
             )
 
+        # Heartbeat silent-completion sentinel — model included NO_RESPONSE
+        if is_heartbeat and "NO_RESPONSE" in final_content:
+            final_content = ""
+
         self._save_turn(session, all_msgs, 1 + len(history), usage=usage, model=active_model)
         self.sessions.save(session)
         self._last_llm_usage[key] = usage
@@ -1449,6 +1710,9 @@ class AgentLoop:
                 asyncio.create_task(self._subconscious.nudge_review(snapshot))
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+            return None
+
+        if is_heartbeat and not final_content.strip():
             return None
 
         compact_out = final_content.replace("\n", "\\n").replace("\t", "\\t")
@@ -1607,6 +1871,7 @@ class AgentLoop:
                 len(old_messages),
                 keep_count,
             )
+            self._subconscious._emit("consolidation", {"messages": len(old_messages), "kept": keep_count})
 
             # 1) Prune tool output before extraction/summarization
             pruned_messages = []
@@ -1734,6 +1999,16 @@ Important details that must not be lost"""
                 kept = keep_count + (1 if summary else 0)
                 session.last_consolidated = len(session.messages) - kept
 
+            compaction_meta = session.metadata.get("compaction")
+            if not isinstance(compaction_meta, dict):
+                compaction_meta = {}
+            compaction_meta["count"] = self._to_int(compaction_meta.get("count")) + 1
+            compaction_meta["last_compacted_at"] = datetime.now().isoformat()
+            compaction_meta["last_compacted_messages"] = len(old_messages)
+            compaction_meta["last_keep_count"] = keep_count
+            compaction_meta["last_had_summary"] = bool(summary)
+            session.metadata["compaction"] = compaction_meta
+
             return summary if summary else True
 
         # Legacy fallback
@@ -1785,7 +2060,7 @@ Important details that must not be lost"""
         model: str | None = None,
         system_prompt: str | None = None,
     ) -> str:
-        """Process a message directly (for CLI or cron usage)."""
+        """Process a user message directly (for CLI/opencode usage)."""
         await self._connect_mcp()
         if self._subconscious and not self._subconscious._qmd.available:
             await self._subconscious.initialize()
@@ -1798,3 +2073,47 @@ Important details that must not be lost"""
             system_prompt=system_prompt,
         )
         return response.content if response else ""
+
+    async def process_system_direct(
+        self,
+        content: str,
+        session_key: str = "main",
+        channel: str = "cli",
+        chat_id: str = "direct",
+        model: str | None = None,
+        system_prompt: str | None = None,
+    ) -> str:
+        """Process an internal system message inside an existing session."""
+        await self._connect_mcp()
+        if self._subconscious and not self._subconscious._qmd.available:
+            await self._subconscious.initialize()
+
+        session = self.sessions.get_or_create(session_key)
+        active_model = model or self.model
+        await self._refresh_model_limits(active_model)
+
+        self._set_tool_context(channel, chat_id, None)
+        history = session.get_history(max_messages=self.memory_window)
+        stamped_history = self.context._stamp_history(history)
+        initial_messages = [
+            {"role": "system", "content": self.context.build_system_prompt()},
+            *stamped_history,
+            {"role": "system", "content": content},
+        ]
+        if system_prompt:
+            initial_messages[0] = {"role": "system", "content": system_prompt}
+
+        final_content, _, all_msgs, usage = await self._run_agent_loop(
+            initial_messages,
+            model=active_model,
+        )
+        self._save_turn(
+            session,
+            all_msgs,
+            1 + len(stamped_history),
+            usage=usage,
+            model=active_model,
+        )
+        self.sessions.save(session)
+        self._last_llm_usage[session_key] = usage
+        return final_content or ""

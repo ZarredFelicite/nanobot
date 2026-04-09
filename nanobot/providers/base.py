@@ -1,8 +1,18 @@
 """Base LLM provider interface."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+
+@dataclass
+class ModelLimits:
+    """Provider-reported model limits/capabilities."""
+
+    context_tokens: int | None = None
+    max_output_tokens: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -22,6 +32,7 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
+    streamed_content: bool = False
     
     @property
     def has_tool_calls(self) -> bool:
@@ -116,6 +127,40 @@ class LLMProvider(ABC):
             LLMResponse with content and/or tool calls.
         """
         pass
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        """Optional streaming variant of chat().
+
+        Providers that support incremental text deltas can override this.
+        The default implementation falls back to chat() and emits the full
+        content as a single callback.
+        """
+        response = await self.chat(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+        )
+        if on_text_delta and response.content:
+            await on_text_delta(response.content)
+            response.streamed_content = True
+        return response
+
+    async def get_model_limits(self, model: str | None = None) -> ModelLimits | None:
+        """Optional provider-specific model limit lookup."""
+        return None
 
     @abstractmethod
     def get_default_model(self) -> str:

@@ -7,7 +7,7 @@ import pytest
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMResponse
+from nanobot.providers.base import LLMProvider, LLMResponse
 
 
 def _make_loop(provider: MagicMock) -> AgentLoop:
@@ -77,3 +77,66 @@ async def test_chat_with_retry_does_not_retry_non_transient_error() -> None:
     assert response.is_error is True
     assert provider.chat.await_count == 1
     sleep_mock.assert_not_awaited()
+
+
+class _StreamingProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__(api_key=None, api_base=None)
+        self.chat_called = False
+
+    async def chat(
+        self,
+        messages,
+        tools=None,
+        model=None,
+        max_tokens=4096,
+        temperature=0.7,
+        reasoning_effort=None,
+    ) -> LLMResponse:
+        self.chat_called = True
+        return LLMResponse(content="fallback", finish_reason="stop")
+
+    async def stream_chat(
+        self,
+        messages,
+        tools=None,
+        model=None,
+        max_tokens=4096,
+        temperature=0.7,
+        reasoning_effort=None,
+        on_text_delta=None,
+        on_reasoning_delta=None,
+    ) -> LLMResponse:
+        if on_text_delta:
+            await on_text_delta("hel")
+            await on_text_delta("lo")
+        return LLMResponse(content="hello", finish_reason="stop", streamed_content=True)
+
+    def get_default_model(self) -> str:
+        return "test-model"
+
+
+@pytest.mark.asyncio
+async def test_chat_with_retry_uses_provider_stream_chat_for_incremental_deltas() -> None:
+    provider = _StreamingProvider()
+    loop = _make_loop(MagicMock())
+    seen: list[str] = []
+
+    async def _on_text_delta(delta: str) -> None:
+        seen.append(delta)
+
+    response = await loop._chat_with_retry(
+        provider,
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        model="test-model",
+        temperature=0.1,
+        max_tokens=128,
+        reasoning_effort=None,
+        on_text_delta=_on_text_delta,
+    )
+
+    assert response.content == "hello"
+    assert response.streamed_content is True
+    assert seen == ["hel", "lo"]
+    assert provider.chat_called is False

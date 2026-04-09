@@ -22,34 +22,52 @@ class ContextBuilder:
         self.workspace = workspace
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(
+    def build_system_prompt_sections(
         self,
         skill_names: list[str] | None = None,
         exclude_bootstrap: list[str] | None = None,
-    ) -> str:
-        """Build the system prompt from identity, bootstrap files, and skills."""
-        parts = [self._get_identity()]
+    ) -> dict[str, str]:
+        """Build system prompt sections for richer token accounting/UI."""
+        base_parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files(exclude=exclude_bootstrap)
         if bootstrap:
-            parts.append(bootstrap)
+            base_parts.append(bootstrap)
 
+        skill_parts: list[str] = []
         always_skills = self.skills.get_always_skills()
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+                skill_parts.append(f"# Active Skills\n\n{always_content}")
 
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
-            parts.append(f"""# Skills
+            skill_parts.append(f"""# Skills
 
 The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
 {skills_summary}""")
 
-        return "\n\n---\n\n".join(parts)
+        base = "\n\n---\n\n".join(base_parts)
+        skills = "\n\n---\n\n".join(skill_parts)
+        full_parts = list(base_parts)
+        if skills:
+            full_parts.append(skills)
+        full = "\n\n---\n\n".join(full_parts)
+        return {"base": base, "skills": skills, "full": full}
+
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        exclude_bootstrap: list[str] | None = None,
+    ) -> str:
+        """Build the system prompt from identity, bootstrap files, and skills."""
+        return self.build_system_prompt_sections(
+            skill_names=skill_names,
+            exclude_bootstrap=exclude_bootstrap,
+        )["full"]
 
     def _get_identity(self) -> str:
         """Get the core identity section."""
