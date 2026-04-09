@@ -1,6 +1,11 @@
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
-from nanobot.session.manager import Session
+from nanobot.session.manager import Session, SessionManager
 
 
 def _mk_loop() -> AgentLoop:
@@ -68,3 +73,42 @@ def test_save_turn_persists_usage_on_final_assistant_message() -> None:
 
     assert session.messages[-1].get("usage", {}).get("completion_tokens") == 42
     assert session.messages[-1].get("model") == "openai-codex/gpt-5.3-codex"
+
+
+@pytest.mark.asyncio
+async def test_process_system_direct_persists_into_target_session(tmp_path: Path) -> None:
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._TOOL_RESULT_MAX_CHARS = 500
+    loop._subconscious = None
+    loop.sessions = SessionManager(tmp_path)
+    loop.context = ContextBuilder(tmp_path)
+    loop.model = "openai-codex/gpt-5.4"
+    loop.memory_window = 20
+    loop._last_llm_usage = {}
+    loop._connect_mcp = AsyncMock()
+    loop._refresh_model_limits = AsyncMock()
+    loop._set_tool_context = lambda *args, **kwargs: None
+
+    async def fake_run_agent_loop(messages, model=None):
+        return (
+            "Reminder delivered.",
+            None,
+            [*messages, {"role": "assistant", "content": "Reminder delivered."}],
+            {"prompt_tokens": 10, "completion_tokens": 3},
+        )
+
+    loop._run_agent_loop = fake_run_agent_loop
+
+    response = await loop.process_system_direct(
+        "[Scheduled Task] Timer finished.",
+        session_key="main",
+        channel="telegram",
+        chat_id="owner",
+    )
+
+    assert response == "Reminder delivered."
+    session = loop.sessions.get_or_create("main")
+    assert [m["role"] for m in session.messages] == ["system", "assistant"]
+    assert session.messages[0]["content"] == "[Scheduled Task] Timer finished."
+    assert session.messages[1]["content"] == "Reminder delivered."
+    assert loop._last_llm_usage["main"]["completion_tokens"] == 3

@@ -1,18 +1,20 @@
 <script lang="ts">
-  import type { SessionInfo, SessionStatus } from '$lib/types';
+  import type { SessionInfo, SessionStatus, SubconsciousEvent } from '$lib/types';
   import { relativeTimestamp } from '$lib/utils';
+  import SubconsciousPanel from './SubconsciousPanel.svelte';
 
   interface Props {
     sessions: SessionInfo[];
     activeSessionId: string;
     statuses: Record<string, SessionStatus['status']>;
     creating: boolean;
+    subconsciousEvents: SubconsciousEvent[];
     onCreate: () => void;
     onSelect: (sessionId: string) => void;
     onDelete?: (sessionId: string) => void;
   }
 
-  let { sessions, activeSessionId, statuses, creating, onCreate, onSelect, onDelete }: Props = $props();
+  let { sessions, activeSessionId, statuses, creating, subconsciousEvents, onCreate, onSelect, onDelete }: Props = $props();
 
   let searchQuery = $state('');
 
@@ -103,6 +105,8 @@
       {/each}
     {/if}
   </div>
+
+  <SubconsciousPanel events={subconsciousEvents} />
 </nav>
 
 <style>

@@ -392,9 +392,9 @@ def gateway(
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
-            response = await agent.process_direct(
+            response = await agent.process_system_direct(
                 reminder_note,
-                session_key=f"cron:{job.id}",
+                session_key=_resolve_main_session_key(),
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
             )

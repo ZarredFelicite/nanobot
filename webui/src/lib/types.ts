@@ -80,6 +80,14 @@ export interface MessageWithParts {
   parts: MessagePart[];
 }
 
+export interface ContextBreakdown {
+  total: number;
+  systemPrompt: number;
+  skills: number;
+  toolOutputs: number;
+  messages: number;
+}
+
 export interface SessionStatus {
   sessionID: string;
   status: {
@@ -90,11 +98,16 @@ export interface SessionStatus {
       withinBudget?: boolean;
       contextTokens?: number;
       final?: { total: number };
+      breakdown?: ContextBreakdown;
       model?: string;
       tokens?: { used: number; remaining: number };
       mode?: string;
       compactionPasses?: number;
       trimmedHistoryMessages?: number;
+      hasCompacted?: boolean;
+      totalCompactions?: number;
+      lastCompactedAt?: string;
+      lastCompactedMessages?: number;
     };
   };
 }
@@ -115,6 +128,25 @@ export interface ApiError {
   error: string;
 }
 
+export interface SlashCommandInfo {
+  name: string;
+  description: string;
+  source: string;
+  template: string;
+  hints: string[];
+}
+
+export interface SubconsciousEvent {
+  action: 'extraction' | 'nudge' | 'recall' | 'classifier' | 'consolidation';
+  ts: number;
+  sessionID?: string;
+  names?: string[];
+  results?: number;
+  inject?: boolean;
+  messages?: number;
+  kept?: number;
+}
+
 export type SseEvent =
   | { type: 'server.connected'; properties: Record<string, never> }
   | { type: 'server.heartbeat'; properties: Record<string, never> }
@@ -129,4 +161,5 @@ export type SseEvent =
       };
     }
   | { type: 'message.updated'; properties: { info: MessageInfo } }
-  | { type: 'message.part.updated'; properties: { part: MessagePart; delta?: string } };
+  | { type: 'message.part.updated'; properties: { part: MessagePart; delta?: string } }
+  | { type: 'subconscious.event'; properties: SubconsciousEvent };

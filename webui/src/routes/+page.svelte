@@ -6,8 +6,8 @@
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import SessionSidebar from '$lib/components/SessionSidebar.svelte';
   import LogViewer from '$lib/components/LogViewer.svelte';
-  import { abortSession, createSession, deleteSession, getMessages, getProviders, getStatuses, listSessions, patchSession, sendMessage } from '$lib/api';
-  import type { MessageInfo, MessagePart, MessageWithParts, ProviderInfo, SessionInfo, SessionStatus, SseEvent } from '$lib/types';
+  import { abortSession, createSession, deleteSession, executeCommand, getCommands, getMessages, getProviders, getStatuses, getSubconsciousEvents, listSessions, patchSession, sendMessage } from '$lib/api';
+  import type { MessageInfo, MessagePart, MessageWithParts, ProviderInfo, SessionInfo, SessionStatus, SlashCommandInfo, SseEvent, SubconsciousEvent } from '$lib/types';
 
   let sessions = $state<SessionInfo[]>([]);
   let statuses = $state<Record<string, SessionStatus['status']>>({});
@@ -27,6 +27,9 @@
   let editingTitle = $state(false);
   let titleDraft = $state('');
   let logsOpen = $state(false);
+  let subconsciousEvents = $state<SubconsciousEvent[]>([]);
+  let commands = $state<SlashCommandInfo[]>([]);
+  let selectedCommandIndex = $state(0);
 
   let stream: EventSource | null = null;
   let chatLogEl: HTMLElement | undefined = $state();
@@ -47,6 +50,25 @@
     selectedSessionId ? statuses[selectedSessionId]?.context : null
   );
 
+  const slashState = $derived.by(() => {
+    const raw = draft;
+    if (!raw.startsWith('/')) {
+      return { active: false, query: '', args: '', suggestions: [] as SlashCommandInfo[] };
+    }
+
+    const trimmedStart = raw.slice(1);
+    const firstSpace = trimmedStart.indexOf(' ');
+    const query = (firstSpace >= 0 ? trimmedStart.slice(0, firstSpace) : trimmedStart).trim();
+    const args = firstSpace >= 0 ? trimmedStart.slice(firstSpace + 1) : '';
+    const normalizedQuery = query.toLowerCase();
+    const suggestions = commands.filter((command) => {
+      if (!normalizedQuery) return true;
+      return command.name.toLowerCase().startsWith(normalizedQuery);
+    });
+
+    return { active: true, query, args, suggestions };
+  });
+
   onMount(() => {
     void boot();
     connectStream();
@@ -55,6 +77,20 @@
       stream?.close();
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
+  });
+
+  $effect(() => {
+    const count = slashState.suggestions.length;
+    if (count === 0) {
+      selectedCommandIndex = 0;
+      return;
+    }
+    if (selectedCommandIndex >= count) {
+      selectedCommandIndex = count - 1;
+    }
+    if (selectedCommandIndex < 0) {
+      selectedCommandIndex = 0;
+    }
   });
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
@@ -93,10 +129,11 @@
       sessionsLoading = true;
       error = '';
 
-      const [sessionList, statusList, providerList] = await Promise.all([
+      const [sessionList, statusList, providerList, commandList] = await Promise.all([
         listSessions(),
         getStatuses(),
         getProviders(),
+        getCommands(),
       ]);
       sessions = sortSessions(sessionList);
       statuses = Object.fromEntries(
@@ -115,6 +152,8 @@
         }
       }
       availableModels = models;
+      commands = withBuiltinCommands(commandList);
+      selectedCommandIndex = 0;
       if (models.length > 0 && !selectedModel) {
         selectedModel = models[0].label;
       }
@@ -134,6 +173,26 @@
     } finally {
       sessionsLoading = false;
     }
+  }
+
+  function withBuiltinCommands(commandList: SlashCommandInfo[]): SlashCommandInfo[] {
+    const builtins: SlashCommandInfo[] = [
+      {
+        name: 'new',
+        description: 'Create a new session',
+        source: 'builtin',
+        template: '/new',
+        hints: []
+      }
+    ];
+
+    const merged = [...commandList];
+    for (const builtin of builtins) {
+      if (!merged.some((command) => command.name === builtin.name)) {
+        merged.push(builtin);
+      }
+    }
+    return merged;
   }
 
   function connectStream(): void {
@@ -191,6 +250,11 @@
     }
 
     await loadMessages(sessionId);
+    try {
+      subconsciousEvents = await getSubconsciousEvents(sessionId);
+    } catch {
+      subconsciousEvents = [];
+    }
   }
 
   async function loadMessages(sessionId: string): Promise<void> {
@@ -208,22 +272,67 @@
   }
 
   async function handleSend(): Promise<void> {
-    const text = draft.trim();
+    const rawText = draft;
+    const text = rawText.trim();
     if (!text || !selectedSessionId || sending) return;
 
     try {
       sending = true;
       error = '';
       draft = '';
-      await sendMessage(selectedSessionId, text, selectedModel || undefined);
+
+      if (text.startsWith('/')) {
+        const commandText = text.slice(1).trim();
+        const firstSpace = commandText.indexOf(' ');
+        const commandName = (firstSpace >= 0 ? commandText.slice(0, firstSpace) : commandText).trim();
+        const argumentsText = firstSpace >= 0 ? commandText.slice(firstSpace + 1).trim() : '';
+
+        if (commandName === 'new') {
+          await handleCreateSession();
+        } else {
+          await executeCommand(
+            selectedSessionId,
+            commandName,
+            argumentsText,
+            selectedModel || undefined
+          );
+        }
+      } else {
+        await sendMessage(selectedSessionId, text, selectedModel || undefined);
+      }
+
       await tick();
       scrollToBottom();
     } catch (err) {
-      draft = text;
-      error = toErrorMessage(err, 'Failed to send message');
+      draft = rawText;
+      error = toErrorMessage(err, text.startsWith('/') ? 'Failed to run command' : 'Failed to send message');
     } finally {
       sending = false;
     }
+  }
+
+  function applyCommandSuggestion(command: SlashCommandInfo): void {
+    const raw = draft;
+    const firstSpace = raw.indexOf(' ');
+    const suffix = firstSpace >= 0 ? raw.slice(firstSpace) : ' ';
+    draft = `/${command.name}${suffix}`;
+  }
+
+  function handleCommandSelection(index: number): void {
+    const command = slashState.suggestions[index];
+    if (!command) return;
+    selectedCommandIndex = index;
+    applyCommandSuggestion(command);
+  }
+
+  function handleCommandHighlight(index: number): void {
+    selectedCommandIndex = index;
+  }
+
+  function handleCommandCycle(direction: 1 | -1): void {
+    const count = slashState.suggestions.length;
+    if (count === 0) return;
+    selectedCommandIndex = (selectedCommandIndex + direction + count) % count;
   }
 
   async function handleDeleteSession(sessionId: string): Promise<void> {
@@ -314,6 +423,16 @@
       if (event.properties.part.sessionID !== selectedSessionId) return;
       upsertPart(event.properties.part);
       autoScroll();
+      return;
+    }
+
+    if (event.type === 'subconscious.event') {
+      const evt = event.properties as SubconsciousEvent & { sessionID?: string };
+      if (evt.sessionID && evt.sessionID !== selectedSessionId) return;
+      subconsciousEvents = [...subconsciousEvents, evt];
+      if (subconsciousEvents.length > 100) {
+        subconsciousEvents = subconsciousEvents.slice(-100);
+      }
     }
   }
 
@@ -409,6 +528,7 @@
 
   function updateDraft(value: string): void {
     draft = value;
+    selectedCommandIndex = 0;
   }
 
   function scrollToBottom(): void {
@@ -450,6 +570,7 @@
       activeSessionId={selectedSessionId}
       {statuses}
       {creating}
+      {subconsciousEvents}
       onCreate={handleCreateSession}
       onSelect={(id) => selectSession(id)}
       onDelete={handleDeleteSession}
@@ -526,25 +647,6 @@
           </button>
         </div>
       </div>
-      {#if contextInfo?.usagePercent != null}
-        <div class="token-row">
-          <div
-            class="token-bar"
-            title="{Math.round(contextInfo.usagePercent)}% context used"
-          >
-            <div
-              class="token-bar-fill"
-              class:over-budget={!contextInfo.withinBudget}
-              style="width: {Math.min(contextInfo.usagePercent, 100)}%"
-            ></div>
-          </div>
-          {#if contextInfo.compactionPasses && contextInfo.compactionPasses > 0}
-            <span class="compaction-tag" title="Context was compacted to fit budget">
-              compacted
-            </span>
-          {/if}
-        </div>
-      {/if}
     </div>
 
     {#if error}
@@ -603,10 +705,17 @@
           disabled={!selectedSessionId || sending}
           models={availableModels}
           {selectedModel}
+          contextInfo={contextInfo}
+          slashActive={slashState.active}
+          slashSuggestions={slashState.suggestions}
+          selectedSlashIndex={selectedCommandIndex}
           onInput={updateDraft}
           onSend={handleSend}
           onModelChange={handleModelChange}
           onAbort={isBusy ? handleAbort : undefined}
+          onSelectSlash={handleCommandSelection}
+          onHighlightSlash={handleCommandHighlight}
+          onCycleSlash={handleCommandCycle}
         />
       </div>
     {/if}
@@ -940,42 +1049,6 @@
     border-radius: 50%;
     background: #fbbf24;
     animation: pulse-anim 1.4s ease-in-out infinite;
-  }
-
-  .token-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin-top: 0.5rem;
-  }
-
-  .token-bar {
-    flex: 1;
-    height: 3px;
-    background: var(--surface);
-    border-radius: 1.5px;
-    overflow: hidden;
-  }
-
-  .token-bar-fill {
-    height: 100%;
-    background: var(--accent);
-    border-radius: 1.5px;
-    transition: width 300ms ease;
-  }
-
-  .token-bar-fill.over-budget {
-    background: var(--danger);
-  }
-
-  .compaction-tag {
-    flex-shrink: 0;
-    font-size: 0.6rem;
-    font-weight: 500;
-    color: #fbbf24;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    opacity: 0.8;
   }
 
   @media (max-width: 768px) {

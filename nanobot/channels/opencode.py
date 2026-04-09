@@ -240,6 +240,7 @@ class OpenCodeChannel(BaseChannel):
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._sse_write_timeout_s = 2.0
+        self._active_session_id: str = ""
 
         # Log streaming
         self._log_clients: list[web.StreamResponse] = []
@@ -456,6 +457,61 @@ class OpenCodeChannel(BaseChannel):
     def _new_live_ids(self, session_id: str) -> tuple[str, str]:
         return (self._next_id(f"msg_{session_id}"), self._next_id(f"part_{session_id}"))
 
+    async def _broadcast_compact_entries(
+        self, session: Session, session_id: str, entries: list[dict[str, Any]]
+    ) -> None:
+        if not entries:
+            return
+
+        model_name = self._session_model(session, None)
+        provider_name, model_id = self._split_model(model_name)
+
+        for entry in entries:
+            text = entry.get("content")
+            if not isinstance(text, str) or not text.strip():
+                continue
+
+            ts = entry.get("timestamp")
+            created_ms = self._epoch_ms(time.time())
+            if isinstance(ts, str):
+                try:
+                    created_ms = self._epoch_ms(datetime.fromisoformat(ts).timestamp())
+                except ValueError:
+                    pass
+
+            msg_id, part_id = self._new_live_ids(session_id)
+            note_msg = {
+                "id": msg_id,
+                "sessionID": session_id,
+                "role": "assistant",
+                "time": {"created": created_ms, "completed": created_ms},
+                "modelID": model_id,
+                "providerID": provider_name,
+                "mode": "compact",
+                "agent": "default",
+                "path": {
+                    "cwd": str(self.agent_loop.workspace),
+                    "root": str(self.agent_loop.workspace),
+                },
+                "cost": 0,
+                "tokens": {
+                    "input": 0,
+                    "output": 0,
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0},
+                },
+            }
+            note_part = {
+                "id": part_id,
+                "sessionID": session_id,
+                "messageID": msg_id,
+                "type": "text",
+                "text": text,
+                "time": {"created": created_ms},
+            }
+            await self._broadcast_sse("message.updated", {"info": note_msg})
+            await self._broadcast_sse("message.part.updated", {"part": note_part})
+
     def _session_exists(self, key: str) -> bool:
         if not self.session_manager:
             return False
@@ -621,6 +677,9 @@ class OpenCodeChannel(BaseChannel):
             self.agent_loop._permission_callback = self._permission_callback
             if self.permission_config:
                 self.agent_loop._require_approval = list(self.permission_config.require_approval)
+            # Wire subconscious event callback for UI
+            if self.agent_loop._subconscious:
+                self.agent_loop._subconscious._on_event = self._on_subconscious_event
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -720,6 +779,7 @@ class OpenCodeChannel(BaseChannel):
         app.router.add_post("/session/{id}/fork", self._handle_session_fork)
         app.router.add_post("/session/{id}/command", self._handle_session_command)
         app.router.add_post("/session/{id}/summarize", self._handle_session_summarize)
+        app.router.add_get("/session/{id}/subconscious", self._handle_session_subconscious)
         app.router.add_get("/session/{id}/children", self._handle_stub_list)
         app.router.add_get("/session/{id}/todo", self._handle_stub_list)
         app.router.add_get("/session/{id}/diff", self._handle_stub_list)
@@ -803,10 +863,15 @@ class OpenCodeChannel(BaseChannel):
             target = target / "index.html"
 
         if target.exists() and target.is_file():
-            return web.FileResponse(target)
+            resp = web.FileResponse(target)
+            if target.name == "index.html":
+                resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            return resp
 
         if not target.suffix:
-            return web.FileResponse(web_root / "index.html")
+            resp = web.FileResponse(web_root / "index.html")
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            return resp
 
         raise web.HTTPNotFound()
 
@@ -935,6 +1000,37 @@ class OpenCodeChannel(BaseChannel):
                 if client in self._sse_clients:
                     self._sse_clients.remove(client)
 
+    def _subconscious_events_path(self, session_id: str) -> Path:
+        """JSONL file for persisted subconscious events."""
+        if self.session_manager:
+            safe_key = session_id.replace(":", "_")
+            return self.session_manager.sessions_dir / f"{safe_key}.subconscious.jsonl"
+        workspace = self.agent_loop.workspace if self.agent_loop else Path.home() / ".nanobot"
+        return workspace / "sessions" / f"{session_id}.subconscious.jsonl"
+
+    def _persist_subconscious_event(self, session_id: str, detail: dict) -> None:
+        """Append a subconscious event to the session's JSONL file."""
+        if not session_id:
+            return
+        try:
+            path = self._subconscious_events_path(session_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as f:
+                f.write(json.dumps(detail) + "\n")
+        except Exception:
+            pass
+
+    def _on_subconscious_event(self, action: str, detail: dict) -> None:
+        """Callback from SubconsciousService — broadcast + persist."""
+        sid = self._active_session_id
+        if sid:
+            detail["sessionID"] = sid
+        self._persist_subconscious_event(sid, detail)
+        try:
+            asyncio.ensure_future(self._broadcast_sse("subconscious.event", detail))
+        except RuntimeError:
+            pass  # No event loop
+
     # ------------------------------------------------------------------
     # Session endpoints
     # ------------------------------------------------------------------
@@ -1034,7 +1130,44 @@ class OpenCodeChannel(BaseChannel):
         session_id = request.query.get("sessionID") or request.query.get("id")
 
         def _status_payload(sid: str) -> dict[str, Any]:
-            context = self._last_context_by_session.get(sid, {})
+            context = dict(self._last_context_by_session.get(sid, {}))
+
+            def _as_int(value: Any, default: int = 0) -> int:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return default
+
+            session, _key = self._find_session(sid)
+            if session:
+                if not context:
+                    usage = session.metadata.get("context_usage")
+                    if isinstance(usage, dict):
+                        last = usage.get("last")
+                        if isinstance(last, dict):
+                            context.update(last)
+                if self.agent_loop and "breakdown" not in context:
+                    try:
+                        estimated = self.agent_loop.estimate_context_stats(
+                            session,
+                            channel="opencode",
+                            chat_id=sid,
+                            model=session.metadata.get("model") if isinstance(session.metadata, dict) else None,
+                        )
+                        context.update(estimated)
+                    except Exception:
+                        logger.exception("Failed to estimate context stats for {}", sid)
+                compaction = session.metadata.get("compaction")
+                if isinstance(compaction, dict):
+                    context["hasCompacted"] = _as_int(compaction.get("count")) > 0
+                    context["totalCompactions"] = _as_int(compaction.get("count"))
+                    context["lastCompactedAt"] = compaction.get("last_compacted_at")
+                    context["lastCompactedMessages"] = _as_int(
+                        compaction.get("last_compacted_messages")
+                    )
+                    context["lastCompactionHadSummary"] = bool(
+                        compaction.get("last_had_summary")
+                    )
             return {
                 "sessionID": sid,
                 "status": {"type": "idle", "context": context},
@@ -1079,6 +1212,21 @@ class OpenCodeChannel(BaseChannel):
         return web.json_response(info)
 
     # ------------------------------------------------------------------
+    async def _handle_session_subconscious(self, request: web.Request) -> web.Response:
+        """Return persisted subconscious events for a session."""
+        session_id = request.match_info["id"]
+        path = self._subconscious_events_path(session_id)
+        events: list[dict] = []
+        if path.exists():
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        return web.json_response(events)
+
     # Message endpoints
     # ------------------------------------------------------------------
 
@@ -1110,6 +1258,7 @@ class OpenCodeChannel(BaseChannel):
         session_id: str,
         body: dict[str, Any] | None,
     ) -> tuple[dict[str, Any], int]:
+        self._active_session_id = session_id
         current_task = asyncio.current_task()
         if current_task is not None:
             self._active_tasks.setdefault(session_id, set()).add(current_task)
@@ -1214,9 +1363,15 @@ class OpenCodeChannel(BaseChannel):
                 },
             )
 
+            preexisting_compact_entries = sum(
+                1
+                for m in session.messages
+                if m.get("role") == "system" and m.get("compact_event")
+            )
+
             accumulated_text: list[str] = []
             part_counter = 0
-            current_text_part_id = f"{asst_part_id}_p0"
+            current_text_part_id = f"{asst_part_id}_0"
             current_text_part_created_ms = now_ms + 1
             current_text_part_phase = "thinking"
             has_seen_tools = False
@@ -1256,7 +1411,7 @@ class OpenCodeChannel(BaseChannel):
                             "message.part.updated",
                             {
                                 "part": {
-                                    "id": f"{asst_part_id}_p{part_counter}",
+                                    "id": f"{asst_part_id}_{part_counter}",
                                     "sessionID": session_id,
                                     "messageID": asst_msg_id,
                                     "type": "tool",
@@ -1301,7 +1456,7 @@ class OpenCodeChannel(BaseChannel):
                             "message.part.updated",
                             {
                                 "part": {
-                                    "id": f"{asst_part_id}_p{tc_part_idx}",
+                                    "id": f"{asst_part_id}_{tc_part_idx}",
                                     "sessionID": session_id,
                                     "messageID": asst_msg_id,
                                     "type": "tool",
@@ -1322,7 +1477,7 @@ class OpenCodeChannel(BaseChannel):
                 if has_seen_tools or (current_text_part_phase != desired_phase and accumulated_text):
                     # Phase changed or tools seen — start a new text part.
                     part_counter += 1
-                    current_text_part_id = f"{asst_part_id}_p{part_counter}"
+                    current_text_part_id = f"{asst_part_id}_{part_counter}"
                     current_text_part_created_ms = self._epoch_ms(time.time())
                     current_text_part_phase = desired_phase
                     accumulated_text.clear()
@@ -1340,7 +1495,7 @@ class OpenCodeChannel(BaseChannel):
                             "sessionID": session_id,
                             "messageID": asst_msg_id,
                             "type": "text",
-                            "text": "\n".join(accumulated_text),
+                            "text": "".join(accumulated_text),
                             "time": {"created": current_text_part_created_ms},
                             "phase": current_text_part_phase,
                         },
@@ -1390,7 +1545,7 @@ class OpenCodeChannel(BaseChannel):
             final_text = response or "\n".join(accumulated_text) or ""
             if response and has_seen_tools:
                 part_counter += 1
-                current_text_part_id = f"{asst_part_id}_p{part_counter}"
+                current_text_part_id = f"{asst_part_id}_{part_counter}"
                 current_text_part_created_ms = self._epoch_ms(time.time())
             # The final response text is always "assistant" phase — only
             # reasoning_content (sent via on_progress with is_reasoning=True)
@@ -1425,6 +1580,13 @@ class OpenCodeChannel(BaseChannel):
                     url=f"/?session={session_id}",
                 )
 
+            new_compact_entries = [
+                m
+                for m in session.messages
+                if m.get("role") == "system" and m.get("compact_event")
+            ][preexisting_compact_entries:]
+            await self._broadcast_compact_entries(session, session_id, new_compact_entries)
+
             # Re-broadcast user message after turn completes to ensure the TUI
             # has it — the initial broadcast may race with optimistic updates.
             await self._broadcast_sse("message.updated", {"info": user_msg})
@@ -1432,7 +1594,23 @@ class OpenCodeChannel(BaseChannel):
 
             context_stats = self.agent_loop.get_last_context_stats(key) if self.agent_loop else None
             if isinstance(context_stats, dict):
-                self._last_context_by_session[session_id] = context_stats
+                merged_context = dict(context_stats)
+                compaction = session.metadata.get("compaction")
+                if isinstance(compaction, dict):
+                    try:
+                        compaction_count = int(compaction.get("count", 0))
+                    except (TypeError, ValueError):
+                        compaction_count = 0
+                    merged_context["hasCompacted"] = compaction_count > 0
+                    merged_context["totalCompactions"] = compaction_count
+                    merged_context["lastCompactedAt"] = compaction.get("last_compacted_at")
+                    try:
+                        merged_context["lastCompactedMessages"] = int(
+                            compaction.get("last_compacted_messages", 0)
+                        )
+                    except (TypeError, ValueError):
+                        merged_context["lastCompactedMessages"] = 0
+                self._last_context_by_session[session_id] = merged_context
 
             await self._broadcast_sse(
                 "session.status",
@@ -1743,7 +1921,23 @@ class OpenCodeChannel(BaseChannel):
 
         context_stats = self.agent_loop.get_last_context_stats(key)
         if isinstance(context_stats, dict):
-            self._last_context_by_session[session_id] = context_stats
+            merged_context = dict(context_stats)
+            compaction = session.metadata.get("compaction")
+            if isinstance(compaction, dict):
+                try:
+                    compaction_count = int(compaction.get("count", 0))
+                except (TypeError, ValueError):
+                    compaction_count = 0
+                merged_context["hasCompacted"] = compaction_count > 0
+                merged_context["totalCompactions"] = compaction_count
+                merged_context["lastCompactedAt"] = compaction.get("last_compacted_at")
+                try:
+                    merged_context["lastCompactedMessages"] = int(
+                        compaction.get("last_compacted_messages", 0)
+                    )
+                except (TypeError, ValueError):
+                    merged_context["lastCompactedMessages"] = 0
+            self._last_context_by_session[session_id] = merged_context
 
         await self._broadcast_sse(
             "session.status",
@@ -1796,6 +1990,13 @@ class OpenCodeChannel(BaseChannel):
             "hints": [],
         },
         {
+            "name": "compact",
+            "description": "Summarize and compact older session context",
+            "source": "command",
+            "template": "/compact",
+            "hints": [],
+        },
+        {
             "name": "clean",
             "description": "Redact secrets (passwords, keys, tokens) from session history",
             "source": "command",
@@ -1824,6 +2025,9 @@ class OpenCodeChannel(BaseChannel):
 
         if normalized_command_name == "reload-config":
             return await self._handle_reload_command(session_id)
+
+        if normalized_command_name == "compact":
+            return await self._handle_session_summarize(request)
 
         if normalized_command_name == "clean":
             return await self._handle_clean_command(session_id, body)
@@ -2281,6 +2485,11 @@ class OpenCodeChannel(BaseChannel):
                 j = i + 1
                 while j < len(messages) and messages[j].get("role") != "user":
                     candidate = messages[j]
+                    if candidate.get("role") == "system":
+                        # Preserve system messages (e.g. compaction summaries)
+                        # as standalone display entries instead of swallowing
+                        # them into an assistant tool-call merge.
+                        break
                     if candidate.get("role") == "assistant":
                         extra_tc = candidate.get("tool_calls")
                         if extra_tc:
@@ -2373,8 +2582,8 @@ class OpenCodeChannel(BaseChannel):
                 prev_user_created_ms = created
                 continue
 
-            # System messages (compaction summaries) — render as compact assistant messages.
-            if role == "system" and m.get("compact_event"):
+            # System messages — render as assistant-style notices.
+            if role == "system":
                 text = content if isinstance(content, str) else ""
                 if text:
                     msg = {
@@ -2383,7 +2592,7 @@ class OpenCodeChannel(BaseChannel):
                             "sessionID": session_id,
                             "role": "assistant",
                             "time": {"created": created, "completed": created},
-                            "mode": "compact",
+                            "mode": "compact" if m.get("compact_event") else "system",
                             "agent": "default",
                         },
                         "parts": [
@@ -2454,10 +2663,14 @@ class OpenCodeChannel(BaseChannel):
             for tc in tool_calls:
                 tc_id = tc.get("id", "")
                 tc_func = tc.get("function", {})
-                tc_name = tc_func.get("name", "unknown")
-                if not isinstance(tc_name, str):
-                    tc_name = "unknown"
-                oc_name: str = str(_TOOL_NAME_MAP.get(tc_name) or tc_name)
+                raw_tc_name = tc_func.get("name", "unknown")
+                invalid_tool_call = not isinstance(raw_tc_name, str) or not raw_tc_name.strip()
+                tc_name = raw_tc_name.strip() if isinstance(raw_tc_name, str) else ""
+                oc_name: str = (
+                    "invalid_tool_call"
+                    if invalid_tool_call
+                    else str(_TOOL_NAME_MAP.get(tc_name) or tc_name)
+                )
                 tc_args_raw = tc_func.get("arguments", "{}")
                 try:
                     tc_input = (
@@ -2469,15 +2682,25 @@ class OpenCodeChannel(BaseChannel):
                 tr = tool_results.get(tc_id)
                 tc_output = ""
                 tc_status = "completed"
-                if tr:
+                if invalid_tool_call:
+                    tc_status = "error"
+                    tc_output = (
+                        "Error: Invalid tool call: function.name was empty or null. "
+                        "The model should retry with a valid tool name."
+                    )
+                elif tr:
                     tc_output = tr.get("content", "")
                     if isinstance(tc_output, str) and tc_output.startswith("Error"):
                         tc_status = "error"
                 else:
                     tc_status = "pending"
 
-                oc_input = _map_tool_input(tc_name, tc_input)
-                tool_title = _tool_title(oc_name, oc_input)
+                oc_input = _map_tool_input(tc_name or "invalid_tool_call", tc_input)
+                tool_title = (
+                    "invalid_tool_call()"
+                    if invalid_tool_call
+                    else _tool_title(oc_name, oc_input)
+                )
 
                 tc_metadata: dict[str, Any] = {}
                 if tc_name == "exec" and tc_output:

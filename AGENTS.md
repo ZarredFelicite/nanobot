@@ -335,3 +335,98 @@ Suggested first 3 to ship:
 1. Context budget visibility
 2. Compaction (manual + auto)
 3. Session pruning for tool outputs
+
+---
+
+## Local Runtime + Verification Notes
+
+### How nanobot is currently run on this machine
+- Service: `nanobot.service` (systemd user service)
+- Check unit: `systemctl --user cat nanobot.service`
+- Restart: `systemctl --user restart nanobot.service`
+- Status: `systemctl --user --no-pager --full status nanobot.service`
+- Logs: `journalctl --user -u nanobot.service -f`
+- Working directory: `/home/zarred/dev/nanobot`
+- Main process currently resolves to the repo venv entrypoint, e.g.:
+  - `/home/zarred/dev/nanobot/.venv/bin/nanobot gateway --port 18790 --verbose`
+- Main config file: `~/.nanobot/config.json`
+- Default model on this machine: `openai-codex/gpt-5.4`
+- OpenCode HTTP+SSE endpoint used by the TUI/web UI: `http://127.0.0.1:4096`
+- Gateway port is still `18790`, but the OpenCode/web UI surface is on `4096`
+
+### Minimal health checks
+```bash
+systemctl --user restart nanobot.service
+systemctl --user --no-pager --full status nanobot.service
+curl -fsS http://127.0.0.1:4096/config | jq '.model'
+curl -fsS http://127.0.0.1:4096/global/health
+```
+
+### How to test Codex delta streaming properly
+After changes to provider/streaming code, do an end-to-end check against the live OpenCode SSE API, not just unit tests.
+
+1. Restart the service:
+```bash
+systemctl --user restart nanobot.service
+```
+
+2. Create a session:
+```bash
+curl -fsS -X POST http://127.0.0.1:4096/session
+```
+
+3. Open `/event` and verify multiple `message.part.updated` events with non-empty `properties.delta` for the assistant message.
+
+A working scripted check is to run a small Python SSE client that:
+- `POST /session`
+- starts `GET /event`
+- `POST /session/{id}/message`
+- asserts there are multiple assistant deltas before `session.status` becomes `idle`
+
+Expected success signal:
+- more than one assistant delta event for the same `sessionID`
+- final response also visible in the accumulated `part.text`
+
+When I verified the current setup after restarting the service, the live SSE stream produced many assistant deltas for a single `openai-codex/gpt-5.4` reply (e.g. `"1"`, `"."`, `" Rain"`, `" taps"`, ...), confirming real incremental streaming instead of one final blob.
+
+### Python/unit test command
+Use Nix so pytest is present:
+```bash
+nix-shell --run 'python -m pytest -q tests/test_agent_loop_retries.py'
+```
+
+### Web UI verification with Playwright
+The gateway is already serving the built Svelte web UI from `/` when `webui/build` exists.
+
+Quick manual check:
+```bash
+curl -I http://127.0.0.1:4096/
+```
+should return `200 OK` with `Content-Type: text/html`.
+
+For an actual browser-level verification, use Playwright under Nix with the required shared libraries. A working script lives at:
+- `webui/test-playwright.mjs`
+
+It checks that:
+- the page loads
+- the composer is visible
+- a message can be sent
+- the response appears in the UI
+
+Run it with:
+```bash
+nix-shell -E 'with import <nixpkgs> {}; let libs = [ glib gtk3 nspr nss at-spi2-atk cups dbus libdrm libgbm mesa expat pango cairo alsa-lib libxkbcommon xorg.libX11 xorg.libXcomposite xorg.libXdamage xorg.libXext xorg.libXfixes xorg.libXrandr xorg.libxcb xorg.libXcursor xorg.libXi xorg.libXtst xorg.libXScrnSaver xorg.libXrender ]; in mkShell { buildInputs = libs ++ [ nodejs ]; shellHook = "export LD_LIBRARY_PATH=${lib.makeLibraryPath libs}"; }' --run 'cd /home/zarred/dev/nanobot/webui && node test-playwright.mjs'
+```
+
+Expected output:
+```text
+playwright_webui_ok
+```
+
+The script also writes a screenshot to:
+- `/tmp/nanobot-webui-playwright.png`
+
+### Web UI dev notes
+- install deps in `webui/` with `npm install`
+- rebuild static UI with `cd webui && npm run build`
+- after rebuilding, restart `nanobot.service` if needed and reload `http://127.0.0.1:4096/`

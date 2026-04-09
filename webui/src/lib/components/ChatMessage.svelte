@@ -38,6 +38,7 @@
   const isAssistant = $derived(message.info.role === 'assistant');
   const isUser = $derived(message.info.role === 'user');
   const isCompact = $derived(message.info.mode === 'compact');
+  const isSystem = $derived(message.info.mode === 'system');
 
   const contentParts = $derived(textParts.filter(p => p.phase !== 'thinking'));
 
@@ -145,20 +146,36 @@
   }
 </script>
 
-<article class:assistant={isAssistant} class:user={isUser} class:compact={isCompact} class="msg">
-  {#if isCompact}
-    <div class="compact-divider">
-      <div class="compact-line"></div>
-      <span class="compact-label">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0022 16z" />
-          <path d="M7.5 4.21l4.5 2.6 4.5-2.6M7.5 19.79V14.6L3 12M21 12l-4.5 2.6v5.19" />
-        </svg>
+<article class:assistant={isAssistant} class:user={isUser} class:compact={isCompact} class:system={isSystem} class="msg">
+  {#if isCompact || isSystem}
+    <div class:is-compact={isCompact} class:is-system={isSystem} class="notice-block">
+      <div class="notice-divider">
+        <div class="notice-line"></div>
+        <span class:is-compact={isCompact} class:is-system={isSystem} class="notice-label">
+          {#if isCompact}
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0022 16z" />
+              <path d="M7.5 4.21l4.5 2.6 4.5-2.6M7.5 19.79V14.6L3 12M21 12l-4.5 2.6v5.19" />
+            </svg>
+            <span>Compaction Summary</span>
+          {:else}
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 8v4" />
+              <path d="M12 16h.01" />
+            </svg>
+            <span>System Message</span>
+          {/if}
+        </span>
+        <div class="notice-line"></div>
+      </div>
+      <div class:is-compact={isCompact} class:is-system={isSystem} class="notice-content">
         {#each contentParts as part (part.id)}
-          {part.text}
+          <div class:is-compact={isCompact} class:is-system={isSystem} class="text-part notice-text">
+            {@html renderMarkdown(part.text)}
+          </div>
         {/each}
-      </span>
-      <div class="compact-line"></div>
+      </div>
     </div>
   {:else if isUser}
     <div class="user-content">
@@ -776,35 +793,93 @@
     font-style: italic;
   }
 
-  .msg.compact {
+  .msg.compact,
+  .msg.system {
     padding: 0.5rem 0;
   }
 
-  .compact-divider {
+  .notice-block {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .notice-divider {
     display: flex;
     align-items: center;
     gap: 0.75rem;
   }
 
-  .compact-line {
+  .notice-line {
     flex: 1;
     height: 1px;
+  }
+
+  .notice-block.is-compact .notice-line {
     background: rgba(251, 191, 36, 0.2);
   }
 
-  .compact-label {
+  .notice-block.is-system .notice-line {
+    background: rgba(96, 165, 250, 0.18);
+  }
+
+  .notice-label {
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
     font-size: 0.72rem;
-    font-weight: 500;
-    color: #fbbf24;
+    font-weight: 600;
     white-space: nowrap;
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
 
-  .compact-label svg {
+  .notice-label.is-compact {
+    color: #fbbf24;
+  }
+
+  .notice-label.is-system {
+    color: #93c5fd;
+  }
+
+  .notice-content {
+    padding: 0.85rem 1rem;
+    border-radius: 0.85rem;
+  }
+
+  .notice-content.is-compact {
+    border: 1px solid rgba(251, 191, 36, 0.18);
+    background: rgba(251, 191, 36, 0.04);
+  }
+
+  .notice-content.is-system {
+    border: 1px solid rgba(96, 165, 250, 0.16);
+    background: rgba(96, 165, 250, 0.045);
+  }
+
+  .notice-text.is-compact :global(*) {
+    color: rgba(255, 248, 220, 0.95);
+  }
+
+  .notice-text.is-compact :global(h1),
+  .notice-text.is-compact :global(h2),
+  .notice-text.is-compact :global(h3),
+  .notice-text.is-compact :global(strong) {
+    color: #fcd34d;
+  }
+
+  .notice-text.is-system :global(*) {
+    color: rgba(219, 234, 254, 0.96);
+  }
+
+  .notice-text.is-system :global(h1),
+  .notice-text.is-system :global(h2),
+  .notice-text.is-system :global(h3),
+  .notice-text.is-system :global(strong) {
+    color: #bfdbfe;
+  }
+
+  .notice-label svg {
     opacity: 0.7;
   }
 </style>

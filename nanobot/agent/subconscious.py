@@ -113,6 +113,7 @@ class SubconsciousService:
         config: SubconsciousConfig,
         provider_factory: Callable[[str], LLMProvider] | None = None,
         fallback_models: list[str] | None = None,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self._config = config
         self._fallback_models = fallback_models or []
@@ -123,6 +124,7 @@ class SubconsciousService:
         self._bg_task: asyncio.Task | None = None
         self._write_lock = asyncio.Lock()
         self._nudge_counter: int = 0
+        self._on_event = on_event
 
         # Conversation buffer for history summarization (separate from extraction buffer)
         self._conversation_buffer: list[dict[str, str]] = []
@@ -139,6 +141,15 @@ class SubconsciousService:
             config.extraction_model: self._provider_factory(config.extraction_model)
         }
         self._provider: LLMProvider = self._providers[config.extraction_model]
+
+    def _emit(self, action: str, detail: dict[str, Any] | None = None) -> None:
+        """Emit a subconscious event to the UI."""
+        payload = {"action": action, "ts": time.time(), **(detail or {})}
+        if self._on_event:
+            try:
+                self._on_event(action, payload)
+            except Exception:
+                logger.opt(exception=True).debug("subconscious emit failed")
 
     @staticmethod
     def _default_provider_factory(model: str) -> LLMProvider:
@@ -317,6 +328,7 @@ If a note already exists, use action="update" with COMPLETE content. Use [[Name]
                 if isinstance(args, dict):
                     await self._write_memories(args)
                     logger.info("Nudge review: wrote memories from big-picture analysis")
+                    self._emit("nudge", {"names": self._memory_names(args)})
         except Exception:
             logger.exception("Nudge review failed")
 
@@ -407,6 +419,7 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
                 return
 
             await self._write_memories(args)
+            self._emit("extraction", {"names": self._memory_names(args)})
         except Exception:
             logger.exception("Subconscious extraction LLM call failed")
 
@@ -455,6 +468,18 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
             if notes_written and self._qmd.available:
                 await self._qmd.reindex()
                 logger.debug("Subconscious: wrote {} note(s) and reindexed", notes_written)
+
+    @staticmethod
+    def _memory_names(args: dict[str, Any]) -> list[str]:
+        """Extract note names from extraction args."""
+        names: list[str] = []
+        for item in [*args.get("entities", []), *args.get("notes", [])]:
+            name = item.get("name", "")
+            if name:
+                action = item.get("action", "create")
+                prefix = "\u2212" if action == "delete" else ("~" if action == "update" else "+")
+                names.append(f"{prefix}{name}")
+        return names
 
     def _delete_note(self, path: str, name: str) -> None:
         """Delete a note file."""
@@ -534,6 +559,7 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
             answer = (response.content or "").strip().lower()
             result = answer.startswith("yes")
             logger.debug("Memory classifier: {} (answer={})", result, answer)
+            self._emit("classifier", {"inject": result})
             return result
         except Exception:
             logger.debug("Memory classifier failed, defaulting to inject")
@@ -588,7 +614,11 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
         if not results:
             return ""
 
-        return self._format_results(results, budget)
+        formatted = self._format_results(results, budget)
+        if formatted:
+            titles = [r.get("title", "") for r in results if r.get("title")]
+            self._emit("recall", {"names": titles, "results": len(results)})
+        return formatted
 
     async def search(self, query: str, budget: int = 4000, n: int = 10) -> str:
         """Full semantic search with reranking for explicit memory_search tool use."""
@@ -602,7 +632,11 @@ If nothing noteworthy was discussed, call save_memories with empty arrays.
         if not results:
             return ""
 
-        return self._format_results(results, budget, min_score=0.2)
+        titles = [r.get("title", "") for r in results if r.get("title")]
+        formatted = self._format_results(results, budget, min_score=0.2)
+        if formatted:
+            self._emit("recall", {"names": titles, "results": len(results)})
+        return formatted
 
     async def compact_history(self) -> None:
         """Generate weekly and monthly summaries for old history files."""

@@ -1,4 +1,4 @@
-import type { MessageWithParts, ProviderInfo, SessionInfo, SessionStatus } from '$lib/types';
+import type { MessageWithParts, ProviderInfo, SessionInfo, SessionStatus, SlashCommandInfo, SubconsciousEvent } from '$lib/types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -63,8 +63,35 @@ export function patchSession(sessionId: string, body: Record<string, unknown>): 
   });
 }
 
+export function getSubconsciousEvents(sessionId: string): Promise<SubconsciousEvent[]> {
+  return request(`/session/${encodeURIComponent(sessionId)}/subconscious`);
+}
+
 export function getProviders(): Promise<ProviderInfo[]> {
   return request('/provider');
+}
+
+export function getCommands(): Promise<SlashCommandInfo[]> {
+  return request('/command');
+}
+
+export function executeCommand(
+  sessionId: string,
+  command: string,
+  argumentsText = '',
+  model?: string
+): Promise<unknown> {
+  const body: Record<string, unknown> = {
+    command,
+    arguments: argumentsText
+  };
+  if (model) {
+    body.model = model;
+  }
+  return request(`/session/${encodeURIComponent(sessionId)}/command`, {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
 }
 
 // Web Push
